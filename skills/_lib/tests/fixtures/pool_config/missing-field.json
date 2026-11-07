@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "note": "A pool entry with no tier. The reader must say which field is missing and refuse, not guess primary or secondary.",
+  "pools": [
+    {
+      "id": "claude",
+      "windows": ["5h", "7d", "fable-weekly"]
+    }
+  ]
+}

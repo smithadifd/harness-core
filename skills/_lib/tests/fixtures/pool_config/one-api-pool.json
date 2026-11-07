@@ -1,0 +1,89 @@
+{
+  "version": 1,
+  "note": "A user with one metered API account and no subscription: work-api is the only enabled pool. It needs the registry overlay beside it (one-api-pool-overlay.json), because the shipped records say quota and the pick refuses a record whose billing contradicts its pool.",
+  "pools": [
+    {
+      "id": "work-api",
+      "tier": "primary",
+      "billing": "api",
+      "ceiling": 20
+    }
+  ],
+  "models": [
+    {
+      "id": "claude-opus-5-5",
+      "pool": "work-api",
+      "price": {
+        "usd_per_mtok": 15,
+        "as_of": "2026-10-23"
+      }
+    },
+    {
+      "id": "claude-sonnet-5-5",
+      "pool": "work-api",
+      "price": {
+        "usd_per_mtok": 6,
+        "as_of": "2026-10-23"
+      }
+    }
+  ],
+  "work_kinds": [
+    {
+      "id": "orchestration",
+      "models": [
+        "claude-opus-5-5",
+        "claude-sonnet-5-5"
+      ]
+    },
+    {
+      "id": "hard_build",
+      "models": [
+        "claude-opus-5-5",
+        "claude-sonnet-5-5"
+      ]
+    },
+    {
+      "id": "mechanical_build",
+      "models": [
+        "claude-sonnet-5-5"
+      ]
+    },
+    {
+      "id": "docs",
+      "models": [
+        "claude-sonnet-5-5"
+      ]
+    },
+    {
+      "id": "review",
+      "models": [
+        "claude-sonnet-5-5"
+      ]
+    },
+    {
+      "id": "second_review",
+      "models": [
+        "claude-sonnet-5-5"
+      ]
+    },
+    {
+      "id": "lint",
+      "models": [
+        "claude-sonnet-5-5"
+      ]
+    },
+    {
+      "id": "research",
+      "models": [
+        "claude-sonnet-5-5"
+      ]
+    }
+  ],
+  "disabled_pools": [
+    "claude",
+    "openai-codex",
+    "xai-grok",
+    "google-antigravity-gemini",
+    "google-antigravity-shared"
+  ]
+}

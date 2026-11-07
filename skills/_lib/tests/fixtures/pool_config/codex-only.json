@@ -1,0 +1,5 @@
+{
+  "version": 1,
+  "note": "A user with only an OpenAI plan: every other pool is disabled.",
+  "disabled_pools": ["claude", "xai-grok", "google-antigravity-gemini", "google-antigravity-shared"]
+}

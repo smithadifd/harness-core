@@ -1,0 +1,4 @@
+{
+  "version": 1,
+  "note": "A user who accepts every shipped default writes nothing but the version. Merged over pool-defaults.json this must resolve exactly as the shipped defaults do."
+}

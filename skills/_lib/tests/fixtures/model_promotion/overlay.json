@@ -1,0 +1,68 @@
+{
+  "version": 1,
+  "note": "A scratch overlay for the promotion tests: four candidates, each in the state one test needs.",
+  "models": [
+    {
+      "id": "new/clear",
+      "family": "fam",
+      "provider": "new",
+      "billing": "quota",
+      "data_use": {"decision": null, "source": "unscreened", "as_of": "2026-10-20"},
+      "jobs": {
+        "review": {"status": "report-only", "as_of": "2026-10-20", "card": "c-review"},
+        "mechanical_build": {"status": "report-only", "as_of": "2026-10-20", "card": "c-build"}
+      },
+      "cards": [
+        {"id": "c-review", "job": "review", "as_of": "2026-10-20", "source": "a scratch replay of review",
+         "incumbent_bugs": 10, "bugs_found": 6, "bug_recall": 0.6, "false_positives": 1},
+        {"id": "c-build", "job": "mechanical_build", "as_of": "2026-10-20", "source": "a scratch replay of builds",
+         "incumbent_bugs": 8, "bugs_found": 7, "bug_recall": 0.875, "false_positives": 0}
+      ]
+    },
+    {
+      "id": "new/failed",
+      "family": "fam",
+      "provider": "new",
+      "billing": "quota",
+      "data_use": {"decision": null, "source": "unscreened", "as_of": "2026-10-20"},
+      "jobs": {
+        "review": {"status": "failed", "as_of": "2026-10-20", "card": "c-failed"}
+      },
+      "cards": [
+        {"id": "c-failed", "job": "review", "as_of": "2026-10-20", "source": "a scratch replay below the bar",
+         "incumbent_bugs": 10, "bugs_found": 2, "bug_recall": 0.2, "false_positives": 4}
+      ]
+    },
+    {
+      "id": "new/other",
+      "family": "fam",
+      "provider": "new",
+      "billing": "quota",
+      "data_use": {"decision": null, "source": "unscreened", "as_of": "2026-10-20"},
+      "jobs": {
+        "review": {"status": "report-only", "as_of": "2026-10-20", "card": "c-old"}
+      },
+      "cards": [
+        {"id": "c-old", "job": "review", "as_of": "2026-10-19", "source": "an earlier scratch replay",
+         "incumbent_bugs": 10, "bugs_found": 6, "bug_recall": 0.6, "false_positives": 1},
+        {"id": "c-new", "job": "review", "as_of": "2026-10-20", "source": "a later scratch replay",
+         "incumbent_bugs": 10, "bugs_found": 7, "bug_recall": 0.7, "false_positives": 1}
+      ]
+    },
+    {
+      "id": "new/qualified",
+      "family": "fam",
+      "provider": "new",
+      "billing": "quota",
+      "data_use": {"decision": null, "source": "unscreened", "as_of": "2026-10-20"},
+      "jobs": {
+        "review": {"status": "qualified", "as_of": "2026-10-20", "card": "c-q-review"},
+        "mechanical_build": {"status": "qualified", "as_of": "2026-10-20", "card": null}
+      },
+      "cards": [
+        {"id": "c-q-review", "job": "review", "as_of": "2026-10-20", "source": "a ratified scratch replay",
+         "incumbent_bugs": 10, "bugs_found": 8, "bug_recall": 0.8, "false_positives": 0}
+      ]
+    }
+  ]
+}

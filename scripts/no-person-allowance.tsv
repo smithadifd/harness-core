@@ -1,0 +1,11 @@
+# path	sha256 of the lowercased matched text (hashes only; the deny list comes from the environment variable NO_PERSON_DENY, which CI fills from the repository secret of that name)	reason
+ledger-vendor.pin	95a86be226161e30e5f20e9938d8ed0947429cabacc4f481dded0ad2a45f0d94	the owner's handle in the public ledger repository slug
+scripts/ledger-vendor-bump.py	95a86be226161e30e5f20e9938d8ed0947429cabacc4f481dded0ad2a45f0d94	the owner's handle in the public ledger repository slug
+scripts/omp-harness-rules.py	fcf56c2c0e488ee1bff443cdcfc0c98e222f37a43756de591e4aaaf667bc0007	the toolkit's own repository name (config folder and marker)
+scripts/tests/test_check_ledger_vendor.py	95a86be226161e30e5f20e9938d8ed0947429cabacc4f481dded0ad2a45f0d94	the owner's handle in the public ledger repository slug
+scripts/tests/test_omp_harness_rules.py	fcf56c2c0e488ee1bff443cdcfc0c98e222f37a43756de591e4aaaf667bc0007	the toolkit's own repository name (config folder and marker)
+skills/_lib/overrides.py	fcf56c2c0e488ee1bff443cdcfc0c98e222f37a43756de591e4aaaf667bc0007	the toolkit's own repository name (config folder and marker)
+skills/_lib/recall/tests/test_recall_guard.py	4b8826f862b6c545c476108a6e510d4527e0be0e5a120fa610538fc126b2e619	a room project name in a recall-guard test fixture
+skills/_lib/recall/tests/test_recall_guard.py	6766c594cac67d18ada249fd88c201d9339587f95f5dda62b8bdb158ca82e5ec	a room project name in a recall-guard test fixture
+skills/_lib/recall/tests/test_recall_guard.py	fcf56c2c0e488ee1bff443cdcfc0c98e222f37a43756de591e4aaaf667bc0007	the toolkit's own repository name (config folder and marker)
+skills/_lib/tests/test_overrides.py	fcf56c2c0e488ee1bff443cdcfc0c98e222f37a43756de591e4aaaf667bc0007	the toolkit's own repository name (config folder and marker)

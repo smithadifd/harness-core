@@ -1,0 +1,8 @@
+# Repository-relative or pinned upstream entry | reason for the linear ticket kit
+upstream:agents/reviewer.md | Reviews the built change against its acceptance criteria and engineering standards.
+upstream:agents/builder-core.md | Builds one scoped ticket while following the target repository's conventions.
+upstream:skills/ticket/SKILL.md | Runs one ticket from orientation through the two human approval stops.
+skills/_lib/ledger/ | Uses the local decision record and resume-card store in place at this path.
+upstream:agents/researcher.md | Resolves factual unknowns before planning or building.
+upstream:skills/review/SKILL.md | Provides the user-facing review command.
+upstream:skills/pr/SKILL.md | Creates a draft pull request in the target repository's established style.

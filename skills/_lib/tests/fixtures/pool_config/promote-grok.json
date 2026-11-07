@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "note": "A user who ranks the xAI model first for hard builds; every other work kind keeps its shipped order.",
+  "work_kinds": [
+    {"id": "hard_build", "models": ["xai-oauth/grok-4.6", "claude-opus-5-5", "openai-codex/gpt-5.6-sol"]}
+  ]
+}

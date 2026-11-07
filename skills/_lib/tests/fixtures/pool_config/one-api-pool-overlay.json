@@ -1,0 +1,95 @@
+{
+  "version": 1,
+  "note": "The registry half of the one-api-pool shape: the two shipped records re-declared with billing api, and the sonnet record given hard_build as this person's own eligibility edit, so hard_build has two qualified api models and the cheapest one wins.",
+  "models": [
+    {
+      "id": "claude-opus-5-5",
+      "family": "anthropic",
+      "provider": "anthropic",
+      "billing": "api",
+      "line": "claude-opus",
+      "iteration": [
+        5,
+        5
+      ],
+      "surfaces": [
+        "claude"
+      ],
+      "data_use": {
+        "decision": null,
+        "source": "unscreened",
+        "as_of": "2026-10-23"
+      },
+      "jobs": {
+        "orchestration": {
+          "status": "qualified",
+          "as_of": "2026-10-23",
+          "card": null
+        },
+        "hard_build": {
+          "status": "qualified",
+          "as_of": "2026-10-23",
+          "card": null
+        }
+      },
+      "cards": []
+    },
+    {
+      "id": "claude-sonnet-5-5",
+      "family": "anthropic",
+      "provider": "anthropic",
+      "billing": "api",
+      "line": "claude-sonnet",
+      "iteration": [
+        5,
+        5
+      ],
+      "surfaces": [
+        "claude"
+      ],
+      "data_use": {
+        "decision": null,
+        "source": "unscreened",
+        "as_of": "2026-10-23"
+      },
+      "jobs": {
+        "mechanical_build": {
+          "status": "qualified",
+          "as_of": "2026-10-23",
+          "card": null
+        },
+        "docs": {
+          "status": "qualified",
+          "as_of": "2026-10-23",
+          "card": null
+        },
+        "review": {
+          "status": "qualified",
+          "as_of": "2026-10-23",
+          "card": null
+        },
+        "second_review": {
+          "status": "qualified",
+          "as_of": "2026-10-23",
+          "card": null
+        },
+        "lint": {
+          "status": "qualified",
+          "as_of": "2026-10-23",
+          "card": null
+        },
+        "research": {
+          "status": "qualified",
+          "as_of": "2026-10-23",
+          "card": null
+        },
+        "hard_build": {
+          "status": "qualified",
+          "as_of": "2026-10-23",
+          "card": null
+        }
+      },
+      "cards": []
+    }
+  ]
+}

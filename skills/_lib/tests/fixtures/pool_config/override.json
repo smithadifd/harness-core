@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "note": "A user who has a different subscription set: no xAI plan, a locally hosted model, a protected amount on one primary pool, one shipped work kind re-pointed and one new work kind added.",
+  "pools": [
+    {
+      "id": "claude",
+      "tier": "primary",
+      "windows": ["5h", "7d", "fable-weekly"],
+      "protected_headroom_percent": 15,
+      "note": "Whole-entry replacement of the shipped claude pool, keeping its position and adding a protected amount."
+    },
+    {
+      "id": "local-ollama",
+      "tier": "secondary",
+      "billing": "quota",
+      "windows": ["unmetered"],
+      "note": "A new pool, appended after the shipped ones."
+    }
+  ],
+  "models": [
+    {"id": "qwen3.5:32b", "pool": "local-ollama"}
+  ],
+  "work_kinds": [
+    {
+      "id": "docs",
+      "models": ["openai-codex/gpt-5.6-sol", "claude-sonnet-5-5"],
+      "note": "Replaces the shipped docs entry in place."
+    },
+    {
+      "id": "triage",
+      "models": ["qwen3.5:32b", "claude-sonnet-5-5"],
+      "note": "A new work kind, appended after the shipped ones."
+    }
+  ],
+  "disabled_pools": ["xai-grok"]
+}

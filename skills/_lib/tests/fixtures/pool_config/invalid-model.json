@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "note": "A work kind pointed at a model that is not declared anywhere. The reader must name the undeclared model and refuse, not fall through to another pool.",
+  "work_kinds": [
+    {
+      "id": "docs",
+      "models": ["google-antigravity/gemini-3.9-ultra", "claude-sonnet-5-5"]
+    }
+  ]
+}

@@ -1,0 +1,5 @@
+{
+  "version": 1,
+  "note": "A user with only an Anthropic plan: every other pool is disabled.",
+  "disabled_pools": ["openai-codex", "xai-grok", "google-antigravity-gemini", "google-antigravity-shared"]
+}

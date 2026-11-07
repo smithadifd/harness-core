@@ -1,0 +1,106 @@
+{
+  "version": 1,
+  "note": "Shipped defaults for the provider-pool inventory and the work-kind fit table. They reproduce a measured subscription set (readings taken 2026-09-25) so that a user with the same subscriptions gets a working configuration with no setup. Every entry is overridable per id, and a pool a user does not have is named in disabled_pools. No protected_headroom_percent is set anywhere here on purpose: a protected amount exists only where a user's own configuration sets one.",
+  "pools": [
+    {
+      "id": "claude",
+      "tier": "primary",
+      "billing": "quota",
+      "policy": "pace",
+      "windows": ["5h", "7d", "fable-weekly"],
+      "note": "Anthropic plan. Two rolling windows over one quota, plus a third window scoped to the Fable-tier models within the same pool. The windows are percentages over different denominators and different periods; they are inventory here, never summed."
+    },
+    {
+      "id": "openai-codex",
+      "tier": "primary",
+      "billing": "quota",
+      "policy": "pace",
+      "windows": ["7d"],
+      "note": "The OpenAI plan pool. One window."
+    },
+    {
+      "id": "xai-grok",
+      "tier": "secondary",
+      "billing": "quota",
+      "policy": "spend-down",
+      "windows": ["7d"],
+      "note": "The xAI plan pool. Reported under two identifiers that are one quota."
+    },
+    {
+      "id": "google-antigravity-gemini",
+      "tier": "secondary",
+      "billing": "quota",
+      "policy": "spend-down",
+      "windows": ["5h", "7d"],
+      "note": "The Gemini half of the Antigravity plan."
+    },
+    {
+      "id": "google-antigravity-shared",
+      "tier": "secondary",
+      "billing": "quota",
+      "policy": "spend-down",
+      "windows": ["5h", "7d"],
+      "note": "The shared third-party pool on the same plan, displayed as Claude and GPT together. Declared as inventory only: no model here routes to it, and its Claude half is not used at all."
+    }
+  ],
+  "models": [
+    {"id": "claude-opus-5-5", "pool": "claude"},
+    {"id": "claude-sonnet-5", "pool": "claude"},
+    {"id": "claude-sonnet-5-5", "pool": "claude"},
+    {
+      "id": "claude-fable-5-1",
+      "pool": "claude",
+      "note": "Judgment tier. Draws on the pool's Fable-scoped window as well as the shared ones."
+    },
+    {"id": "openai-codex/gpt-5.6-sol", "pool": "openai-codex"},
+    {
+      "id": "openai-codex/gpt-6-astra",
+      "pool": "openai-codex",
+      "note": "Advisory voice; declared as available inventory, preferred for no work kind by default."
+    },
+    {"id": "xai-oauth/grok-4.6", "pool": "xai-grok"},
+    {"id": "google-antigravity/gemini-3.8-flash", "pool": "google-antigravity-gemini"}
+  ],
+  "work_kinds": [
+    {
+      "id": "orchestration",
+      "models": ["claude-opus-5-5", "openai-codex/gpt-5.6-sol"],
+      "note": "Driving a run. Both lanes are primary-pool, so a quota problem on one moves the work to the other."
+    },
+    {
+      "id": "hard_build",
+      "models": ["claude-opus-5-5", "openai-codex/gpt-5.6-sol"],
+      "note": "Code changes that need judgment."
+    },
+    {
+      "id": "mechanical_build",
+      "models": ["xai-oauth/grok-4.6", "openai-codex/gpt-5.6-sol", "claude-sonnet-5-5"],
+      "note": "The measured default build lane first, then both primary pools behind it."
+    },
+    {
+      "id": "docs",
+      "models": ["google-antigravity/gemini-3.8-flash", "openai-codex/gpt-5.6-sol", "claude-sonnet-5-5"],
+      "note": "Prose and records work."
+    },
+    {
+      "id": "review",
+      "models": ["claude-sonnet-5-5", "openai-codex/gpt-5.6-sol"],
+      "note": "The fresh-context reviewing lane."
+    },
+    {
+      "id": "second_review",
+      "models": ["openai-codex/gpt-5.6-sol", "xai-oauth/grok-4.6", "claude-sonnet-5-5"],
+      "note": "The independent second reviewing lane, which is required to come from a different provider than the builder of the same work."
+    },
+    {
+      "id": "lint",
+      "models": ["claude-sonnet-5-5", "openai-codex/gpt-5.6-sol"],
+      "note": "Mechanical checks."
+    },
+    {
+      "id": "research",
+      "models": ["openai-codex/gpt-5.6-sol", "claude-sonnet-5-5"],
+      "note": "Reading-heavy investigation."
+    }
+  ]
+}

@@ -1,0 +1,130 @@
+# The pinned source of the vendored ledger. skills/_lib/ledger is a byte-for-byte
+# copy of the ledger/ tree of `repo` at commit `sha`, and nothing else; the
+# ledger repository's VENDORING.md defines that mapping. Never edit the copy
+# here: a change lands in the ledger repository first and reaches this
+# repository as one reviewed pull request (this file plus the copied files),
+# made by
+#   python3 scripts/ledger-vendor-bump.py <ledger checkout> <tag>
+# which re-copies the tree, rewrites this file and runs the drift check.
+#
+# Read by scripts/check-ledger-vendor.py and written by
+# scripts/ledger-vendor-bump.py. Two checks read it. Offline, the files under
+# skills/_lib/ledger are hashed against the manifest's git blob ids (the lint
+# job of .github/workflows/skills-ci.yml and the daily wave's pre-flight,
+# launchd-kit/triage-wave-run.sh --wave). With --source, the manifest itself
+# is compared with the ledger repository at `sha`, `tag` must resolve to `sha`
+# there, and `sha` must be on the ledger's main (CI fetches the commit, the
+# tag and main from the public repository without credentials).
+#
+# Grammar (anything else is refused with exit 2): UTF-8, LF line endings only,
+# ending in a newline. `#` comment lines and empty lines may appear only
+# before the first manifest line. Exactly one `repo <owner>/<name>` line, then
+# exactly one `sha <40 lowercase hex>` line; exactly one `tag <name>` line
+# ([A-Za-z0-9._-]+), required, anywhere among those key lines. Then one
+# manifest line per vendored file:
+# `<git blob id, 40 lowercase hex> <path>`, one space, where
+# <path> is relative to ledger/ (no leading slash; no empty, `.` or `..`
+# component; components of [A-Za-z0-9._-] only; no __pycache__ component; no
+# .pyc file). At least one manifest line, sorted ascending by byte value,
+# no duplicates. The manifest is `git ls-tree -r <sha> ledger/` of the commit.
+repo smithadifd/ledger
+tag v0.1.8
+sha 812e0fabfa39e1bfba64219fde4cee762499d1d1
+dafb6ec5d1d9a2fd99e85a0d2aecd51a1e01664a __init__.py
+3d2c7ebc6f4050ab400c9623bc020c70ca969bb3 __main__.py
+1c67907220eaa2de990e053c10d7455237a7f858 backup.py
+df7261593c8afc8a5c8eac2573a74cf41105223d card.py
+976a6c63dd68c26c4eb7d2fbf26f61afc1fe8d10 cli.py
+8a89bab7d6a377c8536567cfc92c0afdddae98a3 decisions.py
+7f4cdc5def0db58a267b95ecd2f5a05e18844287 drill.py
+ff85e569496b8779b4402b99c4c565d4585efc39 export.py
+cd82656852e4d2365a1e8eab6b21f64907815174 gen_verb_registry.py
+fa95c38973803d98093c69e1d689c557654d3bf2 guidance.py
+c9cf188416e0c509d0529710035f27bbad78082e lease.py
+3be24a887ecf0d2de4031d83bb37178a8845ccc8 loop.py
+821ff56dde950c950ef4ffb32f132240efdfb4ed migrations/0001_initial.sql
+93f656e1bac96c75d36f261929f40f4781f3e384 migrations/0002_open_decisions_ask_link.sql
+bdf769b6118df1f35d71e810b4412d3227a592cd migrations/0003_loop_writer_identity.sql
+db0b9e7e46ade4d730780dbeb7f8ed87d960db4e migrations/0004_open_decisions_held.sql
+58c0f73c5f0552e4413d58a0d8b66fc73c028fe8 migrations/0005_decision_records.sql
+3d0449557a06d41692ef604d1ee8c231a37b6542 migrations/0006_claim_lease.sql
+35ef05da1b4e44f1268d886001270dcfc5304f10 migrations/0007_actor_operator.sql
+08fc3f8e02cdd443c8c1ca0fa52467e44b8bff36 migrations/0008_item_spec_version.sql
+1292ffdfd689c4ec43aaa7ed74cd61c7f39e6a24 migrations/0009_entities.sql
+94b959aa29d36ead9e73df7f1e6cb758a4735de5 paths.py
+6e7fa99d5f41fce2f2ae90883c44996bfefa7a19 pointers.py
+305e4ab5bd50e295bd0c595bba1a11d8786cf99f restore.py
+9cbe1c4beed94cddf888ad1fc7394d4c316cb1d8 schema.py
+b5e4c64a3f906e5a6bcf147d896e3cf235878196 search.py
+da795223d91186f7cce4cc462ecf50e8048a4fbe store.py
+f8fd17c208651c625c4cedc6b6edc215b1745c15 tests/conftest.py
+1edda3b5a69a01fdba7cc4c28131b81b1394af3c tests/fixtures/decisions/ticket.json
+516de401fd51eef600737ec667785c683f78de63 tests/test_append_many.py
+a3232def49b9eb01976034de1aae634779764997 tests/test_card.py
+b365a776cc9ac24876709c9407b61858136bdc39 tests/test_claim_lease.py
+c73a33be0177c6fda49cc97c745fa6efc30f0cb6 tests/test_cli.py
+646202126710925c0fd49dedd7a254c6aeb6427e tests/test_concurrency.py
+60b9dc41a9c6f4a1fdb520b9ed7ad06c817bead2 tests/test_context.py
+c6396601d19d217ab585811840ba989f6403672e tests/test_decisions.py
+e61e17407f5ece3ce2f62dc2d9ded7d27df0a86b tests/test_doctor_summary.py
+27b18bbcf0c3aae9c620d7d55f3617aa1cc4a002 tests/test_elect.py
+aa9cc001eb816fd05666ff17f14600e18dae7320 tests/test_entities.py
+a4f95a4ca707d8357e43a44c16c67fd028f16c4a tests/test_events_verb.py
+f4bde6b101813491da7bf2f60c293f8463c604f5 tests/test_expect_revision.py
+d30c639561e993365116e49bb4b277da3556042d tests/test_export_backup_restore.py
+42391df1f0af1095f98bc8e0c579cc5531cd05ae tests/test_first_try_verbs.py
+deec23f7e6a398576a7347d03d4c75a8bb3313a9 tests/test_grants.py
+a9fb77a601e6faad655113b10e99951e8d3293cf tests/test_guidance.py
+0deaf6118351751937e69a2acf1ef99dfcd97303 tests/test_idempotency_keys.py
+93ef379f76382dfb7adb70a5371bef85bb9cfc18 tests/test_item_spec.py
+699f6cea62233cf77e050866312921d1029b8577 tests/test_ledger.py
+3a6424b163007996e36a660f2dc1157be123d072 tests/test_link_duplicate_of.py
+7d6d681416a0719bac07202e3ed574788a33a6e5 tests/test_loop_writer_identity.py
+03b4bc9e31d50d867c806e55c5323e35cbbe6bd2 tests/test_newer_schema_refused.py
+cc35f0b4c30ca8a8401ba6246cbff8ad47ea02b6 tests/test_operator_field.py
+87ff513b8f79f210fd88712c3e60ceb02ae28fe9 tests/test_paths.py
+c1772165371e17994ede82f6b0ec81286d50f55a tests/test_questions_verb.py
+ea418662d67671e9d04be9c18c16bcc5b9478912 tests/test_readonly_open.py
+0912e26e367134bad8bae5d4abb3b8a928b5ce2b tests/test_resume.py
+a94c684f909e20761f28a1b9b50f67ef8d07f129 tests/test_search.py
+dd0ed8cb6e92191cd5c07bd1b6b12b151cb01297 tests/test_search_filters.py
+3b7f0acf44ee279b4f95f8e5b61414ba697f3d8f tests/test_search_round2.py
+b7b66c788767a5ea4c609fe498b9eda146c92a8b tests/test_source_locator.py
+4caf06889664258c0c5eec3af85fff3bd9df39bb tests/test_utterance_origin.py
+893e06e697c29cd7f21444af54f3ada18e24e8f0 tests/test_verb_discovery.py
+5f1b755731127c414138b4922e8297d4950534b6 tests/test_verb_plugins.py
+e36ef658610109a5dc03f26c187c430439cc0976 tests/test_verb_registry_generator.py
+30adfa304f4c022d2def95e23b75357b00e2103a tests/test_wave_slot_keys.py
+6b2777ddcfea8882646f03e483dda0d54b6b0712 verbs/__init__.py
+43aadf5f53d89a47d3ce6bd15e2ff890015723dd verbs/_registry.py
+9df5b8746bea718a5b69954568d03de026e1cc67 verbs/append.py
+7b9cb041be28b4e02ee17caf3f3baaa079b57679 verbs/append_many.py
+8aedb371a89985c130008c0cb45adee871739b5c verbs/backup.py
+b474d124048d087024a12ac05ba49eaaeb4b400d verbs/card.py
+342321ec2607478906b42941b0c080d534e31262 verbs/claim.py
+e4403e5eb81fd48473ad5fd7cd6361ebaf12f3ea verbs/context.py
+ebca1ca72e6e8ef599f498978469dd85abfe5bbd verbs/decisions.py
+f0f30af571c73e1b3114117fb346f8aafaa30bd2 verbs/doctor.py
+07396c18da22238ec9cb75b377511282fe3bdef5 verbs/elect.py
+937aafdaed47d7213e0c6c3c69863c6437d854b2 verbs/entities.py
+3a8bf848e3b8608fc5698d82d5fd038306028ae0 verbs/entity.py
+2649d2fdbd7b78d48b6defd4d155023ed7e925e0 verbs/events.py
+7ac6fe64fc69e35ba7722b0c18e1f773d2df8541 verbs/export.py
+775bcf57ea5bde50ada2a497a4e81199f4a7930d verbs/export_item.py
+024d84fc0db1f81dff26b214582b673192ff0ef3 verbs/grants.py
+8b40787e9e62f7cee1fa42cabb540bb3a3b09271 verbs/guidance.py
+cc8299cad5f98498ba20e8549c925318009351ae verbs/index.py
+36049fac5b924e4a4ff2b5ba7dbde34d01f06a3f verbs/link.py
+009aad1cb87d367871eb6480e8e168144935badf verbs/lint_quotes.py
+9fa7416eff5c1908aa71761c86e0f70ec84a0101 verbs/new.py
+09f155c98d92e5a3fee3075e13fc332e201aa0c0 verbs/note.py
+8046cbf11656e7d921afb42b4bd8847a5aaea1da verbs/pick.py
+e7f15f30932254c25c6c014359ee8724f0f3f98f verbs/query.py
+1a1e219686270ace37f23603817789b39b1c9d6b verbs/questions.py
+7dc88b7e9bb51102298508c21a660ba5bf0e0dbb verbs/ready.py
+a8ef9bea2ce122cd83c4c87a91d5281e0280d599 verbs/restore.py
+b13febab9957069c2c8ccc850195e82733a4d806 verbs/resume.py
+20cc1b1e355f2e646737dc76be0495689a04f6d2 verbs/search.py
+25829bc61af32cf0dc543051a99dd99bd2f4e936 verbs/spec.py
+016ba83ec5c2c89e0bab71ee3667328759f30df2 verbs/state.py
+9728093755f2f24742810dace76d358e21533849 verbs/verify.py

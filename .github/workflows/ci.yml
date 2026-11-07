@@ -1,0 +1,158 @@
+name: CI
+
+# The core's own gates. Every job runs on the self-hosted runner named by the
+# repository variable CORE_CI_RUNNER (a JSON list of labels), falling back to
+# the single label self-hosted; never on a hosted runner while the repository
+# is private. Python is the runner's own python3: nothing is downloaded to
+# provide it. No step is skipped or allowed to fail: a gate that cannot run
+# fails its job.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  # Every vendored test and every repository-only test, run stand-alone in
+  # this checkout, which holds only the vendored files and this repository's
+  # own: a test that reaches a file outside that set fails here. HOME is a
+  # fresh folder, so no test reads the runner's own home folder.
+  pytest:
+    name: pytest (vendored and repository-only tests, stand-alone)
+    runs-on: ${{ fromJSON(vars.CORE_CI_RUNNER || '["self-hosted"]') }}
+    timeout-minutes: 30
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Use the runner's python3, or install pytest into a job venv when it lacks pytest
+        shell: python3 {0}
+        run: |
+          import os, subprocess, sys
+          found = subprocess.run(["python3", "-c", "import pytest"], capture_output=True)
+          if found.returncode == 0:
+              python = "python3"
+              print("pytest is importable in the runner's python3")
+          else:
+              venv = os.path.join(os.environ["RUNNER_TEMP"], "core-pytest-venv")
+              subprocess.run(["python3", "-m", "venv", venv], check=True)
+              python = os.path.join(venv, "bin", "python")
+              subprocess.run([python, "-m", "pip", "install", "pytest==9.1.1"], check=True)
+              print(f"pytest installed into the job venv {venv}")
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as handle:
+              handle.write(f"CORE_PYTHON={python}\n")
+      - name: Run every test suite
+        shell: python3 {0}
+        run: |
+          import os, subprocess, sys, tempfile
+          home = tempfile.mkdtemp(dir=os.environ["RUNNER_TEMP"])
+          env = dict(os.environ, HOME=home, PYTHONDONTWRITEBYTECODE="1")
+          suites = ["skills/_lib/tests", "skills/_lib/recall/tests",
+                    "skills/_lib/ledger/tests", "scripts/tests"]
+          command = [os.environ["CORE_PYTHON"], "-m", "pytest", "-q", "-ra",
+                     "-p", "no:cacheprovider", *suites]
+          sys.exit(subprocess.run(command, env=env).returncode)
+
+  # .core-manifest lists exactly the vendored files, each tracked at mode
+  # 100644, and every other tracked file is in VENDORING.md's
+  # repository-only table.
+  core-manifest:
+    name: core manifest
+    runs-on: ${{ fromJSON(vars.CORE_CI_RUNNER || '["self-hosted"]') }}
+    timeout-minutes: 5
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: .core-manifest and the repository-only table cover every tracked file
+        run: python3 scripts/check-core-manifest.py
+
+  # No tracked file names a person, a machine, a home path or a private host.
+  # The person and owner words come only from the repository secret
+  # NO_PERSON_DENY, which the log masks (a repository variable would be
+  # printed in the step's env block); no step echoes it. The check fails
+  # here when it is unset or empty, and never prints a matched word or the
+  # list.
+  no-person:
+    name: no person
+    runs-on: ${{ fromJSON(vars.CORE_CI_RUNNER || '["self-hosted"]') }}
+    timeout-minutes: 5
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: No tracked file names a person, a machine, a home path or a private host
+        env:
+          NO_PERSON_DENY: ${{ secrets.NO_PERSON_DENY }}
+        run: python3 scripts/check-no-person.py
+
+  # The vendored ledger. skills/_lib/ledger is the public ledger repository's
+  # ledger/ tree at the commit ledger-vendor.pin names, byte for byte.
+  #   * offline: the files of this checkout against the pin's manifest of git
+  #     blob ids (an edited, removed, added, re-moded or symlinked file);
+  #   * --source: the manifest against the ledger repository at the pinned
+  #     commit, which must be the pinned tag and be on the ledger's main.
+  ledger-drift:
+    name: ledger drift
+    runs-on: ${{ fromJSON(vars.CORE_CI_RUNNER || '["self-hosted"]') }}
+    timeout-minutes: 10
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: skills/_lib/ledger matches ledger-vendor.pin (offline)
+        run: python3 scripts/check-ledger-vendor.py
+      # The ledger repository is public and belongs to this repository's
+      # owner; its URL is built from github.repository_owner, never typed.
+      # This step fetches exactly three things, read-only over HTTPS with no
+      # token, no credential helper and none of the runner's git
+      # configuration, into a fresh folder under RUNNER_TEMP: the ledger's
+      # main (into refs/remotes/origin/main), the pinned tag and the pinned
+      # commit. A pin whose repo line names any other repository fails the
+      # step rather than redirect the fetch; a failed fetch fails the step.
+      - name: ledger-vendor.pin matches the ledger repository at the pinned commit (--source)
+        env:
+          GIT_CONFIG_NOSYSTEM: '1'
+          GIT_CONFIG_GLOBAL: /dev/null
+          GIT_TERMINAL_PROMPT: '0'
+          OWNER: ${{ github.repository_owner }}
+        shell: python3 {0}
+        run: |
+          import os, re, subprocess, sys, tempfile
+          owner = os.environ["OWNER"]
+          expected = f"{owner}/ledger"
+          url = f"https://github.com/{expected}.git"
+          values = {"repo": [], "sha": [], "tag": []}
+          with open("ledger-vendor.pin", encoding="utf-8") as handle:
+              for line in handle:
+                  fields = line.split()
+                  if len(fields) >= 2 and fields[0] in values:
+                      values[fields[0]].append(fields[1])
+          def refuse(message):
+              print(message, file=sys.stderr)
+              sys.exit(1)
+          if values["repo"] != [expected]:
+              refuse(f"ledger-vendor.pin names repo {values['repo']}; this step fetches only {expected}")
+          if len(values["sha"]) != 1 or not re.fullmatch(r"[0-9a-f]{40}", values["sha"][0]):
+              refuse("ledger-vendor.pin has no single 40-hex sha line")
+          if len(values["tag"]) != 1 or not re.fullmatch(r"[A-Za-z0-9._-]+", values["tag"][0]):
+              refuse("ledger-vendor.pin has no single well-formed tag line")
+          sha, tag = values["sha"][0], values["tag"][0]
+          source = tempfile.mkdtemp(prefix="ledger-at-pin.", dir=os.environ["RUNNER_TEMP"])
+          def git(*args):
+              done = subprocess.run(["git", *args])
+              if done.returncode != 0:
+                  refuse(f"git {args[0]} failed with exit {done.returncode}")
+          git("init", "-q", source)
+          git("-C", source, "fetch", "--no-tags", url, "refs/heads/main:refs/remotes/origin/main")
+          git("-C", source, "fetch", "--no-tags", url, f"refs/tags/{tag}:refs/tags/{tag}")
+          git("-C", source, "fetch", "--no-tags", url, sha)
+          check = subprocess.run(["python3", "scripts/check-ledger-vendor.py", "--source", source])
+          sys.exit(check.returncode)
