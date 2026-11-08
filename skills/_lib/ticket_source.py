@@ -35,12 +35,33 @@ class Ticket:
     url: str | None
 
 
+@dataclass(frozen=True)
+class Subtask:
+    """A tracker item created under an anchor: its id and, when known, its URL."""
+
+    id: str
+    url: str | None
+
+
 class TicketSource(Protocol):
+    """Read and write one tracker.
+
+    ``create_subtask`` creates one tracker item under the anchor item
+    ``anchor_id`` and returns it; ``comment`` posts one comment on a tracker
+    item and returns the comment's id. Neither edits the anchor itself or the
+    tracker's own breakdown of it. A caller that must write at most once
+    turns off its transport's retries around these calls.
+    """
+
     def pull(self, lane: str) -> list[Ticket]: ...
 
     def get(self, ticket_id: str) -> Ticket: ...
 
     def file(self, ticket: Ticket) -> str: ...
+
+    def create_subtask(self, anchor_id: str, title: str, body_md: str) -> Subtask: ...
+
+    def comment(self, ticket_id: str, text: str) -> str: ...
 
 
 class TicketSourceRefused(RuntimeError):
@@ -166,6 +187,71 @@ class NotionTicketSource:
             raise TicketSourceRefused("notion_create_missing_id")
         return new_id
 
+    def create_subtask(self, anchor_id: str, title: str, body_md: str) -> Subtask:
+        """Create a page under the anchor page ``anchor_id`` and return it.
+
+        The tasks database has no sub-item relation, so the subtask is a child
+        page of the anchor: ``title`` as its title and ``body_md`` as
+        paragraphs. The anchor's properties and its database row are not
+        touched.
+        """
+        payload = {
+            "parent": {"page_id": anchor_id},
+            "properties": {
+                "title": {
+                    "title": [
+                        {"type": "text", "text": {"content": part}}
+                        for part in self._notion.chunk(title)
+                    ]
+                }
+            },
+        }
+        children = [
+            {
+                "object": "block",
+                "type": "paragraph",
+                "paragraph": {"rich_text": [{"type": "text", "text": {"content": part}}]},
+            }
+            for part in self._notion.chunk(body_md)
+            if part
+        ]
+        if children:
+            payload["children"] = children
+        if self._notion.DRY_RUN:
+            print(
+                f"[dry-run] would create subtask: {json.dumps(payload)}",
+                file=sys.stderr,
+            )
+            raise TicketSourceRefused("notion_dry_run")
+        response = self._transport("POST", "/pages", payload)
+        new_id = response.get("id")
+        if not new_id:
+            raise TicketSourceRefused("notion_create_missing_id")
+        return Subtask(id=new_id, url=response.get("url"))
+
+    def comment(self, ticket_id: str, text: str) -> str:
+        """Post one comment on the page ``ticket_id``; return the comment's id."""
+        if not text.strip():
+            raise TicketSourceRefused("comment_text_empty")
+        payload = {
+            "parent": {"page_id": ticket_id},
+            "rich_text": [
+                {"type": "text", "text": {"content": part}}
+                for part in self._notion.chunk(text)
+            ],
+        }
+        if self._notion.DRY_RUN:
+            print(
+                f"[dry-run] would comment: {json.dumps(payload)}",
+                file=sys.stderr,
+            )
+            raise TicketSourceRefused("notion_dry_run")
+        response = self._transport("POST", "/comments", payload)
+        comment_id = response.get("id")
+        if not comment_id:
+            raise TicketSourceRefused("notion_comment_missing_id")
+        return comment_id
+
 
 class WorkTrackerStub:
     """Refuse until a work-tracker transport and field mapping are defined."""
@@ -181,6 +267,12 @@ class WorkTrackerStub:
         self._refuse()
 
     def file(self, ticket: Ticket) -> str:
+        self._refuse()
+
+    def create_subtask(self, anchor_id: str, title: str, body_md: str) -> Subtask:
+        self._refuse()
+
+    def comment(self, ticket_id: str, text: str) -> str:
         self._refuse()
 
 
