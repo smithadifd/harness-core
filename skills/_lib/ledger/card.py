@@ -22,6 +22,7 @@ Format (stable — a later reader should parse this layout, not invent one):
     ## Open questions
     ## Next step
     ## Links
+    ## Children    (only when the item has children; the header shows closed/total)
     ## Blockers
     ## Notes
     ## Decision records        (these eight only when they have content)
@@ -38,8 +39,10 @@ Format (stable — a later reader should parse this layout, not invent one):
 
 The spec line names the item's current spec version (its latest item.spec
 event, also named in source_event_ids). The moved line appears only while
-the item is claimed and its claim stamped spec_version N older than the
-current M. A claim rewritten by the same holder without a stamp (the loop's
+the item is claimed, its claim stamped spec_version N older than the
+current M, and the content hash of the current spec differs from the hash of
+version N (a version written only to move the source says nothing; when
+version N's event cannot be found the version numbers decide). A claim rewritten by the same holder without a stamp (the loop's
 hand-off and re-stamp writes) keeps the version its run of claims stamped.
 ``ledger spec show`` prints the spec itself; the card names it and stays
 bounded.
@@ -47,6 +50,15 @@ bounded.
 Links lists the item's own links, then a "duplicated-by: <item>" row for
 each item linked to this one as its duplicate (the duplicate's own card lists
 "duplicate-of: <this item>").
+
+An anchor's card has a Children section after Links: one line per child
+(id, title, status, holder), a child that blocks another first, then in
+creation order, under a header carrying closed/total over all children. An
+item with no children has no section. The rollup stays whole when long
+sections are capped. A capped Children section ends "(+K cut; ledger query
+--parent=<item> --all)": the children are other items' events, so the
+anchor's own export does not list them, and that query prints every child the
+anchor has when it runs. The command carries no count taken from the card.
 
 The resume sections come from decision.recorded (with its latest standing
 and result), item.tried, item.progress, review.recorded and the latest
@@ -104,6 +116,7 @@ WORD_LIMIT words.
 from __future__ import annotations
 
 import shlex
+import unicodedata
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Iterable, Mapping
 
@@ -294,6 +307,13 @@ class Card:
     # The current spec version, and the version the active claim stamped.
     spec_version: int | None = None
     spec_claim_version: int | None = None
+    # The content hashes of the current spec and of the claimed version.
+    spec_hash: str | None = None
+    spec_claim_hash: str | None = None
+    # The item's children (see children_of) and the rollup over all of them.
+    children: tuple[dict[str, Any], ...] = ()
+    children_closed: int = 0
+    children_total: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         """Structured form of the same content the text card shows."""
@@ -311,6 +331,11 @@ class Card:
             "open_questions": [dict(row) for row in self.open_questions],
             "next_step": self.next_step,
             "links": [dict(row) for row in self.links],
+            "children": [dict(row) for row in self.children],
+            "children_rollup": {
+                "closed": self.children_closed,
+                "total": self.children_total,
+            },
             "blockers": list(self.blockers),
             "notes": [dict(row) for row in self.notes],
             "decision_records": [dict(row) for row in self.decision_records],
@@ -323,15 +348,32 @@ class Card:
             "pointers": [dict(row) for row in self.pointers],
             "spec_version": self.spec_version,
             "spec_claim_version": self.spec_claim_version,
-            "spec_moved": spec_moved_line(self.spec_claim_version, self.spec_version),
+            "spec_moved": spec_moved_line(
+                self.spec_claim_version,
+                self.spec_version,
+                self.spec_claim_hash,
+                self.spec_hash,
+            ),
             "truncated": list(self.truncated),
             "footer": footer_line(self.item_id),
         }
 
 
-def spec_moved_line(claimed: int | None, current: int | None) -> str | None:
-    """``spec moved: vN → vM`` when the claim's version N is older than M."""
+def spec_moved_line(
+    claimed: int | None,
+    current: int | None,
+    claimed_hash: str | None = None,
+    current_hash: str | None = None,
+) -> str | None:
+    """``spec moved: vN → vM`` when the claim's version N is older than M.
+
+    When both content hashes are known and equal the content the claim was
+    built against is unchanged (a source-only version), so there is no line.
+    A missing hash falls back to the version numbers alone.
+    """
     if claimed is None or current is None or current <= claimed:
+        return None
+    if claimed_hash is not None and current_hash is not None and claimed_hash == current_hash:
         return None
     return f"spec moved: v{claimed} → v{current}"
 
@@ -375,6 +417,17 @@ def claim_spec_version(events: list[Any], item: Mapping[str, Any]) -> int | None
     return None
 
 
+def spec_content_hash(events: Iterable[Any], version: int | None) -> str | None:
+    """The content hash of spec ``version`` among ``events``, or None if absent."""
+    if version is None:
+        return None
+    for event in events:
+        if event.kind == SPEC_KIND and event.payload.get("version") == version:
+            digest = event.payload.get("content_hash")
+            return digest if isinstance(digest, str) else None
+    return None
+
+
 def item_spec_moved(lg: Ledger, item_id: str) -> str | None:
     """The ``spec moved`` line for one item, or None (see ``spec_moved_line``)."""
     item = lg.item(item_id)
@@ -383,7 +436,13 @@ def item_spec_moved(lg: Ledger, item_id: str) -> str | None:
     events = lg.events(item_id=item_id)
     spec = latest_spec_event(events)
     current = None if spec is None else spec.payload.get("version")
-    return spec_moved_line(claim_spec_version(events, item), current)
+    claimed = claim_spec_version(events, item)
+    return spec_moved_line(
+        claimed,
+        current,
+        spec_content_hash(events, claimed),
+        None if spec is None else spec.payload.get("content_hash"),
+    )
 
 
 def _dash(value: str | None) -> str:
@@ -424,6 +483,12 @@ def footer_line(item_id: str) -> str:
 def _cut_count(count: int, item_id: str) -> str:
     """Marker for rows or ids cut from a section or the header."""
     return f"(+{count} cut; {recover_command(item_id)})"
+
+
+def children_command(item_id: str) -> str:
+    """The command that prints every child ``item_id`` has when it runs."""
+    # The --flag=value form keeps an id with a leading hyphen one argument.
+    return shlex.join(["ledger", "query", f"--parent={item_id}", "--all"])
 
 
 def _cut_words(count: int, item_id: str) -> str:
@@ -506,6 +571,49 @@ def _fmt_links(rows: tuple[dict[str, Any], ...]) -> str:
 def _fmt_notes(rows: tuple[dict[str, Any], ...]) -> str:
     lines = [f"- event={row['event_id']}: {row['text']}" for row in rows]
     return _fmt_list(lines)
+
+
+_NAMED_ESCAPES = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
+
+
+def _one_line(value: Any) -> str:
+    """The value as text that cannot end its line: every control character,
+    and the Unicode line and paragraph separators, becomes a visible escape."""
+    out = []
+    for char in str(value):
+        if char in _NAMED_ESCAPES:
+            out.append(_NAMED_ESCAPES[char])
+        elif unicodedata.category(char) in ("Cc", "Zl", "Zp"):
+            out.append(f"\\u{ord(char):04x}")
+        else:
+            out.append(char)
+    return "".join(out)
+
+
+def _fmt_children(rows: tuple[dict[str, Any], ...]) -> str:
+    lines = [
+        f"- {_one_line(row['item_id'])}: {_one_line(row['title'])} "
+        f"[{_one_line(row['status'])}] holder: {_one_line(_dash(row['holder']))}"
+        for row in rows
+    ]
+    return _fmt_list(lines)
+
+
+def _children_block(card: Card) -> list[str]:
+    """The Children section, or nothing for an item with no children."""
+    if card.children_total <= 0:
+        return []
+    body = _fmt_children(card.children)
+    count = _omitted_count(card, "children")
+    if count > 0:
+        # The children are other items' events: name the query that lists them.
+        marker = f"(+{count} cut; {children_command(card.item_id)})"
+        body = marker if body == "(none)" else f"{body}\n{marker}"
+    return [
+        "",
+        f"## Children ({card.children_closed}/{card.children_total})",
+        body,
+    ]
 
 
 def _fmt_blockers(blockers: tuple[str, ...]) -> str:
@@ -629,7 +737,9 @@ def format_card(card: Card) -> str:
         f"claim: {_with_inline_marker(_dash(card.claim), card, 'claim')}",
         f"spec {_dash(None if card.spec_version is None else f'v{card.spec_version}')}",
     ]
-    moved = spec_moved_line(card.spec_claim_version, card.spec_version)
+    moved = spec_moved_line(
+        card.spec_claim_version, card.spec_version, card.spec_claim_hash, card.spec_hash
+    )
     if moved:
         parts.append(moved)
     parts += [
@@ -647,6 +757,7 @@ def format_card(card: Card) -> str:
         "",
         "## Links",
         _with_marker(_fmt_links(card.links), card, "links"),
+        *_children_block(card),
         "",
         "## Blockers",
         _with_marker(_fmt_blockers(card.blockers), card, "blockers"),
@@ -841,6 +952,7 @@ def bound_card(card: Card) -> Card:
         "decision_records": True,
         "decisions": True,
         "blockers": False,
+        "children": False,
         "open_questions": True,
         "refs": False,
     }
@@ -936,7 +1048,7 @@ def bound_card(card: Card) -> Card:
 
     # The stop point and the next seat's skills are never capped; references
     # go last, the last listed first, only when nothing else is left to cut.
-    for section in ("decision_records",) + CAP_ORDER + ("refs",):
+    for section in ("children", "decision_records") + CAP_ORDER + ("refs",):
         items = list(getattr(current, section))
         while word_count(format_card(current)) > WORD_LIMIT and items:
             if keep_newest[section]:
@@ -1131,6 +1243,45 @@ def _resume_sections(
     }
 
 
+def children_of(
+    rows: Iterable[Mapping[str, Any]], events: Iterable[Any], item_id: str
+) -> list[dict[str, Any]]:
+    """The items whose current anchor is ``item_id``, one row each.
+
+    A child that ``blocks`` another child comes before it; otherwise creation
+    order. A cycle among the blocks links falls back to creation order for
+    what is left.
+    """
+    kids = sorted(
+        (row for row in rows if row.get("parent_id") == item_id),
+        key=lambda row: int(row["created_event_id"]),
+    )
+    ids = {row["item_id"] for row in kids}
+    before: dict[str, set[str]] = {i: set() for i in ids}
+    for event in events:
+        if event.kind != "item.linked" or event.payload.get("rel") != "blocks":
+            continue
+        blocker, blocked = event.item_id, event.payload.get("target")
+        if blocker in ids and blocked in ids and blocker != blocked:
+            before[blocked].add(blocker)
+    ordered: list[dict[str, Any]] = []
+    placed: set[str] = set()
+    left = list(kids)
+    while left:
+        pick = next((row for row in left if before[row["item_id"]] <= placed), left[0])
+        left.remove(pick)
+        placed.add(pick["item_id"])
+        ordered.append(
+            {
+                "item_id": pick["item_id"],
+                "title": pick["title"],
+                "status": pick["status"],
+                "holder": pick["owner"] if pick["owner"] is not None else pick["claim"],
+            }
+        )
+    return ordered
+
+
 def project_item(
     lg: Ledger, item: Mapping[str, Any], *, pointers: PointerSource | None = None
 ) -> Card:
@@ -1213,7 +1364,9 @@ def project_item(
     # A "blocks" link lives on the blocker and names the item it blocks,
     # the same direction v_ready reads (migrations/0001_initial.sql): a
     # link {rel: "blocks", target: T} on item S blocks T.
-    closed = {row["item_id"] for row in lg.items() if row["status"] == "closed"}
+    rows = lg.items()
+    closed = {row["item_id"] for row in rows if row["status"] == "closed"}
+    children = children_of(rows, events, item_id)
     for event in events:
         if event.kind != "item.linked":
             continue
@@ -1244,6 +1397,7 @@ def project_item(
     if state_id is not None:
         base.add(int(state_id))
     spec = latest_spec_event(own_events)
+    spec_claim = claim_spec_version(own_events, item)
     if spec is not None:
         base.add(spec.id)
     card = Card(
@@ -1262,9 +1416,14 @@ def project_item(
         links=links,
         blockers=blockers,
         notes=notes,
+        children=tuple(children),
+        children_closed=sum(1 for row in children if row["status"] == "closed"),
+        children_total=len(children),
         **_resume_sections(lg, item_id, item_events, pointers),
         spec_version=None if spec is None else spec.payload.get("version"),
-        spec_claim_version=claim_spec_version(own_events, item),
+        spec_claim_version=spec_claim,
+        spec_hash=None if spec is None else spec.payload.get("content_hash"),
+        spec_claim_hash=spec_content_hash(own_events, spec_claim),
     )
     # The creation, state and current spec events are always named; past SOURCE_ID_LIMIT
     # the header keeps them, the newest open ask and the latest election,
@@ -1295,10 +1454,13 @@ __all__ = [
     "Card",
     "PointerSource",
     "bound_card",
+    "children_command",
+    "children_of",
     "claim_spec_version",
     "derive_next_step",
     "format_card",
     "item_spec_moved",
+    "spec_content_hash",
     "latest_spec_event",
     "project_card",
     "project_item",

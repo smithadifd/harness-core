@@ -30,6 +30,7 @@ skills/_lib/ledger/migrations/0006_claim_lease.sql
 skills/_lib/ledger/migrations/0007_actor_operator.sql
 skills/_lib/ledger/migrations/0008_item_spec_version.sql
 skills/_lib/ledger/migrations/0009_entities.sql
+skills/_lib/ledger/migrations/0010_child_of.sql
 skills/_lib/ledger/paths.py
 skills/_lib/ledger/pointers.py
 skills/_lib/ledger/restore.py
@@ -40,6 +41,7 @@ skills/_lib/ledger/tests/conftest.py
 skills/_lib/ledger/tests/fixtures/decisions/ticket.json
 skills/_lib/ledger/tests/test_append_many.py
 skills/_lib/ledger/tests/test_card.py
+skills/_lib/ledger/tests/test_child_of.py
 skills/_lib/ledger/tests/test_claim_lease.py
 skills/_lib/ledger/tests/test_cli.py
 skills/_lib/ledger/tests/test_concurrency.py
@@ -51,6 +53,7 @@ skills/_lib/ledger/tests/test_entities.py
 skills/_lib/ledger/tests/test_events_verb.py
 skills/_lib/ledger/tests/test_expect_revision.py
 skills/_lib/ledger/tests/test_export_backup_restore.py
+skills/_lib/ledger/tests/test_export_item_row_source.py
 skills/_lib/ledger/tests/test_first_try_verbs.py
 skills/_lib/ledger/tests/test_grants.py
 skills/_lib/ledger/tests/test_guidance.py
@@ -62,6 +65,7 @@ skills/_lib/ledger/tests/test_loop_writer_identity.py
 skills/_lib/ledger/tests/test_newer_schema_refused.py
 skills/_lib/ledger/tests/test_operator_field.py
 skills/_lib/ledger/tests/test_paths.py
+skills/_lib/ledger/tests/test_query_parent_fields.py
 skills/_lib/ledger/tests/test_questions_verb.py
 skills/_lib/ledger/tests/test_readonly_open.py
 skills/_lib/ledger/tests/test_resume.py

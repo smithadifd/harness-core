@@ -17,8 +17,11 @@ GUIDANCE_DIRECTIONS = ("burn", "protect")
 ITEM_TYPES = ("topic", "ticket", "initiative", "decision", "gate", GUIDANCE_ITEM_TYPE)
 ITEM_STATUSES = ("open", "claimed", "blocked", "closed")
 # duplicate-of lives on the duplicate and names the item kept; `ledger link`
-# closes the duplicate in the same transaction.
-LINK_RELS = ("pr", "branch", "session", "item", "url", "blocks", "duplicate-of")
+# closes the duplicate in the same transaction. child-of lives on the child
+# and names its one anchor (the store's append path keeps the graph a forest).
+LINK_RELS = (
+    "pr", "branch", "session", "item", "url", "blocks", "duplicate-of", "child-of",
+)
 LOOP_OPERATIONS = ("build", "decision", "review", "merge", "ping")
 # A decision's standing is a position, never a ticket status: these values
 # share nothing with ITEM_STATUSES, and only decision events carry them.
@@ -168,6 +171,8 @@ SCHEMAS: dict[tuple[str, int], dict[str, Any]] = {
         },
         "optional": {
             "source": _SOURCE,
+            # A child-of move names the anchor it left.
+            "moved_from": {"type": "string", "min_len": 1},
         },
     },
     ("item.note", 1): {
@@ -180,8 +185,8 @@ SCHEMAS: dict[tuple[str, int], dict[str, Any]] = {
         },
     },
     # One immutable version of a ticket's content. ``ledger spec set``
-    # appends version N+1 only when content_hash differs from the current
-    # spec's; the latest item.spec event is the item's current spec.
+    # appends version N+1 only when content_hash or source differs from the
+    # current spec's; the latest item.spec event is the item's current spec.
     # content_hash is sha256 over the canonical JSON of SPEC_CONTENT_FIELDS
     # (an absent field hashes as null). source and source_rev say where the
     # content came from and are not hashed. The store reserves the kind for
