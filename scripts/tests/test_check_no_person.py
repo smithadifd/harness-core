@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -371,6 +372,92 @@ def test_allowance_duplicate_pair_and_crlf_are_refused(tmp_path):
     result2 = run(repo2, NO_PERSON_DENY=DENY)
     assert result2.returncode == 1
     assert f"{ALLOWANCE}:1: carriage return (CRLF line endings are refused)" in lines(result2)
+
+
+# The license carve: the MIT copyright line of the root LICENSE, and nothing
+# else. The holder is read from this repository's own root LICENSE, never
+# spelled here, and the deny list for these cases is built from its words.
+
+REPO_LICENSE = SCRIPT.parents[1] / "LICENSE"
+COPYRIGHT = re.compile(r"Copyright \(c\) [0-9]{4} (.+)")
+
+
+def license_case() -> tuple[str, int, str, str]:
+    """(the LICENSE text ending in a newline, the copyright line's number,
+    the copyright line, a deny expression of the holder's words and DENY)."""
+    text = REPO_LICENSE.read_text(encoding="utf-8")
+    if not text.endswith("\n"):
+        text += "\n"
+    rows = text.split("\n")
+    found = [number for number, row in enumerate(rows, 1) if COPYRIGHT.fullmatch(row)]
+    assert len(found) == 1, "the root LICENSE needs exactly one copyright line"
+    line = rows[found[0] - 1]
+    words = COPYRIGHT.fullmatch(line).group(1).split()
+    deny = "|".join(re.escape(word) for word in words) + "|" + DENY
+    return text, found[0], line, deny
+
+
+def test_the_root_license_copyright_line_passes(tmp_path):
+    text, _number, _line, deny = license_case()
+    repo = build(tmp_path, {"LICENSE": text})
+    result = run(repo, NO_PERSON_DENY=deny)
+    assert result.returncode == 0, result.stdout
+    assert lines(result) == ["no-person: ok: 3 tracked files scanned; deny list set"]
+
+
+@pytest.mark.parametrize("path", ["docs/LICENSE", "LICENSE.md", "COPYING", "README.md"])
+def test_the_copyright_line_in_any_other_file_fails(tmp_path, path):
+    text, number, _line, deny = license_case()
+    repo = build(tmp_path, {path: text})
+    result = run(repo, NO_PERSON_DENY=deny)
+    assert result.returncode == 1
+    assert lines(result) == [f"{path}:{number}: deny-list", "no-person: FAIL: 1 finding(s)"]
+
+
+def test_another_person_word_in_the_license_fails(tmp_path):
+    text, _number, line, deny = license_case()
+    holder = COPYRIGHT.fullmatch(line).group(1)
+    extra = text.count("\n") + 1
+    repo = build(tmp_path, {"LICENSE": text + "Maintained by " + holder + "\n" + TERM + "\n"})
+    result = run(repo, NO_PERSON_DENY=deny)
+    assert result.returncode == 1
+    assert lines(result) == [f"LICENSE:{extra}: deny-list", f"LICENSE:{extra + 1}: deny-list",
+                             "no-person: FAIL: 2 finding(s)"]
+
+
+def test_a_second_copy_of_the_copyright_line_fails(tmp_path):
+    text, _number, line, deny = license_case()
+    extra = text.count("\n") + 1
+    repo = build(tmp_path, {"LICENSE": text + line + "\n"})
+    result = run(repo, NO_PERSON_DENY=deny)
+    assert result.returncode == 1
+    assert lines(result) == [f"LICENSE:{extra}: deny-list", "no-person: FAIL: 1 finding(s)"]
+
+
+NEAR_MISSES = {
+    "other-holder": lambda line: line + " and " + TERM.capitalize(),
+    "extra-holder-text": lambda line: line + " Jr",
+    "upper-c": lambda line: line.replace("(c)", "(C)", 1),
+    "lower-copyright": lambda line: line.replace("Copyright", "copyright", 1),
+    "double-space": lambda line: line.replace("(c) ", "(c)  ", 1),
+    "leading-space": lambda line: " " + line,
+    "trailing-space": lambda line: line + " ",
+    "carriage-return": lambda line: line + "\r",
+    "bullet": lambda line: "- " + line,
+    "two-digit-year": lambda line: re.sub(r"\(c\) [0-9]{2}([0-9]{2})", r"(c) \1", line, count=1),
+    "no-year": lambda line: re.sub(r"\(c\) [0-9]{4}", "(c)", line, count=1),
+}
+
+
+@pytest.mark.parametrize("name", sorted(NEAR_MISSES))
+def test_a_near_miss_of_the_copyright_line_in_the_license_fails(tmp_path, name):
+    text, number, line, deny = license_case()
+    changed = NEAR_MISSES[name](line)
+    assert changed != line
+    repo = build(tmp_path, {"LICENSE": text.replace(line + "\n", changed + "\n", 1)})
+    result = run(repo, NO_PERSON_DENY=deny)
+    assert result.returncode == 1
+    assert lines(result) == [f"LICENSE:{number}: deny-list", "no-person: FAIL: 1 finding(s)"]
 
 
 def test_outside_a_git_work_tree_fails(tmp_path):

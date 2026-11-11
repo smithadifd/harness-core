@@ -1,11 +1,11 @@
 name: CI
 
-# The core's own gates. Every job runs on the self-hosted runner named by the
-# repository variable CORE_CI_RUNNER (a JSON list of labels), falling back to
-# the single label self-hosted; never on a hosted runner while the repository
-# is private. Python is the runner's own python3: nothing is downloaded to
-# provide it. No step is skipped or allowed to fail: a gate that cannot run
-# fails its job.
+# The core's own gates. Every job runs on the runner named by the repository
+# variable CORE_CI_RUNNER (a JSON list of labels) when it is set, and on the
+# GitHub-hosted ubuntu-latest runner when it is unset or empty; no job falls
+# back to a self-hosted runner. Python is the runner's own python3: nothing is
+# downloaded to provide it. No step is skipped or allowed to fail: a gate that
+# cannot run fails its job.
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
@@ -22,7 +22,7 @@ jobs:
   # fresh folder, so no test reads the runner's own home folder.
   pytest:
     name: pytest (vendored and repository-only tests, stand-alone)
-    runs-on: ${{ fromJSON(vars.CORE_CI_RUNNER || '["self-hosted"]') }}
+    runs-on: ${{ fromJSON(vars.CORE_CI_RUNNER || '["ubuntu-latest"]') }}
     timeout-minutes: 30
     steps:
       - name: Check out the repository
@@ -62,7 +62,7 @@ jobs:
   # repository-only table.
   core-manifest:
     name: core manifest
-    runs-on: ${{ fromJSON(vars.CORE_CI_RUNNER || '["self-hosted"]') }}
+    runs-on: ${{ fromJSON(vars.CORE_CI_RUNNER || '["ubuntu-latest"]') }}
     timeout-minutes: 5
     steps:
       - name: Check out the repository
@@ -80,7 +80,7 @@ jobs:
   # list.
   no-person:
     name: no person
-    runs-on: ${{ fromJSON(vars.CORE_CI_RUNNER || '["self-hosted"]') }}
+    runs-on: ${{ fromJSON(vars.CORE_CI_RUNNER || '["ubuntu-latest"]') }}
     timeout-minutes: 5
     steps:
       - name: Check out the repository
@@ -100,7 +100,7 @@ jobs:
   #     commit, which must be the pinned tag and be on the ledger's main.
   ledger-drift:
     name: ledger drift
-    runs-on: ${{ fromJSON(vars.CORE_CI_RUNNER || '["self-hosted"]') }}
+    runs-on: ${{ fromJSON(vars.CORE_CI_RUNNER || '["ubuntu-latest"]') }}
     timeout-minutes: 10
     steps:
       - name: Check out the repository

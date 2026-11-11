@@ -29,6 +29,16 @@ Two kinds of rule run over every line of every tracked file:
   path, the sha256 of the lowercased matched text) is a row of
   ``scripts/no-person-allowance.tsv``; the same text in any other file, or
   any other text, fails. Path names are matched too.
+- The license carve: one line is exempt from the deny list, the MIT
+  copyright line of the root ``LICENSE`` file. It is that line only when
+  the path is exactly ``LICENSE``, the whole line is ``Copyright (c)
+  <year> <holder>`` (single spaces, four ASCII digits, no leading or
+  trailing space) and the sha256 of the holder text equals
+  ``LICENSE_HOLDER_SHA256`` below, so the holder is pinned without being
+  spelled here. Only its first occurrence in that file is exempt. The same
+  line in any other file, a second copy of it, any other holder or near
+  miss of the shape, and every other line of ``LICENSE`` still run the
+  deny list; the shape rules run on the exempt line too.
 
 Output, one line per hit, never the matched text and never the variable:
 
@@ -81,6 +91,11 @@ LEDGER_TREE = "skills/_lib/ledger/"
 # Two shapes do not run in a file under the public ledger tree: its own
 # home-folder paths and decision numbers. Every other shape still does.
 LEDGER_SHAPES = frozenset({"private home folder", "decision number"})
+# The license carve (see the docstring): exactly this path, exactly this line
+# shape, and the holder text pinned by its sha256.
+LICENSE_PATH = "LICENSE"
+LICENSE_LINE = re.compile(r"Copyright \(c\) [0-9]{4} (\S(?:.*\S)?)")
+LICENSE_HOLDER_SHA256 = "c157acfd0136907586269d8508b72f480981d020bf98eda12b47a8a0a82f0093"
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 _GIT_LOCATION_ENV = frozenset({
     "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
@@ -252,6 +267,17 @@ def parse_allowance(text: str) -> tuple[dict[tuple[str, str], int], list[str]]:
     return pairs, problems
 
 
+def license_copyright_line(path: str, line: str) -> bool:
+    """True only for the root LICENSE's MIT copyright line naming the pinned holder."""
+    if path != LICENSE_PATH:
+        return False
+    match = LICENSE_LINE.fullmatch(line)
+    if match is None:
+        return False
+    holder = match.group(1).encode("utf-8", "surrogateescape")
+    return hashlib.sha256(holder).hexdigest() == LICENSE_HOLDER_SHA256
+
+
 def scan_text(path: str, data: bytes, deny: re.Pattern[str] | None,
               allowed: dict[tuple[str, str], int], used: set[tuple[str, str]]) -> list[str]:
     """One ``<path>:<line>: <rule>`` per rule a line of ``data`` breaks.
@@ -262,8 +288,12 @@ def scan_text(path: str, data: bytes, deny: re.Pattern[str] | None,
     text = data.decode("utf-8", errors="surrogateescape")
     in_ledger = path.startswith(LEDGER_TREE)
     hits: list[str] = []
+    carved = False
     for number, line in enumerate(text.split("\n"), 1):
         rules: list[str] = []
+        # The license carve applies once per file, at its first occurrence.
+        carve = not carved and license_copyright_line(path, line)
+        carved = carved or carve
         for name, pattern in SHAPES:
             if in_ledger and name in LEDGER_SHAPES:
                 continue
@@ -272,7 +302,7 @@ def scan_text(path: str, data: bytes, deny: re.Pattern[str] | None,
         for name, pattern in SECRET_SHAPES:
             if pattern.search(line):
                 rules.append(f"secret shape: {name}")
-        if deny is not None and not in_ledger:
+        if deny is not None and not in_ledger and not carve:
             for match in deny.finditer(line):
                 if not match.group(0):
                     continue

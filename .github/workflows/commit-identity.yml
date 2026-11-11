@@ -3,7 +3,9 @@ name: Commit identity
 # PR-only identity gate. The only secret this workflow may read is
 # BLOCKED_COMMIT_IDENTITY (Actions masks it). Unset/empty is a loud
 # warn-and-pass. Drafts still run — identity is independent of review state.
-# No path filter: every pull request is checked.
+# No path filter: every pull request is checked. The job runs on the runner
+# named by the repository variable CORE_CI_RUNNER when it is set, and on the
+# GitHub-hosted ubuntu-latest runner otherwise.
 on:
   pull_request:
     # ready_for_review is listed so a draft that is later marked ready still
@@ -20,7 +22,7 @@ jobs:
   # silent green.
   commit-identity:
     name: blocked commit identity
-    runs-on: ${{ fromJSON(vars.CORE_CI_RUNNER || '["self-hosted"]') }}
+    runs-on: ${{ fromJSON(vars.CORE_CI_RUNNER || '["ubuntu-latest"]') }}
     timeout-minutes: 5
     steps:
       - name: Check out the repository

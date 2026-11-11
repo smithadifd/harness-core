@@ -1,5 +1,17 @@
 # Harness core
 
+## Status: alpha
+
+This is the working core of my own agent harness, published as it is.
+
+- **Held to a high bar:** every change here passed two independent model
+  reviews and tests that fail without it.
+- **Not done:** docs, onboarding, and any promise of stability. Interfaces
+  change between tags without notice.
+- **If you use it:** pin a tag and expect to read the code. There is no support.
+
+## What it is
+
 The harness core is the shared, person-neutral part of an AI coding-agent
 harness: the written standards agents work to, the small Python modules that
 find the harness and read its configuration, a session recall index, and an

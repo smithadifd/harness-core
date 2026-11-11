@@ -8,6 +8,7 @@ does not know fails the test rather than pass it.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -15,10 +16,16 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[2]
 CI = ROOT / ".github" / "workflows" / "ci.yml"
 IDENTITY = ROOT / ".github" / "workflows" / "commit-identity.yml"
-RUNS_ON = "${{ fromJSON(vars.CORE_CI_RUNNER || '[\"self-hosted\"]') }}"
+RUNS_ON = "${{ fromJSON(vars.CORE_CI_RUNNER || '[\"ubuntu-latest\"]') }}"
+# The one runs-on grammar: the CORE_CI_RUNNER override, else a JSON list
+# literal of labels. Anything else is unparsed and fails.
+RUNS_ON_SHAPE = re.compile(r"\$\{\{ fromJSON\(vars\.CORE_CI_RUNNER \|\| '(\[[^']*\])'\) \}\}")
+HOSTED_DEFAULT = ["ubuntu-latest"]
 JOBS = ["pytest", "core-manifest", "no-person", "ledger-drift"]
 # Every workflow file and its jobs; a workflow file not listed here fails.
 WORKFLOWS = {CI: JOBS, IDENTITY: ["commit-identity"]}
@@ -134,20 +141,61 @@ def workflow_files() -> list[Path]:
     return found
 
 
-# J9: private repository, self-hosted runner, in every workflow.
+def runner_default(expression: str) -> list[str]:
+    """The fallback label list of a runs-on expression; an expression outside
+    the one grammar, or a fallback that is not a JSON list of strings, fails."""
+    match = RUNS_ON_SHAPE.fullmatch(expression)
+    assert match, f"unparsed runs-on expression {expression!r}"
+    try:
+        value = json.loads(match.group(1))
+    except ValueError:
+        raise AssertionError(f"the runs-on fallback is not JSON: {expression!r}") from None
+    assert isinstance(value, list) and value and all(isinstance(label, str) for label in value), (
+        f"the runs-on fallback is not a list of labels: {expression!r}")
+    return value
 
-def test_j9_every_job_runs_on_the_runner_variable_with_the_self_hosted_default():
+
+# J9: every job runs on the CORE_CI_RUNNER override, else a GitHub-hosted runner.
+
+def test_j9_every_job_runs_on_the_runner_variable_with_the_hosted_default():
     for path in workflow_files():
         found = jobs(path.read_text(encoding="utf-8"))
         assert sorted(found) == sorted(WORKFLOWS[path]), path.name
         for name, job in found.items():
             assert field(job, "runs-on") == [RUNS_ON], (path.name, name)
+            assert runner_default(field(job, "runs-on")[0]) == HOSTED_DEFAULT, (path.name, name)
 
 
-def test_j9_no_hosted_runner_and_no_python_download_anywhere():
+def test_j9_no_job_falls_back_to_a_self_hosted_runner():
+    for path in workflow_files():
+        for name, job in jobs(path.read_text(encoding="utf-8")).items():
+            for expression in field(job, "runs-on"):
+                assert "self-hosted" not in runner_default(expression), (path.name, name)
+        for number, line in enumerate(path.read_text(encoding="utf-8").split("\n"), 1):
+            if not line.lstrip().startswith("#"):
+                assert "self-hosted" not in line, f"{path.name}:{number}"
+
+
+@pytest.mark.parametrize("expression", [
+    "ubuntu-latest",
+    "${{ fromJSON('[\"ubuntu-latest\"]') }}",
+    "${{ fromJSON(vars.OTHER_RUNNER || '[\"ubuntu-latest\"]') }}",
+    "${{ fromJSON(vars.CORE_CI_RUNNER || '[\"ubuntu-latest\"]')}}",
+    "${{ fromJSON(vars.CORE_CI_RUNNER || '\"ubuntu-latest\"') }}",
+    "${{ fromJSON(vars.CORE_CI_RUNNER || '[ubuntu-latest]') }}",
+    "${{ fromJSON(vars.CORE_CI_RUNNER || '[]') }}",
+    "${{ fromJSON(vars.CORE_CI_RUNNER || '[1]') }}",
+], ids=["bare-label", "no-override", "other-variable", "missing-space", "not-a-list",
+        "not-json", "empty-list", "not-a-string"])
+def test_j9_an_unparsed_runs_on_expression_fails(expression):
+    with pytest.raises(AssertionError):
+        runner_default(expression)
+
+
+def test_j9_no_python_download_anywhere_and_one_runs_on_per_job():
     for path in workflow_files():
         text = path.read_text(encoding="utf-8")
-        for word in ("ubuntu", "windows-latest", "macos-latest", "setup-python"):
+        for word in ("windows-latest", "macos-latest", "setup-python"):
             assert word not in text, (path.name, word)
         assert text.count("runs-on:") == len(WORKFLOWS[path]), path.name
 
