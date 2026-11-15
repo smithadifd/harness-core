@@ -1,5 +1,17 @@
 # Harness core
 
+Running Claude Code on many projects gets repetitive. Every project needs the
+same rules for security, review and deploys. Every session has to find its
+configuration and work out where things stand. Done by hand, that upkeep grows
+until it is the job.
+
+This repository is the part of one person's harness that handles it. That
+harness grew over months of daily use. The core is the piece carved out of it so
+that other people can, in time, install a default tier into their own Claude
+Code setup in a safe and controlled way. That install path is not built yet.
+This repository is the first step: the shared files, kept separate from
+everything that belongs to one person.
+
 ## Status: alpha
 
 This is the working core of my own agent harness, published as it is.
@@ -16,6 +28,28 @@ The harness core is the shared, person-neutral part of an AI coding-agent
 harness: the written standards agents work to, the small Python modules that
 find the harness and read its configuration, a session recall index, and an
 append-only item ledger, together with the tests that exercise them.
+
+## What it is not
+
+- **Not the delegation loop.** The loop plans sprints and runs many agents at
+  once. It is a heavier setup that sits on top of the core, and it is not what
+  someone else installs. A few standards here mention it, but its machinery is
+  not in this repository.
+- **Not one person's setup.** Nothing here may name a person, a machine or a
+  home folder, and a CI check fails the build if it does. Each person's own
+  accounts and settings go in an override layer on top of the core, which this
+  repository does not hold.
+
+## Where it sits
+
+Two sibling repositories are published separately, and both are public:
+
+- **ledger** is the item ledger, a tracker and decision log for agents. A copy
+  of it lives inside this repository (see "The ledger inside" below).
+- **skills** holds the skills themselves. This repository does not: its
+  `skills/` folder holds only shared library files and standards.
+
+## What is in it
 
 | Path | What it is |
 |---|---|
