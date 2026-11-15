@@ -115,14 +115,18 @@ each command), `--only <A|B|C>` (repeatable), `-h`. Environment:
 - `CLAUDE_CODE_OAUTH_TOKEN` is the only credential used. The probe passes it
   inline to each `claude` command and never prints it. Without it every
   selected load is `UNVERIFIED` and the script exits 2.
-- `PROBE_HOME` (optional) is an absolute path to a fresh, empty or absent
-  folder to use as the target home. The probe refuses it (exit 3, before any
-  session starts) when it is the invoking user's own home folder, is not an
-  absolute path, or already holds `.claude/rules` or a `.claude` symlink. Use a
-  new folder for each run; the probe leaves a folder you chose in place. With
-  it unset, the probe makes a temp home and removes it on exit.
-- `PROBE_LEDGER_TAG` (optional) names the ledger repository tag to probe in
-  load C; the default is its newest `vX.Y.Z` tag.
+- `PROBE_HOME` (optional) is an absolute path to an empty or absent folder to
+  use as the target home. The probe refuses it (exit 3, before anything is
+  created or any session starts) when it is the invoking user's own home
+  folder, is not an absolute path, or exists and is not empty. Use a new
+  folder for each run; the probe leaves a folder you chose in place. With it
+  unset, the probe makes a temp home and removes it on exit.
+
+Load C does not take its ledger code from the environment. It fetches the
+public ledger repository at the one commit pinned in the script (tag `v0.3.1`,
+commit `346cb3595180fcea702ebdd37b32ff8c36325ea5`) and is `UNVERIFIED` unless
+the fetched HEAD is exactly that commit, because the plugin's hooks run in a
+session that holds your token. Moving the pin is a change to the script.
 
 Every `claude` command gets `HOME=<target home>` on that one command, with
 `CLAUDE_CONFIG_DIR` and the other variables that could point it at another
@@ -138,11 +142,11 @@ summary: <n> pass, <n> fail, <n> unverified
 | Id | What it asks | PASS means |
 |---|---|---|
 | A1 | does a rules file in the target home's `.claude/rules/` reach the main thread | a one-turn no-tools session returned the file's random sentinel |
-| A2 | ... and a general-purpose subagent | the main thread's own `Agent` call to a general-purpose subagent came back with the sentinel, and the sentinel was not in the prompt it gave the subagent |
-| A3 | ... and a session after compaction | a resumed session was compacted with `/compact` (the stream shows `compact_boundary`), then returned the sentinel; the seed turn never held it |
+| A2 | ... and a general-purpose subagent | the main thread's own `Agent` call to one foreground subagent of type exactly `general-purpose` came back with the sentinel, and the sentinel was not in the prompt it gave the subagent |
+| A3 | ... and a session after compaction | one `claude` process was sent three messages (a seed turn that never held the sentinel, `/compact`, a question), the stream showed `compact_boundary` before the question's reply, and that reply held the sentinel. This proves the rules file's sentinel is still in that session's context after a compaction in that same session. It does not show whether Claude Code kept the file's text through the compaction or loaded it again, and it says nothing about a session resumed in a new process, which loads the rules file at start |
 | B1 | does a plugin option reach the main thread's Bash commands (diagnostic, not counted) | the main thread's `echo` of the exported variable showed the option value |
 | B2 | does a plugin option reach a general-purpose subagent's Bash commands (the verdict for B) | the subagent's `echo` showed the value set with `claude plugin configure --values-stdin`, with no Bash run by the main thread; the exact value seen is printed |
-| C | are the ledger plugin's hooks silent before setup | with no ledger value set and a call-recording `ledger` first on PATH, session start and one prompt each ran a hook that exited 0 with no output, the recorder was never called and no file was written outside Claude's own state |
+| C | are the ledger plugin's hooks silent before setup | with the pinned ledger plugin installed, no ledger value set and a call-recording `ledger` first on PATH, session start and one prompt each ran a hook of the `ledger-hooks` plugin that exited 0 with no output, the recorder was never called and no file was written outside Claude's own state. Only hook responses that name the `ledger-hooks` plugin count; responses from any other source are ignored, and with none that name it the line is `UNVERIFIED` |
 
 What each verdict means:
 
@@ -152,9 +156,12 @@ What each verdict means:
   there. A FAIL is a finding about the install design, not about the probe.
 - `UNVERIFIED`: the route could not be run or its reply could not be read: no
   token, no `claude`, a timeout, an unreadable or oversized reply, a
-  compaction the probe could not force, a test plugin that would not install,
-  a main thread that answered for the subagent, or a ledger tag that ships no
-  hooks plugin. It is never counted as a pass.
+  compaction the probe could not force in one process, a test plugin that would
+  not install, a main thread that answered for the subagent, a subagent that
+  ran in the background or was not of type `general-purpose`, a fetched ledger
+  commit that is not the pinned one, a pinned commit that ships no hooks
+  plugin, or hook responses that do not name the ledger plugin. It is never
+  counted as a pass.
 
 Exit codes: 0 every counted line PASS; 1 one or more FAIL and no UNVERIFIED; 2
 one or more UNVERIFIED (it wins over FAIL); 3 usage error or refused

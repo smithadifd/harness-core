@@ -22,17 +22,19 @@
 #
 # Environment:
 #   PROBE_HOME              absolute path of a fresh, empty-or-absent folder to
-#                           use as the target home. Refused (exit 3) when it
-#                           equals the invoking user's HOME or already holds
-#                           .claude/rules (or a .claude that is a symlink).
+#                           use as the target home. Refused (exit 3, before
+#                           anything is created) when it equals the invoking
+#                           user's HOME, or exists and is not empty (a file
+#                           of the caller's would otherwise be overwritten).
 #                           Unset: the probe makes its own temp home and
 #                           removes it on exit. A PROBE_HOME the caller chose
 #                           is left in place.
 #   CLAUDE_CODE_OAUTH_TOKEN the only credential the probe uses. It is passed
 #                           inline to each claude command and never printed.
 #                           Unset: every selected load is UNVERIFIED.
-#   PROBE_LEDGER_TAG        optional tag of the public ledger repository to
-#                           probe in load C. Unset: its newest vX.Y.Z tag.
+#
+# Load C runs the public ledger repository's hooks plugin at the one commit
+# pinned below (LEDGER_PIN_SHA); no environment variable changes it.
 #
 # Every claude command gets HOME=<target home> inline, with CLAUDE_CONFIG_DIR
 # and the other config-folder and credential variables removed, so the
@@ -43,6 +45,16 @@ EX_PASS=0; EX_FAIL=1; EX_UNVERIFIED=2; EX_USAGE=3
 MODEL=claude-haiku-5-5
 MAX_REPLY_BYTES=1048576
 LEDGER_PLUGIN=ledger-hooks
+# Load C runs the ledger plugin's hooks in a session that holds the operator's
+# token, so the code under test is pinned by commit, never by a tag name or a
+# newest-tag lookup: C is UNVERIFIED unless the fetched HEAD is exactly this
+# commit. Moving the pin is a change to this script, reviewed as one.
+LEDGER_PIN_TAG=v0.3.1
+LEDGER_PIN_SHA=346cb3595180fcea702ebdd37b32ff8c36325ea5
+# The local test plugin of load B. A plugin verb that takes an id is given
+# <plugin>@<marketplace>, the form `claude plugin list` shows.
+PROBE_PLUGIN=probe-option
+PROBE_MARKET=probe-marketplace
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
@@ -62,8 +74,8 @@ ledger repository.
   --timeout <secs>  per-command limit, a positive whole number (default 120)
   --only <A|B|C>    run only that load; repeatable (default: all three)
 
-Environment: PROBE_HOME (absolute, fresh folder to use as the target home),
-PROBE_LEDGER_TAG (ledger tag for load C), CLAUDE_CODE_OAUTH_TOKEN.
+Environment: PROBE_HOME (absolute, empty or absent folder to use as the target
+home), CLAUDE_CODE_OAUTH_TOKEN.
 
 Exit codes:
   0  every sub-load PASS
@@ -146,6 +158,11 @@ if [ "${PROBE_HOME+set}" = set ]; then
   fi
   if [ -L "$probe_home/.claude" ]; then
     refuse_home 'PROBE_HOME/.claude is a symlink'
+  fi
+  if [ -d "$probe_home" ]; then
+    # find's own error text counts as an entry: an unreadable folder is refused.
+    first_entry="$(find "$resolved_home" -mindepth 1 -maxdepth 1 2>&1 | head -n 1)"
+    [ -z "$first_entry" ] || refuse_home 'PROBE_HOME is not empty'
   fi
 fi
 
@@ -309,8 +326,10 @@ rand_hex() {
 #   <CODE>|<field 1>|<field 2>
 # CODE is BAD (field 1 says why the reply cannot be read), FOUND or MISSING
 # (the wanted text is, or is not, in the route under test; field 1 is the
-# value seen, field 2 an excerpt), NOSPAWN, NOTGP, TOPBASH or LEAK (the route
-# was not the one under test), NOEVENT, DIRTY or CLEAN (hook events).
+# value seen, field 2 an excerpt), NOSPAWN, NOTGP, BGRUN, TOPBASH or LEAK (the
+# route was not the one under test), NOBOUNDARY or LEAKSEED (the compaction
+# was not shown, or the sentinel was there before it), NOEVENT, DIRTY or CLEAN
+# (hook events of the ledger plugin).
 IFS= read -r -d '' ANALYZER <<'PYEOF' || true
 import json, re, sys
 
@@ -340,6 +359,7 @@ if re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", text):
     out("BAD", "reply holds a control character")
 
 OPT = re.compile(r"PROBE_OPT=\[([^\]]*)\]")
+LAUNCH = re.compile(r"Async agent launched|This tool result is internal metadata", re.I)
 
 
 def seen_option(blob):
@@ -388,12 +408,34 @@ def block_text(value):
     return ""
 
 
-if mode == "compact":
-    if any(event.get("type") == "system" and event.get("subtype") == "compact_boundary"
-           for event in events):
-        out("FOUND", "compact_boundary seen")
-    last = [event for event in events if event.get("type") == "result"]
-    out("MISSING", "no compact_boundary message", last[-1].get("result", "") if last else "")
+if mode == "compacted":
+    # One process, three turns: the seed, the /compact, the question. Each
+    # turn ends in a result message. PASS needs a compact_boundary between the
+    # seed's result and the question's result, so the reply that holds the
+    # sentinel came after a compaction in the same process.
+    needle = extra[0]
+    results = [number for number, event in enumerate(events) if event.get("type") == "result"]
+    if len(results) != 3:
+        out("BAD", "the stream has %d result messages, expected 3 (seed, compaction, question)" % len(results))
+    for number in results:
+        event = events[number]
+        if event.get("is_error") or event.get("subtype") != "success":
+            out("BAD", "result %s, is_error %s: %s" % (
+                event.get("subtype"), event.get("is_error"), event.get("result", "")))
+    seed_at, ask_at = results[0], results[2]
+    marks = [number for number, event in enumerate(events)
+             if event.get("type") == "system" and event.get("subtype") == "compact_boundary"
+             and seed_at < number < ask_at]
+    if not marks:
+        out("NOBOUNDARY", "no compact_boundary message between the seed turn and the question",
+            events[results[1]].get("result", ""))
+    for event in events[:marks[0]]:
+        if event.get("type") in ("assistant", "user", "result") and needle in json.dumps(event):
+            out("LEAKSEED", "the sentinel appeared before the compaction")
+    final = events[ask_at].get("result", "")
+    if needle in final:
+        out("FOUND", "compact_boundary seen before the reply", final)
+    out("MISSING", "", final)
 
 if mode == "subagent":
     needle, pattern = extra[0], extra[1]
@@ -417,8 +459,10 @@ if mode == "subagent":
         out("TOPBASH", "the main thread ran Bash itself %d time(s)" % top_bash)
     for given in spawned.values():
         kind = given.get("subagent_type")
-        if kind not in (None, "", "general-purpose"):
-            out("NOTGP", kind)
+        if kind != "general-purpose":
+            out("NOTGP", kind if isinstance(kind, str) and kind else "(missing)")
+        if str(given.get("run_in_background")).lower() == "true":
+            out("BGRUN", "subagent ran in the background")
         if needle in json.dumps(given):
             out("LEAK", "the subagent's prompt carried the sentinel")
     replies = []
@@ -427,24 +471,46 @@ if mode == "subagent":
             continue
         for item in blocks(event):
             if item.get("type") == "tool_result" and item.get("tool_use_id") in spawned:
+                if item.get("is_error"):
+                    out("BAD", "the subagent call returned an error: %s" % block_text(item.get("content")))
                 replies.append(block_text(item.get("content")))
     if not replies:
         out("BAD", "the subagent call has no result in the stream")
     reply = " ".join(replies)
+    # A background launch answers the Agent call with a notice, not with the
+    # subagent's final reply; reading it as the reply would be a false FAIL.
+    if LAUNCH.search(reply):
+        out("BGRUN", "subagent ran in the background", reply)
     if pattern in reply:
         out("FOUND", seen_option(reply), reply)
     out("MISSING", seen_option(reply), reply)
 
 if mode == "hooks":
+    plugin = extra[0]
     result_event()
     wanted = ("SessionStart", "UserPromptSubmit")
     counts = dict((name, 0) for name in wanted)
     dirty = []
+    others = []
+
+    def ours(event):
+        # Attributable to the plugin when the stream names it, as a whole word,
+        # in the hook's name or in a plugin field. A response that does not
+        # name it is another source's, and is neither counted nor held against it.
+        for key in ("hook_name", "plugin", "plugin_name", "plugin_id"):
+            value = event.get(key)
+            if isinstance(value, str) and plugin in re.split(r"[^A-Za-z0-9_.-]+", value):
+                return True
+        return False
+
     for event in events:
         if event.get("type") != "system" or event.get("subtype") != "hook_response":
             continue
         name = event.get("hook_event")
         if name not in counts:
+            continue
+        if not ours(event):
+            others.append(clean(event.get("hook_name") or name, 60))
             continue
         counts[name] += 1
         code = event.get("exit_code")
@@ -460,10 +526,11 @@ if mode == "hooks":
             dirty.append("%s printed on stderr" % name)
     for name in wanted:
         if counts[name] == 0:
-            out("NOEVENT", name)
+            out("NOEVENT", name, ", ".join(sorted(set(others))[:5]) or "none")
     if dirty:
         out("DIRTY", "; ".join(dirty))
-    out("CLEAN", "SessionStart=%d, UserPromptSubmit=%d" % (counts["SessionStart"], counts["UserPromptSubmit"]))
+    out("CLEAN", "SessionStart=%d, UserPromptSubmit=%d" % (counts["SessionStart"], counts["UserPromptSubmit"]),
+        "%d hook response(s) from other sources ignored" % len(others))
 
 out("BAD", "unknown analyzer mode")
 PYEOF
@@ -479,7 +546,7 @@ analyze() {
 
 # --- load A: a rules file ---------------------------------------------------------
 P_A1='[probe A1] Reply with only the probe marker given in your instructions, exactly as written. If your instructions contain no probe marker, reply exactly NONE.'
-P_A2='[probe A2] Use the Agent tool exactly once, with subagent_type "general-purpose", to start one subagent. Tell the subagent: "Use no tools. Reply with only the probe marker given in your instructions, exactly as written, or exactly NONE if your instructions contain no probe marker." Do not write any marker value in the subagent prompt and do not answer from your own context. When the subagent replies, reply with exactly what it replied and nothing else.'
+P_A2='[probe A2] Use the Agent tool exactly once, with subagent_type "general-purpose" and run_in_background false, to start one foreground subagent and wait for its reply. Tell the subagent: "Use no tools. Reply with only the probe marker given in your instructions, exactly as written, or exactly NONE if your instructions contain no probe marker." Do not write any marker value in the subagent prompt and do not answer from your own context. When the subagent replies, reply with exactly what it replied and nothing else.'
 P_A3_SEED='[probe A3 seed] Reply with the single word READY.'
 P_A3_ASK='[probe A3 ask] Reply with only the probe marker given in your instructions, exactly as written. If your instructions contain no probe marker, reply exactly NONE.'
 
@@ -488,6 +555,7 @@ route_not_run() {
   case "$a_code" in
     NOSPAWN) printf '%s, so the subagent route was not exercised' "$a_one" ;;
     NOTGP) printf 'the subagent type was %s, not general-purpose' "$a_one" ;;
+    BGRUN) printf '%s, so the subagent'"'"'s own final reply was not read' "$a_one" ;;
     TOPBASH) printf '%s, so the subagent route was not isolated' "$a_one" ;;
     LEAK) printf '%s, so its reply proves nothing' "$a_one" ;;
     *) printf '%s' "${a_one:-unreadable reply}" ;;
@@ -495,7 +563,7 @@ route_not_run() {
 }
 
 group_a() {
-  local sentinel session_id
+  local sentinel a3_input
   sentinel="PROBE-RULES-$(rand_hex)"
   mkdir -p "$target_home/.claude/rules" \
     && printf '# Probe rules file\n\nThe probe marker is %s. When you are asked for the probe marker, reply with exactly that value.\n' \
@@ -528,40 +596,44 @@ group_a() {
     emit UNVERIFIED A2 "$why"
   fi
 
-  # A3: a session compacted with /compact in a resumed session. The headless
-  # route is documented in the Agent SDK's slash-command page, section
-  # "Compact history with /compact" (code.claude.com/docs/en/agent-sdk/slash-commands):
-  # send /compact as the prompt of a continued or resumed session and read the
-  # compact_boundary system message in the stream-json output. The seed turn
-  # never mentions the sentinel, so a PASS cannot come from the transcript.
-  session_id="$(python3 -I -c 'import uuid; print(uuid.uuid4())')"
-  if ! session "$base_path" -p "$P_A3_SEED" --model "$MODEL" --max-turns 1 --session-id "$session_id" --tools ""; then
-    emit UNVERIFIED A3 "seed turn failed: $why"
-  elif grep -Fq -- "$sentinel" "$out_file"; then
-    emit UNVERIFIED A3 'the sentinel appeared in the seed turn, before the compaction'
-  elif ! session "$base_path" -p '/compact' --model "$MODEL" --resume "$session_id" \
-      --output-format stream-json --verbose; then
-    emit UNVERIFIED A3 "compaction could not be forced: $why"
+  # A3: a compaction inside one claude process. The headless route is the
+  # Agent SDK's slash-command page, section "Compact history with /compact"
+  # (code.claude.com/docs/en/agent-sdk/slash-commands): /compact sent as a
+  # user message, then the compact_boundary system message in the stream-json
+  # output. Here the seed turn, /compact and the question are three user
+  # messages on one process's stdin (--input-format stream-json), so the
+  # question is answered by the process that compacted, not by a new one
+  # resumed from a transcript. The seed never mentions the sentinel. What a
+  # PASS shows is in the README: the rules file is still in the session's
+  # context after a compaction in that session.
+  a3_input="$scratch/a3-input.jsonl"
+  if ! python3 -I -c '
+import json, sys
+for text in sys.argv[1:]:
+    print(json.dumps({"type": "user", "message": {"role": "user", "content": text}}))
+' "$P_A3_SEED" '/compact' "$P_A3_ASK" >"$a3_input"; then
+    emit UNVERIFIED A3 'could not write the compaction session input'
   else
-    analyze compact "$out_file"
-    if [ "$a_code" != FOUND ]; then
-      emit UNVERIFIED A3 "compaction could not be forced (${a_one:-no detail}); reply: $a_two"
-    elif session "$base_path" -p "$P_A3_ASK" --model "$MODEL" --max-turns 1 --resume "$session_id" --tools ""; then
-      analyze text "$out_file" "$sentinel"
+    stdin_file="$a3_input"
+    if session "$base_path" -p --input-format stream-json --output-format stream-json --verbose \
+        --model "$MODEL" --tools ""; then
+      analyze compacted "$out_file" "$sentinel"
       case "$a_code" in
-        FOUND) emit PASS A3 "after a forced compaction (compact_boundary seen) the session returned the rules sentinel $sentinel" ;;
-        MISSING) emit FAIL A3 "after a forced compaction the reply lacks the rules sentinel; reply: $a_two" ;;
+        FOUND) emit PASS A3 "in one session, after a compaction (compact_boundary seen) the reply returned the rules sentinel $sentinel" ;;
+        MISSING) emit FAIL A3 "after a compaction in the same session the reply lacks the rules sentinel; reply: $a_two" ;;
+        NOBOUNDARY) emit UNVERIFIED A3 "compaction could not be forced in one session ($a_one); reply: $a_two" ;;
+        LEAKSEED) emit UNVERIFIED A3 "$a_one, so the reply proves nothing about it" ;;
         *) emit UNVERIFIED A3 "$a_one" ;;
       esac
     else
-      emit UNVERIFIED A3 "ask after compaction failed: $why"
+      emit UNVERIFIED A3 "the compaction session failed: $why"
     fi
   fi
 }
 
 # --- load B: a plugin option reaches a subagent's commands ---------------------
 P_B1='[probe B1] Run exactly this command with the Bash tool and reply with its output only: echo "PROBE_OPT=[${HARNESS_PROBE_OPTION}]"'
-P_B2='[probe B2] Use the Agent tool exactly once, with subagent_type "general-purpose", to start one subagent. Tell the subagent: "Run exactly this command with the Bash tool and reply with its output only: echo \"PROBE_OPT=[${HARNESS_PROBE_OPTION}]\"". Do not run Bash yourself. When the subagent replies, reply with exactly what it replied and nothing else.'
+P_B2='[probe B2] Use the Agent tool exactly once, with subagent_type "general-purpose" and run_in_background false, to start one foreground subagent and wait for its reply. Tell the subagent: "Run exactly this command with the Bash tool and reply with its output only: echo \"PROBE_OPT=[${HARNESS_PROBE_OPTION}]\"". Do not run Bash yourself. When the subagent replies, reply with exactly what it replied and nothing else.'
 
 # A local marketplace with one plugin: a user option carrying the sentinel, and
 # a SessionStart hook that appends an export line to the session's env file,
@@ -621,11 +693,11 @@ group_b() {
   step="marketplace add"
   if session "$base_path" plugin marketplace add "$market"; then
     step="install"
-    if session "$base_path" plugin install probe-option@probe-marketplace; then
+    if session "$base_path" plugin install "$PROBE_PLUGIN@$PROBE_MARKET"; then
       step="configure"
       printf '{"probe_value":"%s"}\n' "$value" >"$scratch/option.json"
       stdin_file="$scratch/option.json"
-      session "$base_path" plugin configure probe-option --values-stdin && step=""
+      session "$base_path" plugin configure "$PROBE_PLUGIN@$PROBE_MARKET" --values-stdin && step=""
     fi
   fi
   if [ -n "$step" ]; then
@@ -680,7 +752,7 @@ git_run() {
 }
 
 group_c() {
-  local repo url tag ledger_src market_name tagline before after calls new_files step spath bin_dir calls_log
+  local repo url ledger_src head_sha market_name before after calls new_files step spath bin_dir calls_log
   if [ ! -f "$pin_file" ]; then
     emit UNVERIFIED C 'ledger-vendor.pin is not next to this script, so the ledger repository is unknown'
     return
@@ -696,30 +768,21 @@ group_c() {
     emit UNVERIFIED C 'git is not on PATH, so the ledger plugin cannot be fetched'
     return
   fi
-  tag="${PROBE_LEDGER_TAG:-}"
-  if [ -z "$tag" ]; then
-    tagline="$(git_run ls-remote --tags --refs "$url" 2>"$err_file" \
-      | python3 -I -c '
-import re, sys
-tags = []
-for line in sys.stdin:
-    found = re.search(r"\trefs/tags/(v([0-9]+)\.([0-9]+)\.([0-9]+))$", line.strip())
-    if found:
-        tags.append((tuple(int(part) for part in found.groups()[1:]), found.group(1)))
-print(max(tags)[1] if tags else "")
-')"
-    tag="$tagline"
-  fi
-  case "$tag" in
-    ''|*[!A-Za-z0-9._-]*) emit UNVERIFIED C 'could not read a ledger tag from the public ledger repository'; return ;;
-  esac
+  # Fetch the pinned commit itself, then refuse unless HEAD is exactly it.
   ledger_src="$scratch/ledger-src"
-  if ! git_run -c advice.detachedHead=false clone --quiet --depth 1 --branch "$tag" "$url" "$ledger_src" 2>"$err_file"; then
-    emit UNVERIFIED C "could not fetch the ledger repository at $tag: $(head -n 1 "$err_file" | cut -c1-200)"
+  if ! git_run init --quiet "$ledger_src" 2>"$err_file" \
+      || ! git_run -C "$ledger_src" fetch --quiet --depth 1 "$url" "$LEDGER_PIN_SHA" 2>"$err_file" \
+      || ! git_run -C "$ledger_src" -c advice.detachedHead=false checkout --quiet --detach FETCH_HEAD 2>"$err_file"; then
+    emit UNVERIFIED C "could not fetch the ledger repository at $LEDGER_PIN_TAG ($LEDGER_PIN_SHA): $(head -n 1 "$err_file" | cut -c1-200)"
+    return
+  fi
+  head_sha="$(git_run -C "$ledger_src" rev-parse HEAD 2>/dev/null)"
+  if [ "$head_sha" != "$LEDGER_PIN_SHA" ]; then
+    emit UNVERIFIED C "the fetched ledger repository is at ${head_sha:-no commit}, not the pinned $LEDGER_PIN_SHA, so its hooks are not run"
     return
   fi
   if [ ! -f "$ledger_src/.claude-plugin/marketplace.json" ] || [ ! -f "$ledger_src/plugins/$LEDGER_PLUGIN/hooks/hooks.json" ]; then
-    emit UNVERIFIED C "the public ledger repository at $tag ships no $LEDGER_PLUGIN hooks plugin (a later ledger row adds it)"
+    emit UNVERIFIED C "the public ledger repository at $LEDGER_PIN_TAG ships no $LEDGER_PLUGIN hooks plugin (a later ledger row adds it)"
     return
   fi
   market_name="$(python3 -I -c '
@@ -729,7 +792,7 @@ names = [entry.get("name") for entry in data.get("plugins", [])]
 print(data["name"] if sys.argv[2] in names else "")
 ' "$ledger_src/.claude-plugin/marketplace.json" "$LEDGER_PLUGIN" 2>/dev/null)"
   if [ -z "$market_name" ]; then
-    emit UNVERIFIED C "the ledger marketplace at $tag does not list $LEDGER_PLUGIN"
+    emit UNVERIFIED C "the ledger marketplace at $LEDGER_PIN_TAG does not list $LEDGER_PLUGIN"
     return
   fi
 
@@ -762,7 +825,7 @@ print(data["name"] if sys.argv[2] in names else "")
     return
   fi
   home_listing >"$after"
-  analyze hooks "$out_file"
+  analyze hooks "$out_file" "$LEDGER_PLUGIN"
   if [ "$a_code" = BAD ]; then
     emit UNVERIFIED C "$a_one"
     return
@@ -775,11 +838,11 @@ print(data["name"] if sys.argv[2] in names else "")
   elif [ -n "$new_files" ]; then
     emit FAIL C "with no ledger value set the session wrote new file(s): $new_files"
   elif [ "$a_code" = NOEVENT ]; then
-    emit UNVERIFIED C "the stream shows no $a_one hook event, so a hook run is not shown"
+    emit UNVERIFIED C "the stream shows no $a_one hook event attributable to $LEDGER_PLUGIN (hook events from other sources: $a_two), so a hook run is not shown"
   elif [ "$a_code" = DIRTY ]; then
     emit FAIL C "with no ledger value set a hook was not silent: $a_one"
   else
-    emit PASS C "$LEDGER_PLUGIN $tag hooks exited clean with no output ($a_one), the ledger command was never called, no file was written"
+    emit PASS C "$LEDGER_PLUGIN $LEDGER_PIN_TAG (commit $LEDGER_PIN_SHA) hooks exited clean with no output ($a_one; $a_two), the ledger command was never called, no file was written"
   fi
 }
 

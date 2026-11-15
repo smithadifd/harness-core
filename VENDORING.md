@@ -74,7 +74,7 @@ the text itself.
 | `scripts/tests/test_check_ledger_vendor.py` | tests of the ledger drift check |
 | `scripts/tests/test_check_no_person.py` | tests of the no-person check |
 | `scripts/tests/test_ci_workflow.py` | tests of the CI workflows' runners, triggers and gates |
-| `scripts/tests/test_probe_default_tier_load.py` | tests of the load probe, against a stubbed `claude` and `git` |
+| `scripts/tests/test_probe_default_tier_load.py` | tests of the load probe, against a stubbed claude and git |
 
 ## Carve record
 

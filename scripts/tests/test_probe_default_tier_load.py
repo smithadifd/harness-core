@@ -37,6 +37,15 @@ TOKEN = "tok-SECRET-0123456789abcdef"
 LINE = re.compile(r"^(PASS|FAIL|UNVERIFIED) (\S+) — (.*)$")
 SUMMARY = re.compile(r"^summary: (\d+) pass, (\d+) fail, (\d+) unverified$")
 ALL_IDS = ["A1", "A2", "A3", "B1", "B2", "C"]
+# The commit the probe pins the ledger plugin to (ledger tag v0.3.1).
+PIN_SHA = "346cb3595180fcea702ebdd37b32ff8c36325ea5"
+# Every variable the probe removes from each claude command: the world sets all
+# of them, the stub records which are still set, and a test asserts none is.
+SCRUBBED = [
+    "CLAUDE_CONFIG_DIR", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
+    "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME",
+    "CLAUDE_ENV_FILE", "LEDGER_DB", "LEDGER_HARNESS", "LEDGER_OPERATOR",
+]
 
 CLAUDE_STUB = r'''#!__PYTHON__
 import glob, json, os, re, subprocess, sys, tempfile, time
@@ -45,6 +54,12 @@ argv = sys.argv[1:]
 home = os.environ.get("HOME", "")
 scn = json.loads(os.environ.get("STUB_SCENARIO", "{}"))
 state = os.environ["STUB_STATE"]
+SCRUBBED = __SCRUBBED__
+# The live run's refusal of a bare plugin id, and its launch notice for a
+# background agent (cut where the live-run record cuts it).
+BARE_ID_ERROR = ('No installed plugin has the id "%s". Use its full id (name@marketplace), '
+                 'as `claude plugin list` shows it.')
+LAUNCH_NOTICE = "Async agent launched successfully. (This tool result is internal metadata ...)"
 
 
 def log(**extra):
@@ -53,6 +68,7 @@ def log(**extra):
         "config_dir_set": "CLAUDE_CONFIG_DIR" in os.environ,
         "api_key_set": "ANTHROPIC_API_KEY" in os.environ,
         "ledger_db_set": "LEDGER_DB" in os.environ,
+        "scrubbed_present": [name for name in SCRUBBED if name in os.environ],
         "token_ok": os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") == os.environ.get("STUB_EXPECT_TOKEN"),
         "path0": os.environ.get("PATH", "").split(":")[0],
     }
@@ -91,6 +107,10 @@ def tree(path):
     return found
 
 
+def home_files():
+    return sorted(os.path.relpath(os.path.join(b, n), home) for b, _d, fs in os.walk(home) for n in fs)
+
+
 def emit(event):
     print(json.dumps(event))
 
@@ -100,9 +120,16 @@ def tool_use(name, given, ident, parent=None):
           "message": {"content": [{"type": "tool_use", "id": ident, "name": name, "input": given}]}})
 
 
-def tool_result(ident, text, parent=None):
-    emit({"type": "user", "parent_tool_use_id": parent,
-          "message": {"content": [{"type": "tool_result", "tool_use_id": ident, "content": text}]}})
+def tool_result(ident, text, parent=None, is_error=False):
+    block = {"type": "tool_result", "tool_use_id": ident, "content": text}
+    if is_error:
+        block["is_error"] = True
+    emit({"type": "user", "parent_tool_use_id": parent, "message": {"content": [block]}})
+
+
+def say(text):
+    emit({"type": "assistant", "parent_tool_use_id": None,
+          "message": {"content": [{"type": "text", "text": text}]}})
 
 
 def finish(text, **kw):
@@ -155,39 +182,76 @@ def plugin_command():
         data = sys.stdin.read()
         log(plugin="configure", plugin_id=argv[2], stdin=data)
         fail_step("configure")
+        if argv[2] not in read_state("installed").split():
+            sys.stderr.write(BARE_ID_ERROR % argv[2] + "\n")
+            sys.exit(1)
         write_state("options.json", data)
     else:
         log(plugin=sub)
     sys.exit(0)
 
 
-def main():
-    if argv and argv[0] == "plugin":
-        plugin_command()
-    prompt = argv[argv.index("-p") + 1]
-    found = re.match(r"\[probe ([^\]]+)\]", prompt)
-    tag = found.group(1) if found else ("compact" if prompt == "/compact" else "?")
-    stream = "stream-json" in argv
-    session_id = argv[argv.index("--session-id") + 1] if "--session-id" in argv else None
-    resume_id = argv[argv.index("--resume") + 1] if "--resume" in argv else None
-    if session_id:
-        write_state("sessions", session_id + "\n", "a")
-    log(tag=tag, rules_sentinel=rules_sentinel(), session_id=session_id, resume_id=resume_id,
-        resume_known=bool(resume_id) and resume_id in read_state("sessions").split(),
-        compacted=read_state("compacted") == "yes", home_files=sorted(
-            os.path.relpath(os.path.join(b, n), home) for b, _d, fs in os.walk(home) for n in fs))
+def maybe_fail(tag):
     if scn.get("sleep", {}).get(tag):
         time.sleep(scn["sleep"][tag])
     code = scn.get("rc", {}).get(tag)
     if code:
         sys.stderr.write("stub: failing with the token %s\n" % os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", ""))
         sys.exit(code)
+
+
+def stream_session():
+    """A3: one process, three user messages on stdin (seed, /compact, question)."""
+    texts = [json.loads(line)["message"]["content"] for line in sys.stdin.read().splitlines() if line.strip()]
+    log(tag="A3", rules_sentinel=rules_sentinel(), inputs=texts, home_files=home_files())
+    maybe_fail("A3")
+    sentinel = rules_sentinel() or ""
+    mode = scn.get("A3", "ok")
+    emit({"type": "system", "subtype": "init"})
+    if mode == "badjson":
+        print("this line is not json")
+    if mode == "boundary_early":
+        emit({"type": "system", "subtype": "compact_boundary", "compact_metadata": {"trigger": "manual"}})
+    late = mode == "boundary_late"
+    for text in texts:
+        if text == "/compact":
+            if mode in ("noboundary", "boundary_late", "boundary_early"):
+                finish("Not enough messages to compact.")
+            elif mode == "fewresults":
+                emit({"type": "system", "subtype": "compact_boundary", "compact_metadata": {"trigger": "manual"}})
+            else:
+                emit({"type": "system", "subtype": "compact_boundary", "compact_metadata": {"trigger": "manual"}})
+                finish("compacted")
+        elif text.startswith("[probe A3 seed]"):
+            reply = sentinel if mode == "leak" else "READY"
+            say(reply)
+            finish(reply)
+        else:
+            reply = {"none": "NONE", "wrong": "PROBE-RULES-0000000000000000"}.get(mode, sentinel)
+            say(reply)
+            if mode == "errresult":
+                emit({"type": "result", "subtype": "error_max_turns", "is_error": True, "result": "stopped"})
+            else:
+                finish(reply)
+    if late:
+        emit({"type": "system", "subtype": "compact_boundary", "compact_metadata": {"trigger": "manual"}})
+
+
+def main():
+    if argv and argv[0] == "plugin":
+        plugin_command()
+    if "--input-format" in argv:
+        stream_session()
+        return
+    prompt = argv[argv.index("-p") + 1]
+    found = re.match(r"\[probe ([^\]]+)\]", prompt)
+    tag = found.group(1) if found else "?"
+    log(tag=tag, rules_sentinel=rules_sentinel(), home_files=home_files())
+    maybe_fail(tag)
     sentinel = rules_sentinel() or ""
     mode = scn.get(tag, "ok")
-    if tag in ("A1", "A3 ask"):
+    if tag == "A1":
         reply = {"ok": sentinel, "none": "NONE", "wrong": "PROBE-RULES-0000000000000000"}.get(mode)
-        if tag == "A3 ask" and read_state("compacted") != "yes":
-            reply = "NONE"
         if mode == "empty":
             sys.exit(0)
         if mode == "badutf8":
@@ -198,20 +262,11 @@ def main():
         if mode == "big":
             reply = sentinel + "x" * 1048700
         print(reply)
-    elif tag == "A3 seed":
-        print(sentinel if mode == "leak" else "READY")
-    elif tag == "compact":
-        if mode == "no" or not resume_id:
-            emit({"type": "system", "subtype": "init"})
-            finish("Not enough messages to compact.")
-        else:
-            write_state("compacted", "yes")
-            emit({"type": "system", "subtype": "compact_boundary",
-                  "compact_metadata": {"trigger": "manual", "pre_tokens": 1}})
-            finish("compacted")
     elif tag in ("A2", "B2"):
         if tag == "A2":
-            inner = sentinel if mode in ("ok", "leak", "nospawn", "topbash", "nottgp", "noresult") else "NONE"
+            inner = sentinel if mode in (
+                "ok", "okfg", "leak", "nospawn", "topbash", "nottgp", "noresult",
+                "missingtype", "emptytype", "casetype") else "NONE"
             pattern = inner
         else:
             value = "" if mode == "empty" else option_value()
@@ -224,8 +279,15 @@ def main():
                   "message": {"content": [{"type": "text", "text": pattern}]}})
             finish(pattern)
             return
-        given = {"subagent_type": "Explore" if mode == "nottgp" else "general-purpose",
+        given = {"subagent_type": {"nottgp": "Explore", "emptytype": "", "casetype": "General-Purpose"}.get(
+                     mode, "general-purpose"),
                  "prompt": ("sentinel is %s" % sentinel) if mode == "leak" else "stub subagent prompt"}
+        if mode == "missingtype":
+            del given["subagent_type"]
+        if mode in ("background", "bgflag"):
+            given["run_in_background"] = True
+        if mode == "okfg":
+            given["run_in_background"] = False
         tool_use("Agent", given, "toolu_1")
         if mode == "foreign":
             tool_result("toolu_9", [{"type": "text", "text": sentinel}])
@@ -233,8 +295,10 @@ def main():
         if mode == "topbash":
             tool_use("Bash", {"command": "echo hi"}, "toolu_2")
         tool_use("Bash", {"command": "echo inner"}, "toolu_3", parent="toolu_1")
+        if mode in ("background", "launch_notice"):
+            pattern = LAUNCH_NOTICE
         if mode != "noresult":
-            tool_result("toolu_1", [{"type": "text", "text": pattern}])
+            tool_result("toolu_1", [{"type": "text", "text": pattern}], is_error=(mode == "agent_error"))
         if mode == "errresult":
             emit({"type": "result", "subtype": "error_max_turns", "is_error": True, "result": "stopped"})
         else:
@@ -270,7 +334,21 @@ def main():
                 event["outcome"] = "blocking"
             if mode == "no_exit_code":
                 del event["exit_code"]
+            # Responses another source's hooks produced, not the ledger plugin's.
+            if mode == "foreign_only":
+                event["hook_name"] = name + ":other-plugin"
+            if mode == "lookalike":
+                event["hook_name"] = name + ":not-ledger-hooks"
+            if mode == "foreign_session_start" and name == "SessionStart":
+                event["hook_name"] = name + ":other-plugin"
+            if mode == "plugin_field":
+                event["hook_name"] = name + ":startup"
+                event["plugin_id"] = "ledger-hooks@ledger-plugins"
             emit(event)
+        if mode == "foreign_dirty_extra":
+            emit({"type": "system", "subtype": "hook_response", "hook_event": "SessionStart",
+                  "hook_name": "SessionStart:other-plugin", "exit_code": 2, "outcome": "blocking",
+                  "stdout": "other plugin noise", "stderr": ""})
         finish("ACK")
     else:
         print("stub: unknown prompt", file=sys.stderr)
@@ -284,22 +362,34 @@ GIT_STUB = r'''#!__PYTHON__
 import json, os, shutil, sys
 
 argv = sys.argv[1:]
+args = list(argv)
+workdir = None
+while args and args[0] in ("-C", "-c"):
+    if args[0] == "-C":
+        workdir = args[1]
+    args = args[2:]
+verb = args[0] if args else ""
 with open(os.environ["STUB_LOG"], "a", encoding="utf-8") as handle:
     handle.write(json.dumps({
-        "tool": "git", "argv": argv, "home": os.environ.get("HOME", ""),
+        "tool": "git", "argv": argv, "verb": verb, "workdir": workdir,
+        "home": os.environ.get("HOME", ""),
         "config_global": os.environ.get("GIT_CONFIG_GLOBAL"),
         "token_set": "CLAUDE_CODE_OAUTH_TOKEN" in os.environ}) + "\n")
-if "ls-remote" in argv:
-    if os.environ.get("STUB_GIT_FAIL") == "ls-remote":
-        sys.stderr.write("stub: ls-remote failed\n")
-        sys.exit(128)
-    for tag in filter(None, os.environ.get("STUB_GIT_TAGS", "").split(",")):
-        print("0123456789012345678901234567890123456789\trefs/tags/%s" % tag)
-elif "clone" in argv:
-    if os.environ.get("STUB_GIT_FAIL") == "clone":
-        sys.stderr.write("stub: clone failed\n")
-        sys.exit(128)
-    shutil.copytree(os.environ["STUB_LEDGER_FIXTURE"], argv[-1])
+state = os.environ["STUB_STATE"]
+os.makedirs(state, exist_ok=True)
+fetched = os.path.join(state, "git_fetched")
+if os.environ.get("STUB_GIT_FAIL") == verb:
+    sys.stderr.write("stub: %s failed\n" % verb)
+    sys.exit(128)
+if verb == "init":
+    os.makedirs(args[-1], exist_ok=True)
+elif verb == "fetch":
+    with open(fetched, "w", encoding="utf-8") as handle:
+        handle.write(args[-1])
+elif verb == "checkout":
+    shutil.copytree(os.environ["STUB_LEDGER_FIXTURE"], workdir, dirs_exist_ok=True)
+elif verb == "rev-parse":
+    print(os.environ.get("STUB_GIT_HEAD") or open(fetched, encoding="utf-8").read())
 else:
     sys.exit(64)
 '''
@@ -314,7 +404,8 @@ PIN = (
 
 def write_exec(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text.replace("__PYTHON__", sys.executable), encoding="utf-8")
+    path.write_text(text.replace("__PYTHON__", sys.executable).replace("__SCRUBBED__", repr(SCRUBBED)),
+                    encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
 
@@ -402,7 +493,7 @@ class World:
         return sorted(str(p.relative_to(self.real_home)) for p in self.real_home.rglob("*"))
 
     def run(self, *args, scenario=None, env=None, token=TOKEN, stubs=True, home=None,
-            tags="v0.1.13,v0.3.1", unset=(), without=()):
+            unset=(), without=()):
         self.runs += 1
         self.log.write_text("")
         shutil.rmtree(self.state, ignore_errors=True)
@@ -411,13 +502,15 @@ class World:
         environ = {
             "PATH": path, "HOME": str(home or self.real_home), "TMPDIR": str(self.tmpdir),
             "STUB_LOG": str(self.log), "STUB_STATE": str(self.state), "STUB_EXPECT_TOKEN": TOKEN,
-            "STUB_SCENARIO": json.dumps(scenario or {}), "STUB_GIT_TAGS": tags,
+            "STUB_SCENARIO": json.dumps(scenario or {}),
             "STUB_LEDGER_FIXTURE": str(self.fixture),
             # Variables that could send a session to another config folder or
             # credential, or arm the ledger: the probe must remove each.
             "CLAUDE_CONFIG_DIR": str(self.real_home / ".claude"), "ANTHROPIC_API_KEY": "api-key-x",
             "LEDGER_DB": "/should/not/be/seen",
         }
+        for name in SCRUBBED:
+            environ.setdefault(name, "scrubbed-" + name)
         if token is not None:
             environ["CLAUDE_CODE_OAUTH_TOKEN"] = token
         environ.update(env or {})
@@ -508,41 +601,23 @@ def test_a2_asks_for_an_agent_tool_and_no_other_tool(world):
     assert "general-purpose" in argv[argv.index("-p") + 1]
 
 
-def test_a3_resumes_one_session_through_a_compaction(world):
+def test_a3_compacts_inside_one_process_that_takes_the_three_messages(world):
     result = world.run("--only", "A")
-    seed = result.tagged("A3 seed")[0]
-    compact = result.tagged("compact")[0]
-    ask = result.tagged("A3 ask")[0]
-    assert seed["session_id"] and seed["session_id"] == compact["resume_id"] == ask["resume_id"]
-    assert compact["resume_known"] and ask["resume_known"]
-    assert ask["compacted"], "the question must come after the compaction"
-    assert "--no-session-persistence" not in seed["argv"]
-    assert "compact_boundary" in result.evidence("A3")
-    order = [c["tag"] for c in result.claude() if c.get("tag", "").startswith(("A3", "compact"))]
-    assert order == ["A3 seed", "compact", "A3 ask"]
-
-
-def test_a3_is_unverified_never_pass_when_compaction_was_not_forced(world):
-    result = world.run("--only", "A", scenario={"compact": "no"})
-    assert result.status("A3") == "UNVERIFIED"
-    assert "compaction could not be forced" in result.evidence("A3")
-    assert "Not enough messages" in result.evidence("A3")
-    assert result.tagged("A3 ask") == [], "no question is asked of an uncompacted session"
-    assert result.rc == 2
-
-
-def test_a3_fails_when_the_sentinel_is_gone_after_compaction(world):
-    result = world.run("--only", "A", scenario={"A3 ask": "none"})
-    assert result.status("A3") == "FAIL"
-    assert "after a forced compaction" in result.evidence("A3")
-    assert result.rc == 1
-
-
-def test_a3_is_unverified_when_the_sentinel_was_already_in_the_seed_turn(world):
-    result = world.run("--only", "A", scenario={"A3 seed": "leak"})
-    assert result.status("A3") == "UNVERIFIED"
-    assert "before the compaction" in result.evidence("A3")
-    assert result.tagged("compact") == []
+    a3 = result.tagged("A3")
+    assert len(a3) == 1, "seed, /compact and the question are one claude process"
+    call = a3[0]
+    argv = call["argv"]
+    assert argv[argv.index("--input-format") + 1] == "stream-json"
+    assert argv[argv.index("--output-format") + 1] == "stream-json"
+    for resumed in ("--resume", "--continue", "--session-id", "--no-session-persistence"):
+        assert resumed not in argv
+    seed, compact, ask = call["inputs"]
+    assert seed.startswith("[probe A3 seed]") and compact == "/compact" and ask.startswith("[probe A3 ask]")
+    assert call["rules_sentinel"] not in " ".join(call["inputs"]), "the sentinel is never in a message"
+    assert len(call["inputs"]) == 3
+    assert [c["tag"] for c in result.claude() if c.get("tag", "").startswith("A")] == ["A1", "A2", "A3"]
+    assert result.status("A3") == "PASS" and "compact_boundary seen" in result.evidence("A3")
+    assert call["rules_sentinel"] in result.evidence("A3")
 
 
 def test_b_passes_on_the_subagent_and_prints_the_value_seen(world):
@@ -567,7 +642,10 @@ def test_b_installs_a_local_plugin_that_exports_the_option_to_commands(world):
     assert "CLAUDE_ENV_FILE" in script and "CLAUDE_PLUGIN_OPTION_PROBE_VALUE" in script
     assert next(c for c in result.calls if c.get("plugin") == "install")["plugin_id"] == (
         "probe-option@probe-marketplace")
-    assert next(c for c in result.calls if c.get("plugin") == "configure")["argv"][-1] == "--values-stdin"
+    configure = next(c for c in result.calls if c.get("plugin") == "configure")
+    assert configure["argv"][-1] == "--values-stdin"
+    assert configure["plugin_id"] == "probe-option@probe-marketplace"
+    assert result.status("B2") == "PASS", "the stub refuses a bare id with the live run's message"
 
 
 def test_b_b1_is_a_diagnostic_and_does_not_change_the_verdict(world):
@@ -611,23 +689,23 @@ def test_c_passes_when_hooks_run_clean_and_nothing_is_written(world):
     assert "--include-hook-events" in session["argv"]
 
 
-def test_c_installs_the_ledger_plugin_from_the_newest_tag_by_number(world):
-    result = world.run("--only", "C", tags="v0.9.0,v0.10.0,v0.2.1,not-a-version")
+def test_c_fetches_the_pinned_commit_and_checks_it_out(world):
+    result = world.run("--only", "C")
     git = [c for c in result.calls if c["tool"] == "git"]
-    clone = next(c for c in git if "clone" in c["argv"])
-    assert clone["argv"][clone["argv"].index("--branch") + 1] == "v0.10.0"
-    assert "https://github.com/example/ledger.git" in clone["argv"]
+    assert [c["verb"] for c in git] == ["init", "fetch", "checkout", "rev-parse"]
+    fetch = git[1]
+    assert fetch["argv"][-2:] == ["https://github.com/example/ledger.git", PIN_SHA]
+    assert not any("--branch" in c["argv"] or "ls-remote" in c["argv"] or "clone" in c["argv"] for c in git)
     install = next(c for c in result.calls if c.get("plugin") == "install")
     assert install["plugin_id"] == "ledger-hooks@ledger-plugins"
-    assert "ledger-hooks v0.10.0" in result.evidence("C")
+    assert f"ledger-hooks v0.3.1 (commit {PIN_SHA})" in result.evidence("C")
 
 
-def test_c_probe_ledger_tag_overrides_the_newest(world):
-    result = world.run("--only", "C", env={"PROBE_LEDGER_TAG": "v0.2.1"})
-    git = [c for c in result.calls if c["tool"] == "git"]
-    assert not any("ls-remote" in c["argv"] for c in git)
-    clone = next(c for c in git if "clone" in c["argv"])
-    assert clone["argv"][clone["argv"].index("--branch") + 1] == "v0.2.1"
+def test_c_has_no_environment_override_of_the_pinned_commit(world):
+    result = world.run("--only", "C", env={"PROBE_LEDGER_TAG": "v9.9.9", "PROBE_LEDGER_SHA": "f" * 40})
+    fetch = next(c for c in result.calls if c["tool"] == "git" and c["verb"] == "fetch")
+    assert fetch["argv"][-1] == PIN_SHA
+    assert result.status("C") == "PASS", result.out
 
 
 def test_c_git_never_sees_the_token_or_the_users_git_config(world):
@@ -688,14 +766,22 @@ def test_c_is_unverified_when_the_ledger_tag_ships_no_hooks_plugin(world):
     assert result.rc == 2
 
 
-@pytest.mark.parametrize("fail, words", [
-    ("ls-remote", "could not read a ledger tag"),
-    ("clone", "could not fetch the ledger repository at v0.3.1"),
-])
-def test_c_is_unverified_when_the_ledger_repository_cannot_be_read(world, fail, words):
+@pytest.mark.parametrize("fail", ["init", "fetch", "checkout"])
+def test_c_is_unverified_when_the_pinned_commit_cannot_be_fetched(world, fail):
     result = world.run("--only", "C", env={"STUB_GIT_FAIL": fail})
     assert result.status("C") == "UNVERIFIED"
-    assert words in result.evidence("C")
+    assert f"could not fetch the ledger repository at v0.3.1 ({PIN_SHA})" in result.evidence("C")
+    assert not any(c.get("plugin") for c in result.calls)
+    assert result.rc == 2
+
+
+def test_c_is_unverified_when_the_fetched_head_is_not_the_pinned_commit(world):
+    result = world.run("--only", "C", env={"STUB_GIT_HEAD": "f" * 40})
+    assert result.status("C") == "UNVERIFIED"
+    assert f"is at {'f' * 40}, not the pinned {PIN_SHA}" in result.evidence("C")
+    assert not any(c.get("plugin") for c in result.calls), "no ledger plugin is installed"
+    assert result.tagged("C") == [], "no session runs the unpinned code"
+    assert result.rc == 2
 
 
 def test_c_is_unverified_without_a_pin_file(world):
@@ -787,7 +873,7 @@ def test_the_probe_makes_its_own_temp_home_and_removes_it_on_exit(world):
 
 
 def test_the_temp_home_is_removed_when_sessions_fail_too(world):
-    result = world.run(scenario={"rc": {"A1": 7, "A2": 7, "B1": 7, "B2": 7, "C": 7}})
+    result = world.run(scenario={"rc": {"A1": 7, "A2": 7, "A3": 7, "B1": 7, "B2": 7, "C": 7}})
     assert result.rc == 2
     assert list(world.tmpdir.iterdir()) == []
 
@@ -921,7 +1007,7 @@ def test_model_is_haiku_and_tools_are_off_where_no_load_needs_them(world):
             continue
         argv = call["argv"]
         assert argv[argv.index("--model") + 1] == "claude-haiku-5-5"
-    for tag in ("A1", "A3 seed", "A3 ask", "C"):
+    for tag in ("A1", "A3", "C"):
         argv = result.tagged(tag)[0]["argv"]
         assert argv[argv.index("--tools") + 1] == ""
 
@@ -929,3 +1015,155 @@ def test_model_is_haiku_and_tools_are_off_where_no_load_needs_them(world):
 def test_the_script_never_exports_a_variable(world):
     text = SCRIPT.read_text(encoding="utf-8")
     assert not re.search(r"^\s*export\s", text, re.M)
+
+
+@pytest.mark.parametrize("mode, status, words", [
+    ("noboundary", "UNVERIFIED", "compaction could not be forced in one session"),
+    ("boundary_early", "UNVERIFIED", "no compact_boundary message between the seed turn and the question"),
+    ("boundary_late", "UNVERIFIED", "no compact_boundary message between the seed turn and the question"),
+    ("leak", "UNVERIFIED", "the sentinel appeared before the compaction"),
+    ("fewresults", "UNVERIFIED", "the stream has 2 result messages, expected 3"),
+    ("errresult", "UNVERIFIED", "error_max_turns"),
+    ("badjson", "UNVERIFIED", "is not JSON"),
+    ("none", "FAIL", "after a compaction in the same session the reply lacks the rules sentinel"),
+    ("wrong", "FAIL", "after a compaction in the same session the reply lacks the rules sentinel"),
+])
+def test_a3_passes_only_when_a_compaction_precedes_the_reply_that_holds_the_sentinel(world, mode, status, words):
+    result = world.run("--only", "A", scenario={"A3": mode})
+    assert result.status("A3") == status, result.out
+    assert words in result.evidence("A3")
+    assert result.rc == (2 if status == "UNVERIFIED" else 1)
+
+
+def test_a3_is_unverified_with_the_reply_when_the_cli_would_not_compact(world):
+    result = world.run("--only", "A", scenario={"A3": "noboundary"})
+    assert "Not enough messages to compact" in result.evidence("A3")
+
+
+def test_a3_is_unverified_when_the_compaction_session_fails(world):
+    result = world.run("--only", "A", scenario={"rc": {"A3": 7}})
+    assert result.status("A3") == "UNVERIFIED"
+    assert "the compaction session failed: claude exited 7" in result.evidence("A3")
+
+
+@pytest.mark.parametrize("ident", ["A2", "B2"])
+@pytest.mark.parametrize("mode, words", [
+    ("background", "ran in the background"),
+    ("launch_notice", "ran in the background"),
+    ("bgflag", "ran in the background"),
+    ("missingtype", "the subagent type was (missing), not general-purpose"),
+    ("emptytype", "the subagent type was (missing), not general-purpose"),
+    ("casetype", "the subagent type was General-Purpose, not general-purpose"),
+    ("agent_error", "the subagent call returned an error"),
+])
+def test_a_subagent_that_did_not_give_a_foreground_general_purpose_reply_is_unverified(world, ident, mode, words):
+    result = world.run("--only", ident[0], scenario={ident: mode})
+    assert result.status(ident) == "UNVERIFIED", result.out
+    assert words in result.evidence(ident)
+    assert result.rc == 2
+
+
+@pytest.mark.parametrize("ident", ["A2", "B2"])
+def test_a_foreground_subagent_that_says_run_in_background_false_passes(world, ident):
+    result = world.run("--only", ident[0], scenario={ident: "okfg"})
+    assert result.status(ident) == "PASS", result.out
+
+
+def test_a_launch_notice_is_never_read_as_the_subagents_reply_even_with_the_live_wording(world):
+    # The live run read this notice as A2's reply and reported FAIL.
+    result = world.run("--only", "A", scenario={"A2": "launch_notice"})
+    assert result.status("A2") != "FAIL"
+    assert "Async agent launched successfully" not in result.evidence("A2")
+
+
+@pytest.mark.parametrize("tag", ["A2", "B2"])
+def test_the_subagent_prompts_ask_for_one_foreground_subagent(world, tag):
+    argv = world.run("--only", tag[0]).tagged(tag)[0]["argv"]
+    prompt = argv[argv.index("-p") + 1]
+    assert 'subagent_type "general-purpose" and run_in_background false' in prompt
+    assert "foreground" in prompt
+
+
+def test_plugin_install_and_configure_name_the_plugin_by_its_full_id(world):
+    result = world.run("--only", "B")
+    ids = {c["plugin"]: c["plugin_id"] for c in result.calls if c.get("plugin") in ("install", "configure")}
+    assert ids == {"install": "probe-option@probe-marketplace", "configure": "probe-option@probe-marketplace"}
+    assert result.status("B2") == "PASS", result.out
+
+
+def test_ledger_plugin_install_names_the_plugin_by_its_full_id(world):
+    result = world.run("--only", "C")
+    ids = [c["plugin_id"] for c in result.calls if c.get("plugin") == "install"]
+    assert ids == ["ledger-hooks@ledger-plugins"]
+
+
+def test_every_claude_command_runs_with_the_config_and_credential_variables_removed(world):
+    result = world.run()
+    assert len(result.claude()) >= 10
+    leaked = [(call.get("tag") or call.get("plugin"), call["scrubbed_present"])
+              for call in result.claude() if call["scrubbed_present"]]
+    assert leaked == []
+
+
+@pytest.mark.parametrize("kind", ["file", "hidden-file", "folder", "marketplace-folder", "via-symlink"])
+def test_a_probe_home_that_is_not_empty_is_refused_and_left_as_it_was(world, tmp_path, kind):
+    chosen = tmp_path / "occupied"
+    chosen.mkdir()
+    if kind == "file":
+        (chosen / "notes.txt").write_text("mine")
+    elif kind == "hidden-file":
+        (chosen / ".profile").write_text("mine")
+    elif kind == "folder":
+        (chosen / "sub").mkdir()
+    elif kind == "marketplace-folder":
+        (chosen / "probe-marketplace" / ".claude-plugin").mkdir(parents=True)
+        (chosen / "probe-marketplace" / ".claude-plugin" / "marketplace.json").write_text("mine")
+    else:
+        (chosen / "notes.txt").write_text("mine")
+    given = tmp_path / "link" if kind == "via-symlink" else chosen
+    if kind == "via-symlink":
+        given.symlink_to(chosen)
+    before = {str(p.relative_to(chosen)): (p.read_text() if p.is_file() else None) for p in chosen.rglob("*")}
+    result = world.run(env={"PROBE_HOME": str(given)})
+    assert result.rc == 3, result.out + result.err
+    assert "REFUSED  PROBE_HOME is not empty" in result.err
+    assert result.out == "" and result.calls == []
+    assert {str(p.relative_to(chosen)): (p.read_text() if p.is_file() else None) for p in chosen.rglob("*")} == before
+    assert list(world.tmpdir.iterdir()) == []
+
+
+def test_an_empty_existing_probe_home_is_used(world, tmp_path):
+    chosen = tmp_path / "empty-home"
+    chosen.mkdir()
+    result = world.run("--only", "A", env={"PROBE_HOME": str(chosen)})
+    assert result.rc == 0, result.out + result.err
+    assert {Path(c["home"]).resolve() for c in result.calls} == {chosen.resolve()}
+
+
+@pytest.mark.parametrize("mode, words", [
+    ("foreign_only", "no SessionStart hook event attributable to ledger-hooks"),
+    ("lookalike", "no SessionStart hook event attributable to ledger-hooks"),
+    ("foreign_session_start", "no SessionStart hook event attributable to ledger-hooks"),
+])
+def test_c_counts_only_hook_events_that_name_the_ledger_plugin(world, mode, words):
+    result = world.run("--only", "C", scenario={"C": mode})
+    assert result.status("C") == "UNVERIFIED", result.out
+    assert words in result.evidence("C")
+    assert result.rc == 2
+
+
+def test_c_names_the_other_sources_it_saw_when_none_is_the_ledger_plugin(world):
+    result = world.run("--only", "C", scenario={"C": "foreign_only"})
+    assert "SessionStart:other-plugin" in result.evidence("C")
+
+
+def test_c_attributes_a_hook_by_a_plugin_field_when_its_name_does_not_say(world):
+    result = world.run("--only", "C", scenario={"C": "plugin_field"})
+    assert result.status("C") == "PASS", result.out
+
+
+def test_c_ignores_another_plugins_dirty_hook_and_says_so(world):
+    result = world.run("--only", "C", scenario={"C": "foreign_dirty_extra"})
+    assert result.status("C") == "PASS", result.out
+    assert "SessionStart=1, UserPromptSubmit=1" in result.evidence("C")
+    assert "1 hook response(s) from other sources ignored" in result.evidence("C")
