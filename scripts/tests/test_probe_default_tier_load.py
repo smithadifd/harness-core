@@ -210,10 +210,34 @@ def run_hooks(event_name):
     result = (0, "", "")
     if not root:
         return result
+    sources = [p for p in read_state("added").split("\n")
+               if p and os.path.isdir(os.path.join(p, "plugins", "ledger-hooks"))]
+    source = os.path.join(sources[-1], "plugins", "ledger-hooks") if sources else root
+    if scn.get("c_from_source") or scn.get("c_r3_shape"):
+        # A plugin installed from a local-directory marketplace runs from its
+        # source folder: the probe's own checkout of the ledger repository.
+        root = os.path.realpath(source) if scn.get("c_resolved") else source
     if scn.get("c_other_root"):
         other = os.path.join(state, "other-root", "ledger-hooks")
         shutil.copytree(root, other, dirs_exist_ok=True)
         root = other
+    if scn.get("c_lookalike_root"):
+        # The same plugin under a folder that is named like the checkout but is not it.
+        other = os.path.join(state, "lookalike", "ledger-src", "plugins", "ledger-hooks")
+        shutil.copytree(source, other, dirs_exist_ok=True)
+        root = other
+    if scn.get("c_sibling_in_checkout"):
+        # Another plugin folder inside the checkout.
+        other = os.path.join(os.path.dirname(source), "other-plugin")
+        shutil.copytree(source, other, dirs_exist_ok=True)
+        root = other
+    if scn.get("c_r3_shape") and event_name == "SessionStart":
+        # The live r3 log held 8 sh runs: five of shell one-liners, the option
+        # plugin's export hook under the target home, and the two ledger hooks.
+        for _ in range(5):
+            subprocess.run(["sh", "-c", "exit 0"], check=False)
+        subprocess.run(["sh", os.path.join(home, "probe-marketplace", "probe-option", "hooks", "export-option.sh")],
+                       check=False, capture_output=True)
     with open(os.path.join(root, "hooks", "hooks.json"), encoding="utf-8") as handle:
         listed = json.load(handle)["hooks"].get(event_name, [])
     for group in listed:
@@ -393,6 +417,17 @@ def main():
             target = os.path.join(home, ".local", "share", "ledger")
             os.makedirs(target, exist_ok=True)
             open(os.path.join(target, "ledger.db"), "w").close()
+        for folder, name in (("c_write_cache", ".cache/ledger/ledger.db"), ("c_write_npm", ".npm/_logs/a.log"),
+                             ("c_write_claude", ".claude/todos/t.json"),
+                             ("c_write_claude_json", ".claude.json.backup")):
+            if scn.get(folder):
+                target = os.path.join(home, name)
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                open(target, "w").close()
+        for number in range(scn.get("c_write_many", 0)):
+            target = os.path.join(home, ".cache", "many", "f%02d" % number)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            open(target, "w").close()
         os.makedirs(os.path.join(home, ".claude", "projects"), exist_ok=True)
         open(os.path.join(home, ".claude", "projects", "s.jsonl"), "w").close()
         open(os.path.join(home, ".claude.json"), "w").close()
@@ -1249,7 +1284,7 @@ def test_c_attributes_the_hook_runs_by_the_recording_sh_when_the_stream_names_no
     assert result.status("C") == "PASS", result.out
     evidence = result.evidence("C")
     assert "SessionStart:startup" in evidence and "UserPromptSubmit" in evidence
-    assert "logged a run of the install folder's hooks/session-start.sh and hooks/prompt.sh" in evidence
+    assert "logged a run of hooks/session-start.sh and hooks/prompt.sh from the install" in evidence
     assert "(session-start.sh x1, prompt.sh x1)" in evidence
     assert result.rc == 0
 
@@ -1334,6 +1369,93 @@ def test_c_is_unverified_when_the_install_folder_lacks_a_hook_script(world):
     assert result.status("C") == "UNVERIFIED"
     assert "holds no hooks/session-start.sh and hooks/prompt.sh" in result.evidence("C")
     assert result.tagged("C") == []
+
+
+def test_c_passes_in_the_live_r3_shape_the_hooks_run_from_the_pinned_checkout(world):
+    # Live r3: 8 sh runs; the option plugin's export hook under the target home and
+    # both ledger hooks under the probe's own checkout, not the install record's folder.
+    result = world.run("--only", "C", scenario={"c_r3_shape": True})
+    assert result.status("C") == "PASS", result.out
+    assert "from the pinned checkout" in result.evidence("C")
+    assert "(session-start.sh x1, prompt.sh x1)" in result.evidence("C")
+    assert result.rc == 0
+    start = hook_note(world, "session-start")
+    assert "/ledger-src/plugins/ledger-hooks/hooks/session-start.sh" in start[0]
+    assert "/.claude/plugins/cache/" not in start[0]
+
+
+def test_c_passes_when_the_checkout_is_reached_through_a_symlinked_temp_folder(world):
+    # The hooks run from the checkout's resolved path while the probe wrote the
+    # path it got through a symlinked temp folder: both spellings are the checkout.
+    link = world.tmp / "tmplink"
+    link.symlink_to(world.tmpdir, target_is_directory=True)
+    result = world.run("--only", "C", env={"TMPDIR": str(link)}, scenario={"c_r3_shape": True, "c_resolved": True})
+    assert result.status("C") == "PASS", result.out
+    assert "from the pinned checkout" in result.evidence("C")
+
+
+def test_c_r3_shape_logs_eight_sh_runs_as_the_live_run_did(world):
+    # The fixture is pinned to the live count: a stub that logs fewer runs would
+    # prove less than r3 showed. With an extra argument on the two ledger hooks
+    # they are not trusted, and the evidence reports the count and the scripts.
+    result = world.run("--only", "C", scenario={"c_r3_shape": True, "c_extra_arg": True})
+    assert result.status("C") == "UNVERIFIED", result.out
+    assert "sh was run 8 time(s)" in result.evidence("C")
+    assert "probe-marketplace/probe-option/hooks/export-option.sh" in result.evidence("C")
+
+
+def test_c_is_unverified_when_the_checkout_commit_check_failed_whatever_ran_from_it(world):
+    # The same r3-shaped hook runs, but the fetched HEAD is not the pinned commit:
+    # the probe starts no session on that checkout and trusts nothing under it.
+    result = world.run("--only", "C", env={"STUB_GIT_HEAD": "f" * 40}, scenario={"c_r3_shape": True})
+    assert result.status("C") == "UNVERIFIED", result.out
+    assert result.tagged("C") == []
+    assert result.rc == 2
+
+
+@pytest.mark.parametrize("scenario", ["c_lookalike_root", "c_sibling_in_checkout", "c_other_root"])
+def test_c_is_unverified_when_the_hooks_run_from_any_other_folder(world, scenario):
+    result = world.run("--only", "C", scenario={scenario: True})
+    assert result.status("C") == "UNVERIFIED", result.out
+    assert "logged no run of session-start.sh, prompt.sh under the install folder" in result.evidence("C")
+    assert "or its pinned checkout" in result.evidence("C")
+    assert result.rc == 2
+
+
+def test_c_unverified_evidence_names_the_scripts_that_ran_under_the_untrusted_root(world):
+    result = world.run("--only", "C", scenario={"c_lookalike_root": True})
+    assert "/lookalike/ledger-src/plugins/ledger-hooks/hooks/session-start.sh" in result.evidence("C")
+
+
+@pytest.mark.parametrize("scenario, path", [
+    ("c_write_cache", "./.cache/ledger/ledger.db"),
+    ("c_write_npm", "./.npm/_logs/a.log"),
+])
+def test_c_fails_when_a_hook_writes_under_cache_or_npm(world, scenario, path):
+    result = world.run("--only", "C", scenario={scenario: True})
+    assert result.status("C") == "FAIL", result.out
+    assert path in result.evidence("C")
+    assert result.rc == 1
+
+
+def test_c_fail_names_every_new_path(world):
+    result = world.run("--only", "C", scenario={"c_write_cache": True, "c_write_npm": True, "c_write": True})
+    assert result.status("C") == "FAIL"
+    for path in ("./.cache/ledger/ledger.db", "./.npm/_logs/a.log", "./.local/share/ledger/ledger.db"):
+        assert path in result.evidence("C")
+
+
+def test_c_fail_says_how_many_paths_past_the_twenty_it_names(world):
+    result = world.run("--only", "C", scenario={"c_write_many": 23})
+    assert result.status("C") == "FAIL"
+    assert "./.cache/many/f19" in result.evidence("C") and "./.cache/many/f20" not in result.evidence("C")
+    assert "(and 3 more)" in result.evidence("C")
+
+
+@pytest.mark.parametrize("scenario", ["c_write_claude", "c_write_claude_json"])
+def test_c_passes_when_the_session_writes_only_under_claudes_own_state(world, scenario):
+    result = world.run("--only", "C", scenario={scenario: True})
+    assert result.status("C") == "PASS", result.out
 
 
 def test_c_fails_when_a_response_of_either_event_is_not_clean_whatever_its_label(world):

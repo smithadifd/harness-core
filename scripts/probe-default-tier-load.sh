@@ -334,7 +334,8 @@ rand_hex() {
 # Agent/Task call or result), NOBOUNDARY or LEAKSEED (the compaction was not
 # shown, or the sentinel was there before it), ROOT (the install folder the
 # install record names), RAN or NORUN (the recording sh logged the plugin's two
-# hook scripts, or did not), NOEVENT, DIRTY or CLEAN (the stream's hook
+# hook scripts under a trusted root, or did not; RAN's second field names the
+# root kinds), NOEVENT, DIRTY or CLEAN (the stream's hook
 # responses, which name an event and not a plugin).
 IFS= read -r -d '' ANALYZER <<'PYEOF' || true
 import json, os, re, sys
@@ -356,11 +357,20 @@ def out(code, first="", second="", limit=160):
 
 if mode == "shimlog":
     # The recording sh's log: one line per run, the run's arguments separated by
-    # tabs. PASS needs a run whose only argument is a hook script of the
-    # installed plugin, under the install folder the install record names (given
-    # as the recorded path and as its resolved form). A missing log is an empty
-    # one: nothing ran.
-    roots = [item.rstrip("/") for item in extra]
+    # tabs. PASS needs a run whose only argument is a hook script of the plugin
+    # under a trusted root, given as kind:path (each path as recorded and as
+    # resolved): "install" is the install folder the install record names;
+    # "pinned checkout" is the plugin folder inside the probe's own ledger
+    # checkout, whose HEAD the caller verified equal to the pinned commit before
+    # it passed the root (a plugin installed from a local-directory marketplace
+    # runs from its source folder, not from the install record's folder). Any
+    # other root is untrusted. A missing log is an empty one: nothing ran.
+    roots = []
+    for item in extra:
+        kind, _sep, folder = item.partition(":")
+        folder = folder.rstrip("/")
+        if folder.startswith("/") and (kind, folder) not in roots:
+            roots.append((kind, folder))
     wanted = ("session-start.sh", "prompt.sh")
     try:
         with open(path, "rb") as handle:
@@ -369,17 +379,22 @@ if mode == "shimlog":
         lines = []
     runs = [line.split("\t") for line in lines if line]
     found = dict((name, 0) for name in wanted)
+    kinds = []
     for argv in runs:
         for name in wanted:
-            if len(argv) == 1 and argv[0] in ["%s/hooks/%s" % (root, name) for root in roots]:
-                found[name] += 1
+            for kind, root in roots:
+                if len(argv) == 1 and argv[0] == "%s/hooks/%s" % (root, name):
+                    found[name] += 1
+                    if kind not in kinds:
+                        kinds.append(kind)
     missing = [name for name in wanted if not found[name]]
     if missing:
         scripts = [argv[0] for argv in runs if argv and argv[0].endswith(".sh")]
         out("NORUN", ", ".join(missing),
             "sh was run %d time(s)%s" % (len(runs), "; scripts run: " + ", ".join(scripts[:3]) if scripts else ""),
             limit=600)
-    out("RAN", "session-start.sh x%d, prompt.sh x%d" % (found["session-start.sh"], found["prompt.sh"]))
+    out("RAN", "session-start.sh x%d, prompt.sh x%d" % (found["session-start.sh"], found["prompt.sh"]),
+        " and ".join(kinds))
 
 
 try:
@@ -823,10 +838,15 @@ group_b() {
 }
 
 # --- load C: the ledger hooks are silent before setup -----------------------------
+# Every file in the target home except Claude Code's own state: the .claude
+# folder and the .claude.json files beside it. The .cache and .npm folders are
+# listed like any other: a live Claude Code home held neither, so no path under
+# them is known to be Claude Code's own, and a new entry there (a hook writing
+# .cache/ledger/ledger.db, say) is a write the check reports.
 home_listing() {
   (
     cd "$target_home" || exit 1
-    find . \( -path ./.claude -o -path './.claude.json*' -o -path ./.cache -o -path ./.npm \) -prune \
+    find . \( -path ./.claude -o -path './.claude.json*' \) -prune \
       -o -type f -print 2>/dev/null | LC_ALL=C sort
   )
 }
@@ -843,6 +863,7 @@ git_run() {
 group_c() {
   local repo url ledger_src head_sha market_name before after calls new_files step spath bin_dir calls_log
   local plugin_root plugin_root_real shim_dir sh_log real_sh h_code h_one h_two s_code s_one s_two
+  local src_root src_root_real new_count
   if [ ! -f "$pin_file" ]; then
     emit UNVERIFIED C 'ledger-vendor.pin is not next to this script, so the ledger repository is unknown'
     return
@@ -958,23 +979,31 @@ print(data["name"] if sys.argv[2] in names else "")
     return
   fi
   h_code=$a_code; h_one=$a_one; h_two=$a_two
-  analyze shimlog "$sh_log" "$plugin_root" "$plugin_root_real"
+  # The second trusted root: the plugin folder inside the probe's own ledger
+  # checkout. Only a checkout whose HEAD equals the pinned commit gets here (the
+  # check above returns before any session otherwise).
+  src_root="$ledger_src/plugins/$LEDGER_PLUGIN"
+  src_root_real="$(cd -P "$src_root" 2>/dev/null && pwd)"
+  analyze shimlog "$sh_log" "install:$plugin_root" "install:$plugin_root_real" \
+    "pinned checkout:$src_root" "pinned checkout:$src_root_real"
   s_code=$a_code; s_one=$a_one; s_two=$a_two
   calls=""
   [ -s "$calls_log" ] && calls="$(head -n 1 "$calls_log" | cut -c1-120)"
-  new_files="$(comm -13 "$before" "$after" | head -n 5 | tr '\n' ' ')"
+  new_files="$(comm -13 "$before" "$after" | head -n 20 | tr '\n' ' ')"
+  new_count="$(comm -13 "$before" "$after" | wc -l | tr -d ' ')"
+  [ "$new_count" -gt 20 ] && new_files="$new_files(and $((new_count - 20)) more) "
   if [ -n "$calls" ]; then
     emit FAIL C "with no ledger value set a hook called the ledger command: $calls"
   elif [ -n "$new_files" ]; then
     emit FAIL C "with no ledger value set the session wrote new file(s): $new_files"
   elif [ "$s_code" != RAN ]; then
-    emit UNVERIFIED C "the recording sh logged no run of $s_one under the install folder of $LEDGER_PLUGIN ($s_two), so no hook run of the plugin is shown"
+    emit UNVERIFIED C "the recording sh logged no run of $s_one under the install folder of $LEDGER_PLUGIN or its pinned checkout ($s_two), so no hook run of the plugin is shown"
   elif [ "$h_code" = NOEVENT ]; then
     emit UNVERIFIED C "the stream shows no $h_one hook event (hook responses seen: $h_two), so the exit and output of the logged hook run are not shown"
   elif [ "$h_code" = DIRTY ]; then
     emit FAIL C "with no ledger value set a hook was not silent (the stream names the event, not the plugin): $h_one"
   else
-    emit PASS C "$LEDGER_PLUGIN $LEDGER_PIN_TAG (commit $LEDGER_PIN_SHA): the recording sh logged a run of the install folder's hooks/session-start.sh and hooks/prompt.sh ($s_one), the stream's hook responses exited clean with no output ($h_one; seen: $h_two), the ledger command was never called, no file was written outside Claude's own state"
+    emit PASS C "$LEDGER_PLUGIN $LEDGER_PIN_TAG (commit $LEDGER_PIN_SHA): the recording sh logged a run of hooks/session-start.sh and hooks/prompt.sh from the $s_two ($s_one), the stream's hook responses exited clean with no output ($h_one; seen: $h_two), the ledger command was never called, no file was written outside Claude's own state"
   fi
 }
 
