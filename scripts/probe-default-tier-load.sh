@@ -335,7 +335,8 @@ rand_hex() {
 # shown, or the sentinel was there before it), ROOT (the install folder the
 # install record names), RAN or NORUN (the recording sh logged the plugin's two
 # hook scripts under a trusted root, or did not; RAN's second field names the
-# root kinds), NOEVENT, DIRTY or CLEAN (the stream's hook
+# root kinds; NORUN's second field also counts the log's malformed records),
+# NOEVENT, DIRTY or CLEAN (the stream's hook
 # responses, which name an event and not a plugin).
 IFS= read -r -d '' ANALYZER <<'PYEOF' || true
 import json, os, re, sys
@@ -356,34 +357,71 @@ def out(code, first="", second="", limit=160):
 
 
 if mode == "shimlog":
-    # The recording sh's log: one line per run, the run's arguments separated by
-    # tabs. PASS needs a run whose only argument is a hook script of the plugin
-    # under a trusted root, given as kind:path (each path as recorded and as
-    # resolved): "install" is the install folder the install record names;
+    # The recording sh's log: one record per run, on one line, written in one
+    # write: RUN, each argument and END, separated by tabs. A line that is not
+    # exactly one such record (two runs glued together, a cut record) is
+    # malformed: it is counted and read as no run. PASS needs a run whose only
+    # argument is a hook script of the plugin under a trusted root, given as
+    # kind:folder: "install" is the install folder the install record names;
     # "pinned checkout" is the plugin folder inside the probe's own ledger
     # checkout, whose HEAD the caller verified equal to the pinned commit before
     # it passed the root (a plugin installed from a local-directory marketplace
     # runs from its source folder, not from the install record's folder). Any
-    # other root is untrusted. A missing log is an empty one: nothing ran.
+    # other root is untrusted. Both sides of the comparison are resolved the same
+    # way first: a logged script is its folder's physical path plus its base name
+    # (the shell logs the spelling it was given, such as /var/... for
+    # /private/var/... on macOS) and a root is its physical path; the two are
+    # equal when they have the same path components, never by a string prefix,
+    # so /a/ledger-src-evil is not /a/ledger-src. A logged script that does not
+    # exist, or is not an absolute path, is untrusted whatever its spelling. A
+    # missing log is an empty one: nothing ran.
     roots = []
     for item in extra:
         kind, _sep, folder = item.partition(":")
-        folder = folder.rstrip("/")
-        if folder.startswith("/") and (kind, folder) not in roots:
-            roots.append((kind, folder))
+        if not folder.startswith("/"):
+            continue
+        real = os.path.realpath(folder)
+        if os.path.isdir(real) and (kind, real) not in roots:
+            roots.append((kind, real))
+
+    def components(value):
+        return [piece for piece in value.split("/") if piece]
+
+    def physical(script):
+        if not script.startswith("/"):
+            return None
+        folder, name = os.path.split(script)
+        full = os.path.join(os.path.realpath(folder), name)
+        return full if os.path.isfile(full) else None
+
     wanted = ("session-start.sh", "prompt.sh")
     try:
         with open(path, "rb") as handle:
-            lines = handle.read().decode("utf-8", "replace").splitlines()
+            lines = handle.read().decode("utf-8", "replace").split("\n")
     except OSError:
         lines = []
-    runs = [line.split("\t") for line in lines if line]
+    runs = []
+    malformed = 0
+    for line in lines:
+        if not line:
+            continue
+        fields = line.split("\t")
+        if (len(fields) >= 2 and fields[0] == "RUN" and fields[-1] == "END"
+                and line.count("RUN\t") == 1 and line.count("\tEND") == 1):
+            runs.append(fields[1:-1])
+        else:
+            malformed += 1
     found = dict((name, 0) for name in wanted)
     kinds = []
     for argv in runs:
+        if len(argv) != 1:
+            continue
+        full = physical(argv[0])
+        if full is None:
+            continue
         for name in wanted:
             for kind, root in roots:
-                if len(argv) == 1 and argv[0] == "%s/hooks/%s" % (root, name):
+                if components(full) == components(root) + ["hooks", name]:
                     found[name] += 1
                     if kind not in kinds:
                         kinds.append(kind)
@@ -391,7 +429,10 @@ if mode == "shimlog":
     if missing:
         scripts = [argv[0] for argv in runs if argv and argv[0].endswith(".sh")]
         out("NORUN", ", ".join(missing),
-            "sh was run %d time(s)%s" % (len(runs), "; scripts run: " + ", ".join(scripts[:3]) if scripts else ""),
+            "sh was run %d time(s)%s%s" % (
+                len(runs),
+                ", %d malformed record(s) not counted" % malformed if malformed else "",
+                "; scripts run: " + ", ".join(scripts[:3]) if scripts else ""),
             limit=600)
     out("RAN", "session-start.sh x%d, prompt.sh x%d" % (found["session-start.sh"], found["prompt.sh"]),
         " and ".join(kinds))
@@ -612,24 +653,25 @@ if mode == "hooks":
 out("BAD", "unknown analyzer mode")
 PYEOF
 
-# The recording sh of load C, written by one call: it appends its arguments (one
-# tab-separated line) to a log outside the target home, then runs the system sh
-# with the same arguments and the same stdin. Arguments: file, log, the sh.
+# The recording sh of load C, written by one call: it appends one record (RUN,
+# its arguments and END, tab-separated, on one line) to a log outside the target
+# home, then runs the system sh with the same arguments and the same stdin.
+# Arguments: file, log, the sh. The record is built first and written by one
+# command, so it reaches the log in one write: Claude Code starts a session's
+# hooks together, and a record written in pieces is cut by another run's.
 IFS= read -r -d '' SHIM_WRITER <<'PYEOF' || true
 import os, shlex, sys
 
 path, log, real = sys.argv[1:4]
 text = "\n".join([
     "#!/bin/sh",
-    "# Records its arguments on one line, then runs the system sh unchanged.",
-    "{",
-    "  sep=''",
-    '  for arg in "$@"; do',
-    "    printf '%s%s' \"$sep\" \"$arg\"",
-    "    sep='\t'",
-    "  done",
-    "  printf '\\n'",
-    "} >>%s 2>/dev/null" % shlex.quote(log),
+    "# Records one run on one line, in one write, then runs the system sh unchanged.",
+    "probe_record=RUN",
+    'for probe_arg in "$@"; do',
+    '  probe_record="$probe_record\t$probe_arg"',
+    "done",
+    'probe_record="$probe_record\tEND"',
+    "printf '%%s\\n' \"$probe_record\" >>%s 2>/dev/null" % shlex.quote(log),
     'exec %s "$@"' % shlex.quote(real),
     "",
 ])
@@ -863,7 +905,7 @@ git_run() {
 group_c() {
   local repo url ledger_src head_sha market_name before after calls new_files step spath bin_dir calls_log
   local plugin_root plugin_root_real shim_dir sh_log real_sh h_code h_one h_two s_code s_one s_two
-  local src_root src_root_real new_count
+  local src_root new_count
   if [ ! -f "$pin_file" ]; then
     emit UNVERIFIED C 'ledger-vendor.pin is not next to this script, so the ledger repository is unknown'
     return
@@ -983,9 +1025,7 @@ print(data["name"] if sys.argv[2] in names else "")
   # checkout. Only a checkout whose HEAD equals the pinned commit gets here (the
   # check above returns before any session otherwise).
   src_root="$ledger_src/plugins/$LEDGER_PLUGIN"
-  src_root_real="$(cd -P "$src_root" 2>/dev/null && pwd)"
-  analyze shimlog "$sh_log" "install:$plugin_root" "install:$plugin_root_real" \
-    "pinned checkout:$src_root" "pinned checkout:$src_root_real"
+  analyze shimlog "$sh_log" "install:$plugin_root" "pinned checkout:$src_root"
   s_code=$a_code; s_one=$a_one; s_two=$a_two
   calls=""
   [ -s "$calls_log" ] && calls="$(head -n 1 "$calls_log" | cut -c1-120)"

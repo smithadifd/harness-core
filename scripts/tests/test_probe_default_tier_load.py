@@ -75,6 +75,10 @@ def log(**extra):
         "path0": os.environ.get("PATH", "").split(":")[0],
         "path_head": os.environ.get("PATH", "").split(":")[:2],
     }
+    first = os.environ.get("PATH", "").split(":")[0]
+    if os.path.basename(first) == "probe-shim" and os.path.isfile(os.path.join(first, "sh")):
+        with open(os.path.join(first, "sh"), encoding="utf-8") as shim:
+            record["shim"] = shim.read()
     record.update(extra)
     with open(os.environ["STUB_LOG"], "a", encoding="utf-8") as handle:
         handle.write(json.dumps(record) + "\n")
@@ -213,10 +217,16 @@ def run_hooks(event_name):
     sources = [p for p in read_state("added").split("\n")
                if p and os.path.isdir(os.path.join(p, "plugins", "ledger-hooks"))]
     source = os.path.join(sources[-1], "plugins", "ledger-hooks") if sources else root
-    if scn.get("c_from_source") or scn.get("c_r3_shape"):
+    if (scn.get("c_from_source") or scn.get("c_r3_shape") or scn.get("c_r4_shape") or scn.get("c_burst")
+            or scn.get("c_script_gone") or scn.get("c_merged_record") or scn.get("c_relative_record")):
         # A plugin installed from a local-directory marketplace runs from its
         # source folder: the probe's own checkout of the ledger repository.
         root = os.path.realpath(source) if scn.get("c_resolved") else source
+        if scn.get("c_r4_shape"):
+            # The live r4 log: the shell logs the checkout in the spelling the hook
+            # was started with (one slash, through the symlinked temp folder), not
+            # the double-slash spelling the probe was given or the resolved one.
+            root = os.path.normpath(source)
     if scn.get("c_other_root"):
         other = os.path.join(state, "other-root", "ledger-hooks")
         shutil.copytree(root, other, dirs_exist_ok=True)
@@ -224,6 +234,17 @@ def run_hooks(event_name):
     if scn.get("c_lookalike_root"):
         # The same plugin under a folder that is named like the checkout but is not it.
         other = os.path.join(state, "lookalike", "ledger-src", "plugins", "ledger-hooks")
+        shutil.copytree(source, other, dirs_exist_ok=True)
+        root = other
+    if scn.get("c_prefix_sibling_plugin"):
+        # A plugin folder whose name starts with the trusted one's.
+        other = os.path.join(os.path.dirname(source), "ledger-hooks-evil")
+        shutil.copytree(source, other, dirs_exist_ok=True)
+        root = other
+    if scn.get("c_prefix_sibling_checkout"):
+        # A checkout folder whose name starts with the trusted one's.
+        other = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(source))) + "/ledger-src-evil",
+                             "plugins", "ledger-hooks")
         shutil.copytree(source, other, dirs_exist_ok=True)
         root = other
     if scn.get("c_sibling_in_checkout"):
@@ -238,6 +259,35 @@ def run_hooks(event_name):
             subprocess.run(["sh", "-c", "exit 0"], check=False)
         subprocess.run(["sh", os.path.join(home, "probe-marketplace", "probe-option", "hooks", "export-option.sh")],
                        check=False, capture_output=True)
+    export = os.path.join(home, "probe-marketplace", "probe-option", "hooks", "export-option.sh")
+    quiet = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+    side = []
+    if scn.get("c_r4_shape") and event_name == "SessionStart":
+        # The live r4 log held 8 sh runs: five one-liners, then the option plugin's
+        # export hook started together with the ledger hook (Claude Code starts a
+        # session's hooks at once).
+        for _ in range(5):
+            subprocess.run(["sh", "-c", "exit 0"], check=False)
+        side.append(subprocess.Popen(["sh", export], **quiet))
+    if scn.get("c_burst") and event_name == "SessionStart":
+        for _ in range(scn["c_burst"]):
+            side.append(subprocess.Popen(["sh", export], **quiet))
+            side.append(subprocess.Popen('sh "${CLAUDE_PLUGIN_ROOT}/hooks/session-start.sh"', shell=True,
+                                         env=dict(os.environ, CLAUDE_PLUGIN_ROOT=root), **quiet))
+    if scn.get("c_relative_record") and event_name == "SessionStart":
+        # Records of the two hook scripts, each as a path relative to the folder the
+        # probe was started in: the files exist, but the log gives no absolute path.
+        shim_log = os.path.join(os.path.dirname(os.environ["PATH"].split(":")[0]), "sh-calls.log")
+        with open(shim_log, "a", encoding="utf-8") as handle:
+            for name in ("session-start.sh", "prompt.sh"):
+                handle.write("RUN\t%s\tEND\n" % os.path.relpath(os.path.join(root, "hooks", name),
+                                                               scn["c_relative_record"]))
+    if scn.get("c_merged_record") and event_name == "SessionStart":
+        # Two records glued into one line (what a record cut by another run's looked like).
+        shim_log = os.path.join(os.path.dirname(os.environ["PATH"].split(":")[0]), "sh-calls.log")
+        with open(shim_log, "a", encoding="utf-8") as handle:
+            handle.write("RUN\t%s\tENDRUN\t%s\tEND\n" % (export, os.path.join(root, "hooks", "session-start.sh")))
+    gone = []
     with open(os.path.join(root, "hooks", "hooks.json"), encoding="utf-8") as handle:
         listed = json.load(handle)["hooks"].get(event_name, [])
     for group in listed:
@@ -254,6 +304,12 @@ def run_hooks(event_name):
                 input=json.dumps({"hook_event_name": event_name, "session_id": "stub"}),
                 env=dict(os.environ, CLAUDE_PLUGIN_ROOT=root))
             result = (done.returncode, done.stdout, done.stderr)
+            if scn.get("c_script_gone"):
+                gone.append(os.path.join(root, "hooks", re.search(r"hooks/([\w.-]+\.sh)", command).group(1)))
+    for process in side:
+        process.wait()
+    for script in gone:
+        os.unlink(script)
     return result
 
 
@@ -1402,6 +1458,9 @@ def test_c_r3_shape_logs_eight_sh_runs_as_the_live_run_did(world):
     assert result.status("C") == "UNVERIFIED", result.out
     assert "sh was run 8 time(s)" in result.evidence("C")
     assert "probe-marketplace/probe-option/hooks/export-option.sh" in result.evidence("C")
+    # The evidence field is cut at 600 characters, so a long temp path can cut the third entry.
+    assert re.search(r"export-option\.sh, /\S+/ledger-src/plugins/ledger-hooks/hooks/session-start\.sh, /",
+                     result.evidence("C")), result.evidence("C")
 
 
 def test_c_is_unverified_when_the_checkout_commit_check_failed_whatever_ran_from_it(world):
@@ -1504,3 +1563,97 @@ def test_the_counts_are_in_the_evidence_of_a_missing_call_or_result(world, ident
     result = world.run("--only", ident[0], scenario={ident: mode})
     assert result.status(ident) == "UNVERIFIED"
     assert counts in result.evidence(ident)
+
+
+def test_c_passes_in_the_live_r4_shape_logged_through_a_symlink_while_the_root_is_held_resolved(world):
+    # Live r4: the hooks ran from the pinned checkout, but the recording sh logged them
+    # as /var/... while the probe held the checkout as /private/var/... (and, with a
+    # TMPDIR that ends in a slash, as .../T//probe-...). Both sides are resolved
+    # before they are compared.
+    link = world.tmp / "tmplink"
+    link.symlink_to(world.tmpdir, target_is_directory=True)
+    result = world.run("--only", "C", env={"TMPDIR": str(link) + "/"}, scenario={"c_r4_shape": True})
+    assert result.status("C") == "PASS", result.out
+    assert "from the pinned checkout" in result.evidence("C")
+    assert "(session-start.sh x1, prompt.sh x1)" in result.evidence("C")
+    assert result.rc == 0
+    logged = hook_note(world, "session-start")[0]
+    assert logged.startswith(str(link) + "/probe-default-tier."), "logged in the unresolved spelling"
+    assert str(world.tmpdir) not in logged
+    assert logged.endswith("/ledger-src/plugins/ledger-hooks/hooks/session-start.sh")
+
+
+def test_c_r4_shape_logs_eight_runs_each_as_one_record_with_a_comma_and_space_between_scripts(world):
+    link = world.tmp / "tmplink"
+    link.symlink_to(world.tmpdir, target_is_directory=True)
+    result = world.run("--only", "C", env={"TMPDIR": str(link) + "/"},
+                       scenario={"c_r4_shape": True, "c_extra_arg": True})
+    assert result.status("C") == "UNVERIFIED", result.out
+    evidence = result.evidence("C")
+    assert "sh was run 8 time(s)" in evidence
+    assert "malformed" not in evidence
+    listed = evidence.split("scripts run: ")[1]
+    # Entries are separated by a comma and a space; the field is cut at 600
+    # characters, so a long temp path can cut the last entry short.
+    entries = listed.split(", ")
+    assert len(entries) >= 3, listed
+    assert not re.search(r"\.sh/", listed), "no script path runs into the next"
+    for entry in entries[:2]:
+        assert entry.startswith("/") and entry.endswith(".sh"), entry
+
+
+@pytest.mark.parametrize("scenario", ["c_prefix_sibling_plugin", "c_prefix_sibling_checkout"])
+def test_c_is_unverified_when_the_hooks_run_from_a_folder_named_like_the_trusted_one_plus_more(world, scenario):
+    # Whole path components, never a string prefix: ledger-hooks-evil is not ledger-hooks
+    # and ledger-src-evil is not ledger-src.
+    result = world.run("--only", "C", scenario={scenario: True})
+    assert result.status("C") == "UNVERIFIED", result.out
+    assert "logged no run of session-start.sh, prompt.sh" in result.evidence("C")
+    assert "-evil/" in result.evidence("C")
+    assert result.rc == 2
+
+
+def test_c_is_unverified_when_the_logged_script_no_longer_exists_whatever_its_spelling(world):
+    # The log names the pinned checkout's hook scripts exactly as the probe spells it,
+    # but the files are gone when the log is read: a path that cannot be resolved to a
+    # file is never trusted by its spelling.
+    result = world.run("--only", "C", scenario={"c_script_gone": True})
+    assert result.status("C") == "UNVERIFIED", result.out
+    assert "logged no run of session-start.sh, prompt.sh" in result.evidence("C")
+    assert "/ledger-src/plugins/ledger-hooks/hooks/session-start.sh" in result.evidence("C")
+    assert result.rc == 2
+
+
+def test_the_recording_sh_writes_each_record_with_one_command(world):
+    # A record written in pieces is cut by another run's when hooks start together
+    # (live r4: one line held the export hook and the ledger hook).
+    shim = world.run("--only", "C").tagged("C")[0]["shim"]
+    writers = [line for line in shim.splitlines() if "printf" in line]
+    assert len(writers) == 1 and shim.count(">>") == 1, shim
+    assert ">>" in writers[0] and writers[0].startswith("printf "), "not inside the argument loop"
+    assert writers[0].endswith("2>/dev/null")
+    assert shim.rstrip().endswith('"$@"') and "exec " in shim.splitlines()[-1]
+
+
+def test_c_counts_every_run_of_a_burst_of_hooks_started_together(world):
+    result = world.run("--only", "C", scenario={"c_burst": 40})
+    assert result.status("C") == "PASS", result.out
+    assert "(session-start.sh x41, prompt.sh x1)" in result.evidence("C")
+
+
+def test_c_reads_a_line_holding_two_records_as_malformed_and_never_as_a_run(world):
+    result = world.run("--only", "C", scenario={"c_merged_record": True, "c_omit_hook": ["session-start.sh"]})
+    assert result.status("C") == "UNVERIFIED", result.out
+    assert "logged no run of session-start.sh under the install folder" in result.evidence("C")
+    assert "1 malformed record(s) not counted" in result.evidence("C")
+    assert result.rc == 2
+
+
+def test_c_is_unverified_when_the_logged_scripts_are_given_as_relative_paths(world):
+    # The scripts exist and the relative paths lead to them from the probe's folder,
+    # but a path that is not absolute is never trusted.
+    result = world.run("--only", "C", scenario={
+        "c_relative_record": str(world.tmp), "c_omit_hook": ["session-start.sh", "prompt.sh"]})
+    assert result.status("C") == "UNVERIFIED", result.out
+    assert "logged no run of session-start.sh, prompt.sh" in result.evidence("C")
+    assert result.rc == 2
