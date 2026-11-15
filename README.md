@@ -142,11 +142,11 @@ summary: <n> pass, <n> fail, <n> unverified
 | Id | What it asks | PASS means |
 |---|---|---|
 | A1 | does a rules file in the target home's `.claude/rules/` reach the main thread | a one-turn no-tools session returned the file's random sentinel |
-| A2 | ... and a general-purpose subagent | the main thread's own `Agent` call to one foreground subagent of type exactly `general-purpose` came back with the sentinel, and the sentinel was not in the prompt it gave the subagent |
+| A2 | ... and a general-purpose subagent | the main thread made exactly one top-level `Agent` (or `Task`) call, to one foreground subagent of type exactly `general-purpose`, the stream holds exactly one non-error result for that call, it came back with the sentinel, and the sentinel was not in the prompt the main thread gave the subagent. Any other count of calls or results (two subagents where one replied, a call with two results, none) is `UNVERIFIED` and the line shows the counts |
 | A3 | ... and a session after compaction | one `claude` process was sent three messages (a seed turn that never held the sentinel, `/compact`, a question), the stream showed `compact_boundary` before the question's reply, and that reply held the sentinel. This proves the rules file's sentinel is still in that session's context after a compaction in that same session. It does not show whether Claude Code kept the file's text through the compaction or loaded it again, and it says nothing about a session resumed in a new process, which loads the rules file at start |
 | B1 | does a plugin option reach the main thread's Bash commands (diagnostic, not counted) | the main thread's `echo` of the exported variable showed the option value |
-| B2 | does a plugin option reach a general-purpose subagent's Bash commands (the verdict for B) | the subagent's `echo` showed the value set with `claude plugin configure --values-stdin`, with no Bash run by the main thread; the exact value seen is printed |
-| C | are the ledger plugin's hooks silent before setup | with the pinned ledger plugin installed, no ledger value set and a call-recording `ledger` first on PATH, session start and one prompt each ran a hook of the `ledger-hooks` plugin that exited 0 with no output, the recorder was never called and no file was written outside Claude's own state. Only hook responses that name the `ledger-hooks` plugin count; responses from any other source are ignored, and with none that name it the line is `UNVERIFIED` |
+| B2 | does a plugin option reach a general-purpose subagent's Bash commands (the verdict for B) | the subagent's `echo` showed the value set with `claude plugin configure --values-stdin`, with no Bash run by the main thread and exactly one `Agent` call and one non-error result, as for A2; the exact value seen is printed |
+| C | are the ledger plugin's hooks silent before setup | with the pinned ledger plugin installed, no ledger value set, a call-recording `ledger` and a recording `sh` first on PATH: the recording `sh` logged a run of `hooks/session-start.sh` and of `hooks/prompt.sh` under the install folder the install record names (the plugin runs each hook as `sh "${CLAUDE_PLUGIN_ROOT}/hooks/<name>.sh"`), the stream's `SessionStart` and `UserPromptSubmit` hook responses exited 0 with no output, the recorder was never called past its `command -v` check and no file was written outside Claude's own state. The stream names a hook response by its event and not by its plugin, so it only corroborates; the logged run is what attributes it. With no logged run of either script, the line is `UNVERIFIED` and names what the recording `sh` did log; a stream response of either event that is not clean is a `FAIL` |
 
 What each verdict means:
 
@@ -160,8 +160,11 @@ What each verdict means:
   not install, a main thread that answered for the subagent, a subagent that
   ran in the background or was not of type `general-purpose`, a fetched ledger
   commit that is not the pinned one, a pinned commit that ships no hooks
-  plugin, or hook responses that do not name the ledger plugin. It is never
-  counted as a pass.
+  plugin, an install record that does not name the ledger plugin's install
+  folder inside the target home, a session that did not run one of the
+  plugin's hook scripts through the recording `sh` (a Claude Code that runs
+  hooks with an absolute path to `sh` shows nothing there), or a count of
+  subagent calls or results other than one. It is never counted as a pass.
 
 Exit codes: 0 every counted line PASS; 1 one or more FAIL and no UNVERIFIED; 2
 one or more UNVERIFIED (it wins over FAIL); 3 usage error or refused

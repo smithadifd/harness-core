@@ -4,8 +4,10 @@ The probe runs real Claude Code sessions, so these tests put a stub `claude`
 (and a stub `git` for load C) first on PATH. The stubs record every call (argv,
 HOME, the variables that could redirect the config folder, whether the token
 was the one given) and return canned replies chosen by a scenario. They read
-the rules file the probe placed in its target home, and run the plugin hook
-script the probe wrote, so a reply carries a sentinel only when the probe
+the rules file the probe placed in its target home, run the plugin hook
+script the probe wrote, and (load C) run the hooks of the plugin the probe
+installed through the shell and the PATH it was given, as Claude Code does, so
+a reply carries a sentinel, and a hook run is logged, only when the probe
 really put it where the stub looks. No real Claude Code, no network and no
 real home folder is touched: the invoking HOME is a scratch folder with a
 canary in it.
@@ -48,7 +50,7 @@ SCRUBBED = [
 ]
 
 CLAUDE_STUB = r'''#!__PYTHON__
-import glob, json, os, re, subprocess, sys, tempfile, time
+import glob, json, os, re, shutil, subprocess, sys, tempfile, time
 
 argv = sys.argv[1:]
 home = os.environ.get("HOME", "")
@@ -71,6 +73,7 @@ def log(**extra):
         "scrubbed_present": [name for name in SCRUBBED if name in os.environ],
         "token_ok": os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") == os.environ.get("STUB_EXPECT_TOKEN"),
         "path0": os.environ.get("PATH", "").split(":")[0],
+        "path_head": os.environ.get("PATH", "").split(":")[:2],
     }
     record.update(extra)
     with open(os.environ["STUB_LOG"], "a", encoding="utf-8") as handle:
@@ -166,6 +169,70 @@ def option_value():
     return found.group(1) if found else ""
 
 
+def install_ledger(plugin_id):
+    """What `claude plugin install` leaves in the target home: the plugin's files in
+    a cache folder (a name the probe could not guess) and an install record that
+    names it."""
+    sources = [p for p in read_state("added").split("\n")
+               if p and os.path.isdir(os.path.join(p, "plugins", "ledger-hooks"))]
+    if scn.get("c_no_install_record") or not sources:
+        return
+    if scn.get("c_install_outside"):
+        root = os.path.join(state, "outside", "ledger-hooks")
+    else:
+        root = os.path.join(home, ".claude", "plugins", "cache", "ledger-plugins", "ledger-hooks", "build-7f3a")
+    shutil.copytree(os.path.join(sources[-1], "plugins", "ledger-hooks"), root, dirs_exist_ok=True)
+    entry = {"scope": "user", "installPath": root, "version": "0.3.1"}
+    entries = [entry, dict(entry)] if scn.get("c_two_installs") else [entry]
+    record = os.path.join(home, ".claude", "plugins", "installed_plugins.json")
+    os.makedirs(os.path.dirname(record), exist_ok=True)
+    with open(record, "w", encoding="utf-8") as handle:
+        json.dump({"version": 2, "plugins": {plugin_id: entries}}, handle)
+
+
+def installed_root():
+    try:
+        with open(os.path.join(home, ".claude", "plugins", "installed_plugins.json"), encoding="utf-8") as handle:
+            record = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    for entries in record.get("plugins", {}).values():
+        return entries[0]["installPath"]
+    return None
+
+
+def run_hooks(event_name):
+    """Run what the installed plugin's hooks.json lists for an event the way Claude
+    Code does: each command through a shell (which finds `sh` on the PATH it was
+    given) with CLAUDE_PLUGIN_ROOT set and the event's JSON on stdin. Returns the
+    exit code, stdout and stderr of the last command."""
+    root = installed_root()
+    result = (0, "", "")
+    if not root:
+        return result
+    if scn.get("c_other_root"):
+        other = os.path.join(state, "other-root", "ledger-hooks")
+        shutil.copytree(root, other, dirs_exist_ok=True)
+        root = other
+    with open(os.path.join(root, "hooks", "hooks.json"), encoding="utf-8") as handle:
+        listed = json.load(handle)["hooks"].get(event_name, [])
+    for group in listed:
+        for hook in group["hooks"]:
+            command = hook["command"]
+            if any(name in command for name in scn.get("c_omit_hook", [])):
+                continue
+            if scn.get("c_bypass_shim"):
+                command = "/bin/" + command
+            if scn.get("c_extra_arg"):
+                command += " extra"
+            done = subprocess.run(
+                command, shell=True, capture_output=True, text=True,
+                input=json.dumps({"hook_event_name": event_name, "session_id": "stub"}),
+                env=dict(os.environ, CLAUDE_PLUGIN_ROOT=root))
+            result = (done.returncode, done.stdout, done.stderr)
+    return result
+
+
 def plugin_command():
     sub = argv[1] if len(argv) > 1 else ""
     if sub == "marketplace":
@@ -178,6 +245,8 @@ def plugin_command():
         log(plugin="install", plugin_id=argv[2])
         fail_step("install")
         write_state("installed", argv[2] + "\n", "a")
+        if argv[2].startswith("ledger-hooks@"):
+            install_ledger(argv[2])
     elif sub == "configure":
         data = sys.stdin.read()
         log(plugin="configure", plugin_id=argv[2], stdin=data)
@@ -266,7 +335,8 @@ def main():
         if tag == "A2":
             inner = sentinel if mode in (
                 "ok", "okfg", "leak", "nospawn", "topbash", "nottgp", "noresult",
-                "missingtype", "emptytype", "casetype") else "NONE"
+                "missingtype", "emptytype", "casetype", "twocalls", "twocalls_task",
+                "tworesults", "noid") else "NONE"
             pattern = inner
         else:
             value = "" if mode == "empty" else option_value()
@@ -288,7 +358,9 @@ def main():
             given["run_in_background"] = True
         if mode == "okfg":
             given["run_in_background"] = False
-        tool_use("Agent", given, "toolu_1")
+        tool_use("Agent", given, None if mode == "noid" else "toolu_1")
+        if mode in ("twocalls", "twocalls_task"):
+            tool_use("Task" if mode == "twocalls_task" else "Agent", dict(given), "toolu_4")
         if mode == "foreign":
             tool_result("toolu_9", [{"type": "text", "text": sentinel}])
             pattern = "NONE"
@@ -298,7 +370,10 @@ def main():
         if mode in ("background", "launch_notice"):
             pattern = LAUNCH_NOTICE
         if mode != "noresult":
-            tool_result("toolu_1", [{"type": "text", "text": pattern}], is_error=(mode == "agent_error"))
+            tool_result(None if mode == "noid" else "toolu_1", [{"type": "text", "text": pattern}],
+                        is_error=(mode == "agent_error"))
+        if mode == "tworesults":
+            tool_result("toolu_1", [{"type": "text", "text": pattern}])
         if mode == "errresult":
             emit({"type": "result", "subtype": "error_max_turns", "is_error": True, "result": "stopped"})
         else:
@@ -308,6 +383,10 @@ def main():
         print("PROBE_OPT=[%s]" % value)
     elif tag == "C":
         emit({"type": "system", "subtype": "init"})
+        # The hooks run first, as at session start and at the prompt. The stream
+        # then names each response by its event, never by its plugin (the live
+        # run's labels).
+        runs = dict((name, run_hooks(name)) for name in ("SessionStart", "UserPromptSubmit"))
         if scn.get("c_call_ledger"):
             subprocess.run(["ledger", "resume", "--brief"], check=False)
         if scn.get("c_write"):
@@ -317,12 +396,17 @@ def main():
         os.makedirs(os.path.join(home, ".claude", "projects"), exist_ok=True)
         open(os.path.join(home, ".claude", "projects", "s.jsonl"), "w").close()
         open(os.path.join(home, ".claude.json"), "w").close()
+        labels = {"SessionStart": "SessionStart:startup", "UserPromptSubmit": "UserPromptSubmit"}
         for name in ("SessionStart", "UserPromptSubmit"):
             if mode == "noevent_" + name:
                 continue
+            code, out_text, err_text = runs[name]
             event = {"type": "system", "subtype": "hook_response", "hook_event": name,
-                     "hook_name": name + ":ledger-hooks", "exit_code": 0, "outcome": "success",
-                     "stdout": "", "stderr": ""}
+                     "hook_name": labels[name], "exit_code": code,
+                     "outcome": "success" if code == 0 else "error", "stdout": out_text, "stderr": err_text}
+            # A stream that names the plugin in the hook's name: it is no attribution.
+            if mode == "ledger_label":
+                event["hook_name"] = name + ":ledger-hooks"
             if mode == "dirty_stdout" and name == "SessionStart":
                 event["stdout"] = "ledger-hooks: ledger resume --brief exited 2"
             if mode == "dirty_stderr" and name == "UserPromptSubmit":
@@ -334,20 +418,11 @@ def main():
                 event["outcome"] = "blocking"
             if mode == "no_exit_code":
                 del event["exit_code"]
-            # Responses another source's hooks produced, not the ledger plugin's.
-            if mode == "foreign_only":
-                event["hook_name"] = name + ":other-plugin"
-            if mode == "lookalike":
-                event["hook_name"] = name + ":not-ledger-hooks"
-            if mode == "foreign_session_start" and name == "SessionStart":
-                event["hook_name"] = name + ":other-plugin"
-            if mode == "plugin_field":
-                event["hook_name"] = name + ":startup"
-                event["plugin_id"] = "ledger-hooks@ledger-plugins"
             emit(event)
+        # A second source's response of the same event, which is not clean.
         if mode == "foreign_dirty_extra":
             emit({"type": "system", "subtype": "hook_response", "hook_event": "SessionStart",
-                  "hook_name": "SessionStart:other-plugin", "exit_code": 2, "outcome": "blocking",
+                  "hook_name": "SessionStart:startup", "exit_code": 2, "outcome": "blocking",
                   "stdout": "other plugin noise", "stderr": ""})
         finish("ACK")
     else:
@@ -409,6 +484,25 @@ def write_exec(path: Path, text: str) -> None:
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
 
+# The ledger-hooks plugin as the pinned commit ships it: every hook is
+# sh "${CLAUDE_PLUGIN_ROOT}/hooks/<name>.sh". Each script here is silent and
+# notes its own name, argument count, what `command -v ledger` finds and its
+# stdin in a folder outside the target home, for a test to read.
+HOOKS_JSON = {"hooks": {
+    "SessionStart": [{"hooks": [{"type": "command", "command": 'sh "${CLAUDE_PLUGIN_ROOT}/hooks/session-start.sh"'}]}],
+    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": 'sh "${CLAUDE_PLUGIN_ROOT}/hooks/prompt.sh"'}]}],
+}}
+HOOK_SCRIPT = r'''#!/bin/sh
+[ -n "${STUB_STATE:-}" ] || exit 0
+mkdir -p "$STUB_STATE/hooks"
+{
+  printf '%s\n' "$0" "$#" "$(command -v ledger || echo none)"
+  cat
+} >"$STUB_STATE/hooks/NAME"
+exit 0
+'''
+
+
 def ledger_fixture(root: Path, with_plugin: bool = True) -> Path:
     (root / ".claude-plugin").mkdir(parents=True)
     (root / ".claude-plugin" / "marketplace.json").write_text(json.dumps({
@@ -417,7 +511,9 @@ def ledger_fixture(root: Path, with_plugin: bool = True) -> Path:
     if with_plugin:
         hooks = root / "plugins" / "ledger-hooks" / "hooks"
         hooks.mkdir(parents=True)
-        (hooks / "hooks.json").write_text('{"hooks": {}}')
+        (hooks / "hooks.json").write_text(json.dumps(HOOKS_JSON))
+        for script, name in (("session-start.sh", "session-start"), ("prompt.sh", "prompt")):
+            (hooks / script).write_text(HOOK_SCRIPT.replace("NAME", name))
     return root
 
 
@@ -683,8 +779,9 @@ def test_c_passes_when_hooks_run_clean_and_nothing_is_written(world):
     assert result.status("C") == "PASS", result.out
     assert "SessionStart=1, UserPromptSubmit=1" in result.evidence("C")
     session = result.tagged("C")[0]
-    # the tripwire ledger command stands first on PATH, and no ledger value is set.
-    assert session["path0"].endswith("probe-bin")
+    # the recording sh stands first on PATH, then the tripwire ledger command,
+    # and no ledger value is set.
+    assert session["path_head"][0].endswith("probe-shim") and session["path_head"][1].endswith("probe-bin")
     assert session["ledger_db_set"] is False
     assert "--include-hook-events" in session["argv"]
 
@@ -1140,30 +1237,148 @@ def test_an_empty_existing_probe_home_is_used(world, tmp_path):
     assert {Path(c["home"]).resolve() for c in result.calls} == {chosen.resolve()}
 
 
-@pytest.mark.parametrize("mode, words", [
-    ("foreign_only", "no SessionStart hook event attributable to ledger-hooks"),
-    ("lookalike", "no SessionStart hook event attributable to ledger-hooks"),
-    ("foreign_session_start", "no SessionStart hook event attributable to ledger-hooks"),
-])
-def test_c_counts_only_hook_events_that_name_the_ledger_plugin(world, mode, words):
-    result = world.run("--only", "C", scenario={"C": mode})
+def hook_note(world, name):
+    """What the fixture's hook script noted: its $0, its argument count, what
+    `command -v ledger` found, then its stdin."""
+    return (world.state / "hooks" / name).read_text().splitlines()
+
+
+def test_c_attributes_the_hook_runs_by_the_recording_sh_when_the_stream_names_no_plugin(world):
+    # The live stream labels hook responses SessionStart:startup and UserPromptSubmit.
+    result = world.run("--only", "C")
+    assert result.status("C") == "PASS", result.out
+    evidence = result.evidence("C")
+    assert "SessionStart:startup" in evidence and "UserPromptSubmit" in evidence
+    assert "logged a run of the install folder's hooks/session-start.sh and hooks/prompt.sh" in evidence
+    assert "(session-start.sh x1, prompt.sh x1)" in evidence
+    assert result.rc == 0
+
+
+def test_c_runs_are_logged_with_the_scripts_argv_and_stdin_unchanged(world):
+    world.run("--only", "C")
+    start = hook_note(world, "session-start")
+    prompt = hook_note(world, "prompt")
+    assert start[0].endswith("/.claude/plugins/cache/ledger-plugins/ledger-hooks/build-7f3a/hooks/session-start.sh")
+    assert prompt[0].endswith("/ledger-hooks/build-7f3a/hooks/prompt.sh")
+    assert start[1] == prompt[1] == "0"
+    # `ledger` resolves, to the call recorder: the hook can get past its command -v probe.
+    assert start[2].endswith("/probe-bin/ledger") and prompt[2].endswith("/probe-bin/ledger")
+    assert json.loads("\n".join(start[3:]))["hook_event_name"] == "SessionStart"
+    assert json.loads("\n".join(prompt[3:]))["hook_event_name"] == "UserPromptSubmit"
+
+
+def test_the_recording_sh_stands_outside_the_target_home_ahead_of_everything_on_path(world):
+    result = world.run("--only", "C")
+    session = result.tagged("C")[0]
+    shim = Path(session["path_head"][0]).resolve()
+    assert session["path_head"][0].endswith("/probe-shim")
+    assert Path(session["home"]).resolve() not in shim.parents
+    assert Path(session["home"]).resolve().parent in shim.parents, "the probe's own scratch folder"
+
+
+@pytest.mark.parametrize("omitted", [["session-start.sh"], ["prompt.sh"], ["session-start.sh", "prompt.sh"]])
+def test_c_is_unverified_when_the_recording_sh_logged_no_run_of_a_hook_script(world, omitted):
+    # The stream still shows both hook responses, and names the plugin in each.
+    result = world.run("--only", "C", scenario={"C": "ledger_label", "c_omit_hook": omitted})
     assert result.status("C") == "UNVERIFIED", result.out
-    assert words in result.evidence("C")
+    assert f"logged no run of {', '.join(omitted)} under the install folder of ledger-hooks" in result.evidence("C")
     assert result.rc == 2
 
 
-def test_c_names_the_other_sources_it_saw_when_none_is_the_ledger_plugin(world):
-    result = world.run("--only", "C", scenario={"C": "foreign_only"})
-    assert "SessionStart:other-plugin" in result.evidence("C")
+def test_c_is_unverified_when_the_hook_runs_do_not_go_through_the_recording_sh(world):
+    result = world.run("--only", "C", scenario={"C": "ledger_label", "c_bypass_shim": True})
+    assert result.status("C") == "UNVERIFIED", result.out
+    assert "logged no run of session-start.sh, prompt.sh" in result.evidence("C")
+    assert "sh was run 0 time(s)" in result.evidence("C")
 
 
-def test_c_attributes_a_hook_by_a_plugin_field_when_its_name_does_not_say(world):
-    result = world.run("--only", "C", scenario={"C": "plugin_field"})
-    assert result.status("C") == "PASS", result.out
+def test_c_is_unverified_when_the_logged_run_is_a_script_under_another_root(world):
+    result = world.run("--only", "C", scenario={"c_other_root": True})
+    assert result.status("C") == "UNVERIFIED", result.out
+    assert "logged no run of session-start.sh, prompt.sh under the install folder" in result.evidence("C")
+    assert "other-root/ledger-hooks/hooks/session-start.sh" in result.evidence("C")
+    assert result.rc == 2
 
 
-def test_c_ignores_another_plugins_dirty_hook_and_says_so(world):
+def test_c_is_unverified_when_the_logged_run_has_more_arguments_than_the_script(world):
+    result = world.run("--only", "C", scenario={"c_extra_arg": True})
+    assert result.status("C") == "UNVERIFIED", result.out
+    assert "logged no run of session-start.sh, prompt.sh under the install folder" in result.evidence("C")
+    assert "sh was run 2 time(s)" in result.evidence("C")
+
+
+def test_c_is_unverified_when_the_install_left_no_install_record(world):
+    result = world.run("--only", "C", scenario={"c_no_install_record": True})
+    assert result.status("C") == "UNVERIFIED"
+    assert "left no install record" in result.evidence("C")
+    assert result.tagged("C") == []
+
+
+def test_c_is_unverified_when_the_install_folder_is_outside_the_target_home(world):
+    result = world.run("--only", "C", scenario={"c_install_outside": True})
+    assert result.status("C") == "UNVERIFIED"
+    assert "is outside the target home" in result.evidence("C")
+    assert result.tagged("C") == []
+
+
+def test_c_is_unverified_when_the_install_record_lists_two_install_folders(world):
+    result = world.run("--only", "C", scenario={"c_two_installs": True})
+    assert result.status("C") == "UNVERIFIED"
+    assert "lists 2 install folder(s) for ledger-hooks@ledger-plugins, expected 1" in result.evidence("C")
+    assert result.tagged("C") == []
+
+
+def test_c_is_unverified_when_the_install_folder_lacks_a_hook_script(world):
+    (world.fixture / "plugins" / "ledger-hooks" / "hooks" / "prompt.sh").unlink()
+    result = world.run("--only", "C")
+    assert result.status("C") == "UNVERIFIED"
+    assert "holds no hooks/session-start.sh and hooks/prompt.sh" in result.evidence("C")
+    assert result.tagged("C") == []
+
+
+def test_c_fails_when_a_response_of_either_event_is_not_clean_whatever_its_label(world):
+    # The stream does not say whose it is, so a response that is not clean is held against the run.
     result = world.run("--only", "C", scenario={"C": "foreign_dirty_extra"})
-    assert result.status("C") == "PASS", result.out
-    assert "SessionStart=1, UserPromptSubmit=1" in result.evidence("C")
-    assert "1 hook response(s) from other sources ignored" in result.evidence("C")
+    assert result.status("C") == "FAIL", result.out
+    assert "SessionStart exited 2" in result.evidence("C") and "SessionStart printed on stdout" in result.evidence("C")
+    assert "the stream names the event, not the plugin" in result.evidence("C")
+    assert result.rc == 1
+
+
+@pytest.mark.parametrize("mode", ["twocalls", "twocalls_task"])
+@pytest.mark.parametrize("ident", ["A2", "B2"])
+def test_two_subagent_calls_where_only_one_replied_are_unverified(world, ident, mode):
+    result = world.run("--only", ident[0], scenario={ident: mode})
+    assert result.status(ident) == "UNVERIFIED", result.out
+    evidence = result.evidence(ident)
+    assert "made 2 Agent/Task calls, expected exactly one" in evidence
+    assert "2 top-level Agent/Task call(s), 1 non-error result(s) for them" in evidence
+    assert result.rc == 2
+
+
+@pytest.mark.parametrize("ident", ["A2", "B2"])
+def test_one_subagent_call_with_two_results_is_unverified(world, ident):
+    result = world.run("--only", ident[0], scenario={ident: "tworesults"})
+    assert result.status(ident) == "UNVERIFIED", result.out
+    evidence = result.evidence(ident)
+    assert "has 2 results in the stream, expected one" in evidence
+    assert "1 top-level Agent/Task call(s), 2 non-error result(s) for them" in evidence
+    assert result.rc == 2
+
+
+@pytest.mark.parametrize("ident", ["A2", "B2"])
+def test_a_call_and_a_result_that_carry_no_id_are_not_matched_to_each_other(world, ident):
+    result = world.run("--only", ident[0], scenario={ident: "noid"})
+    assert result.status(ident) == "UNVERIFIED", result.out
+    assert "has no result in the stream" in result.evidence(ident)
+
+
+@pytest.mark.parametrize("ident, mode, counts", [
+    ("A2", "noresult", "(1 top-level Agent/Task call(s), 0 non-error result(s) for them)"),
+    ("A2", "nospawn", "(0 top-level Agent/Task call(s), 0 non-error result(s) for them)"),
+    ("B2", "noresult", "(1 top-level Agent/Task call(s), 0 non-error result(s) for them)"),
+])
+def test_the_counts_are_in_the_evidence_of_a_missing_call_or_result(world, ident, mode, counts):
+    result = world.run("--only", ident[0], scenario={ident: mode})
+    assert result.status(ident) == "UNVERIFIED"
+    assert counts in result.evidence(ident)

@@ -34,7 +34,10 @@
 #                           Unset: every selected load is UNVERIFIED.
 #
 # Load C runs the public ledger repository's hooks plugin at the one commit
-# pinned below (LEDGER_PIN_SHA); no environment variable changes it.
+# pinned below (LEDGER_PIN_SHA); no environment variable changes it. The stream
+# of a session names a hook response by its event, never by its plugin, so a
+# hook run is attributed to the plugin by a recording sh that stands first on
+# the session's PATH and logs each run of the plugin's own hook scripts.
 #
 # Every claude command gets HOME=<target home> inline, with CLAUDE_CONFIG_DIR
 # and the other config-folder and credential variables removed, so the
@@ -326,12 +329,15 @@ rand_hex() {
 #   <CODE>|<field 1>|<field 2>
 # CODE is BAD (field 1 says why the reply cannot be read), FOUND or MISSING
 # (the wanted text is, or is not, in the route under test; field 1 is the
-# value seen, field 2 an excerpt), NOSPAWN, NOTGP, BGRUN, TOPBASH or LEAK (the
-# route was not the one under test), NOBOUNDARY or LEAKSEED (the compaction
-# was not shown, or the sentinel was there before it), NOEVENT, DIRTY or CLEAN
-# (hook events of the ledger plugin).
+# value seen, field 2 an excerpt), NOSPAWN, COUNT, NOTGP, BGRUN, TOPBASH or
+# LEAK (the route was not the one under test; COUNT is more or fewer than one
+# Agent/Task call or result), NOBOUNDARY or LEAKSEED (the compaction was not
+# shown, or the sentinel was there before it), ROOT (the install folder the
+# install record names), RAN or NORUN (the recording sh logged the plugin's two
+# hook scripts, or did not), NOEVENT, DIRTY or CLEAN (the stream's hook
+# responses, which name an event and not a plugin).
 IFS= read -r -d '' ANALYZER <<'PYEOF' || true
-import json, re, sys
+import json, os, re, sys
 
 mode, path = sys.argv[1], sys.argv[2]
 extra = sys.argv[3:]
@@ -343,9 +349,37 @@ def clean(value, limit=160):
     return value[:limit]
 
 
-def out(code, first="", second=""):
-    print("%s|%s|%s" % (code, clean(first), clean(second)))
+def out(code, first="", second="", limit=160):
+    print("%s|%s|%s" % (code, clean(first, limit), clean(second, limit)))
     sys.exit(0)
+
+
+if mode == "shimlog":
+    # The recording sh's log: one line per run, the run's arguments separated by
+    # tabs. PASS needs a run whose only argument is a hook script of the
+    # installed plugin, under the install folder the install record names (given
+    # as the recorded path and as its resolved form). A missing log is an empty
+    # one: nothing ran.
+    roots = [item.rstrip("/") for item in extra]
+    wanted = ("session-start.sh", "prompt.sh")
+    try:
+        with open(path, "rb") as handle:
+            lines = handle.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        lines = []
+    runs = [line.split("\t") for line in lines if line]
+    found = dict((name, 0) for name in wanted)
+    for argv in runs:
+        for name in wanted:
+            if len(argv) == 1 and argv[0] in ["%s/hooks/%s" % (root, name) for root in roots]:
+                found[name] += 1
+    missing = [name for name in wanted if not found[name]]
+    if missing:
+        scripts = [argv[0] for argv in runs if argv and argv[0].endswith(".sh")]
+        out("NORUN", ", ".join(missing),
+            "sh was run %d time(s)%s" % (len(runs), "; scripts run: " + ", ".join(scripts[:3]) if scripts else ""),
+            limit=600)
+    out("RAN", "session-start.sh x%d, prompt.sh x%d" % (found["session-start.sh"], found["prompt.sh"]))
 
 
 try:
@@ -372,6 +406,31 @@ if mode == "text":
     if needle in text:
         out("FOUND", seen_option(text), text)
     out("MISSING", seen_option(text), text)
+
+if mode == "installroot":
+    # The install record Claude Code leaves in the target home: the install
+    # folder of one plugin id, which must lie inside the target home.
+    plugin_id, home = extra[0], extra[1]
+    try:
+        data = json.loads(text)
+    except ValueError:
+        out("BAD", "the install record is not JSON")
+    table = data.get("plugins") if isinstance(data, dict) else None
+    entries = table.get(plugin_id) if isinstance(table, dict) else None
+    if isinstance(entries, dict):
+        entries = [entries]
+    paths = [entry["installPath"] for entry in entries or []
+             if isinstance(entry, dict) and isinstance(entry.get("installPath"), str)]
+    if len(paths) != 1:
+        out("BAD", "the install record lists %d install folder(s) for %s, expected 1" % (len(paths), plugin_id))
+    root = paths[0]
+    if not os.path.isabs(root):
+        out("BAD", "the install folder %s is not an absolute path" % root, limit=600)
+    real = os.path.realpath(root)
+    base = os.path.realpath(home)
+    if real != base and not real.startswith(base.rstrip("/") + "/"):
+        out("BAD", "the install folder %s is outside the target home" % root, limit=600)
+    out("ROOT", root, real, limit=4096)
 
 events = []
 for number, line in enumerate(text.splitlines(), 1):
@@ -442,6 +501,7 @@ if mode == "subagent":
     result_event()
     top = [event for event in events if not event.get("parent_tool_use_id")]
     spawned = {}
+    calls = 0
     top_bash = 0
     for event in top:
         if event.get("type") != "assistant":
@@ -450,13 +510,29 @@ if mode == "subagent":
             if item.get("type") != "tool_use":
                 continue
             if item.get("name") in ("Agent", "Task"):
+                calls += 1
                 spawned[item.get("id")] = item.get("input") or {}
             elif item.get("name") == "Bash":
                 top_bash += 1
-    if not spawned:
-        out("NOSPAWN", "the main thread started no subagent")
+    # The results of the top-level Agent/Task calls, by call id.
+    answers = []
+    errors = []
+    for event in top:
+        if event.get("type") != "user":
+            continue
+        for item in blocks(event):
+            if (item.get("type") == "tool_result" and isinstance(item.get("tool_use_id"), str)
+                    and item.get("tool_use_id") in spawned):
+                (errors if item.get("is_error") else answers).append(block_text(item.get("content")))
+    counts = "%d top-level Agent/Task call(s), %d non-error result(s) for them" % (calls, len(answers))
+    if not calls:
+        out("NOSPAWN", "the main thread started no subagent (%s)" % counts)
     if top_bash:
         out("TOPBASH", "the main thread ran Bash itself %d time(s)" % top_bash)
+    # Exactly one call and one result: with more, a reply of one subagent could
+    # stand for the route while another's was never read.
+    if calls != 1 or len(spawned) != 1:
+        out("COUNT", "the main thread made %d Agent/Task calls, expected exactly one (%s)" % (calls, counts))
     for given in spawned.values():
         kind = given.get("subagent_type")
         if kind != "general-purpose":
@@ -465,18 +541,13 @@ if mode == "subagent":
             out("BGRUN", "subagent ran in the background")
         if needle in json.dumps(given):
             out("LEAK", "the subagent's prompt carried the sentinel")
-    replies = []
-    for event in top:
-        if event.get("type") != "user":
-            continue
-        for item in blocks(event):
-            if item.get("type") == "tool_result" and item.get("tool_use_id") in spawned:
-                if item.get("is_error"):
-                    out("BAD", "the subagent call returned an error: %s" % block_text(item.get("content")))
-                replies.append(block_text(item.get("content")))
-    if not replies:
-        out("BAD", "the subagent call has no result in the stream")
-    reply = " ".join(replies)
+    if errors:
+        out("BAD", "the subagent call returned an error: %s" % errors[0])
+    if not answers:
+        out("COUNT", "the subagent call has no result in the stream (%s)" % counts)
+    if len(answers) != 1:
+        out("COUNT", "the subagent call has %d results in the stream, expected one (%s)" % (len(answers), counts))
+    reply = answers[0]
     # A background launch answers the Agent call with a notice, not with the
     # subagent's final reply; reading it as the reply would be a false FAIL.
     if LAUNCH.search(reply):
@@ -486,31 +557,22 @@ if mode == "subagent":
     out("MISSING", seen_option(reply), reply)
 
 if mode == "hooks":
-    plugin = extra[0]
+    # Corroboration only. The stream names a hook response by its event
+    # (SessionStart:startup, UserPromptSubmit), never by its plugin, so it cannot
+    # say whose hook ran: the recording sh's log does that. Here: each event has a
+    # response, and no response of either event failed or printed.
     result_event()
     wanted = ("SessionStart", "UserPromptSubmit")
     counts = dict((name, 0) for name in wanted)
     dirty = []
-    others = []
-
-    def ours(event):
-        # Attributable to the plugin when the stream names it, as a whole word,
-        # in the hook's name or in a plugin field. A response that does not
-        # name it is another source's, and is neither counted nor held against it.
-        for key in ("hook_name", "plugin", "plugin_name", "plugin_id"):
-            value = event.get(key)
-            if isinstance(value, str) and plugin in re.split(r"[^A-Za-z0-9_.-]+", value):
-                return True
-        return False
+    seen = []
 
     for event in events:
         if event.get("type") != "system" or event.get("subtype") != "hook_response":
             continue
         name = event.get("hook_event")
+        seen.append(clean(event.get("hook_name") or name or "?", 60))
         if name not in counts:
-            continue
-        if not ours(event):
-            others.append(clean(event.get("hook_name") or name, 60))
             continue
         counts[name] += 1
         code = event.get("exit_code")
@@ -524,15 +586,42 @@ if mode == "hooks":
             dirty.append("%s printed on stdout" % name)
         if str(event.get("stderr") or "").strip():
             dirty.append("%s printed on stderr" % name)
+    labels = ", ".join(sorted(set(seen))[:5]) or "none"
     for name in wanted:
         if counts[name] == 0:
-            out("NOEVENT", name, ", ".join(sorted(set(others))[:5]) or "none")
+            out("NOEVENT", name, labels)
     if dirty:
-        out("DIRTY", "; ".join(dirty))
-    out("CLEAN", "SessionStart=%d, UserPromptSubmit=%d" % (counts["SessionStart"], counts["UserPromptSubmit"]),
-        "%d hook response(s) from other sources ignored" % len(others))
+        out("DIRTY", "; ".join(dirty), labels)
+    out("CLEAN", "SessionStart=%d, UserPromptSubmit=%d" % (counts["SessionStart"], counts["UserPromptSubmit"]), labels)
 
 out("BAD", "unknown analyzer mode")
+PYEOF
+
+# The recording sh of load C, written by one call: it appends its arguments (one
+# tab-separated line) to a log outside the target home, then runs the system sh
+# with the same arguments and the same stdin. Arguments: file, log, the sh.
+IFS= read -r -d '' SHIM_WRITER <<'PYEOF' || true
+import os, shlex, sys
+
+path, log, real = sys.argv[1:4]
+text = "\n".join([
+    "#!/bin/sh",
+    "# Records its arguments on one line, then runs the system sh unchanged.",
+    "{",
+    "  sep=''",
+    '  for arg in "$@"; do',
+    "    printf '%s%s' \"$sep\" \"$arg\"",
+    "    sep='\t'",
+    "  done",
+    "  printf '\\n'",
+    "} >>%s 2>/dev/null" % shlex.quote(log),
+    'exec %s "$@"' % shlex.quote(real),
+    "",
+])
+descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o755)
+with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+    handle.write(text)
+os.chmod(path, 0o755)
 PYEOF
 
 a_code=""; a_one=""; a_two=""
@@ -753,6 +842,7 @@ git_run() {
 
 group_c() {
   local repo url ledger_src head_sha market_name before after calls new_files step spath bin_dir calls_log
+  local plugin_root plugin_root_real shim_dir sh_log real_sh h_code h_one h_two s_code s_one s_two
   if [ ! -f "$pin_file" ]; then
     emit UNVERIFIED C 'ledger-vendor.pin is not next to this script, so the ledger repository is unknown'
     return
@@ -806,6 +896,25 @@ print(data["name"] if sys.argv[2] in names else "")
     return
   fi
 
+  # The install folder, read from the install record Claude Code left in the
+  # target home (never assumed), and the two hook scripts the plugin's hooks run
+  # from it.
+  if [ ! -f "$target_home/.claude/plugins/installed_plugins.json" ]; then
+    emit UNVERIFIED C "the install of $LEDGER_PLUGIN left no install record in the target home, so its install folder is not known"
+    return
+  fi
+  analyze installroot "$target_home/.claude/plugins/installed_plugins.json" "$LEDGER_PLUGIN@$market_name" "$target_home"
+  if [ "$a_code" != ROOT ]; then
+    emit UNVERIFIED C "the install folder of $LEDGER_PLUGIN could not be read from the install record: $a_one"
+    return
+  fi
+  plugin_root=$a_one
+  plugin_root_real=$a_two
+  if [ ! -f "$plugin_root_real/hooks/session-start.sh" ] || [ ! -f "$plugin_root_real/hooks/prompt.sh" ]; then
+    emit UNVERIFIED C "the install folder of $LEDGER_PLUGIN holds no hooks/session-start.sh and hooks/prompt.sh, so the hook runs to look for are not known"
+    return
+  fi
+
   # A ledger command that records every call stands on PATH, and no ledger
   # value is set: a hook that went past its "no values" check would call it.
   bin_dir="$target_home/probe-bin"
@@ -814,7 +923,25 @@ print(data["name"] if sys.argv[2] in names else "")
     && printf '#!/bin/sh\nprintf "%%s\\n" "$*" >>"%s"\nexit 0\n' "$calls_log" >"$bin_dir/ledger" \
     && chmod 755 "$bin_dir/ledger" \
     || { emit UNVERIFIED C 'could not place the ledger call recorder'; return; }
-  spath="$bin_dir:$base_path"
+
+  # A recording sh stands before everything on PATH, in the probe's own scratch
+  # folder (outside the target home): the plugin's hooks run as
+  # sh "${CLAUDE_PLUGIN_ROOT}/hooks/<name>.sh", so a logged run of the installed
+  # plugin's own scripts is what attributes a hook run to the plugin.
+  shim_dir="$scratch/probe-shim"
+  sh_log="$scratch/sh-calls.log"
+  real_sh="$(PATH="$base_path" command -v sh 2>/dev/null)"
+  case "$real_sh" in
+    /*) ;;
+    *) real_sh="" ;;
+  esac
+  if [ -z "$real_sh" ] || [ ! -x "$real_sh" ] || ! mkdir "$shim_dir" \
+      || ! python3 -I -c "$SHIM_WRITER" "$shim_dir/sh" "$sh_log" "$real_sh" \
+      || ! : >"$sh_log"; then
+    emit UNVERIFIED C 'could not place the recording sh'
+    return
+  fi
+  spath="$shim_dir:$bin_dir:$base_path"
 
   before="$scratch/listing.before"
   after="$scratch/listing.after"
@@ -825,11 +952,14 @@ print(data["name"] if sys.argv[2] in names else "")
     return
   fi
   home_listing >"$after"
-  analyze hooks "$out_file" "$LEDGER_PLUGIN"
+  analyze hooks "$out_file"
   if [ "$a_code" = BAD ]; then
     emit UNVERIFIED C "$a_one"
     return
   fi
+  h_code=$a_code; h_one=$a_one; h_two=$a_two
+  analyze shimlog "$sh_log" "$plugin_root" "$plugin_root_real"
+  s_code=$a_code; s_one=$a_one; s_two=$a_two
   calls=""
   [ -s "$calls_log" ] && calls="$(head -n 1 "$calls_log" | cut -c1-120)"
   new_files="$(comm -13 "$before" "$after" | head -n 5 | tr '\n' ' ')"
@@ -837,12 +967,14 @@ print(data["name"] if sys.argv[2] in names else "")
     emit FAIL C "with no ledger value set a hook called the ledger command: $calls"
   elif [ -n "$new_files" ]; then
     emit FAIL C "with no ledger value set the session wrote new file(s): $new_files"
-  elif [ "$a_code" = NOEVENT ]; then
-    emit UNVERIFIED C "the stream shows no $a_one hook event attributable to $LEDGER_PLUGIN (hook events from other sources: $a_two), so a hook run is not shown"
-  elif [ "$a_code" = DIRTY ]; then
-    emit FAIL C "with no ledger value set a hook was not silent: $a_one"
+  elif [ "$s_code" != RAN ]; then
+    emit UNVERIFIED C "the recording sh logged no run of $s_one under the install folder of $LEDGER_PLUGIN ($s_two), so no hook run of the plugin is shown"
+  elif [ "$h_code" = NOEVENT ]; then
+    emit UNVERIFIED C "the stream shows no $h_one hook event (hook responses seen: $h_two), so the exit and output of the logged hook run are not shown"
+  elif [ "$h_code" = DIRTY ]; then
+    emit FAIL C "with no ledger value set a hook was not silent (the stream names the event, not the plugin): $h_one"
   else
-    emit PASS C "$LEDGER_PLUGIN $LEDGER_PIN_TAG (commit $LEDGER_PIN_SHA) hooks exited clean with no output ($a_one; $a_two), the ledger command was never called, no file was written"
+    emit PASS C "$LEDGER_PLUGIN $LEDGER_PIN_TAG (commit $LEDGER_PIN_SHA): the recording sh logged a run of the install folder's hooks/session-start.sh and hooks/prompt.sh ($s_one), the stream's hook responses exited clean with no output ($h_one; seen: $h_two), the ledger command was never called, no file was written outside Claude's own state"
   fi
 }
 
