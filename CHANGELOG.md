@@ -5,6 +5,10 @@ and any pin move of the vendored ledger.
 
 ## Unreleased
 
+- `scripts/probe-default-tier-load.sh`, a read-only probe of where a rules
+  file, a general-purpose subagent, a compaction and plugin options reach a
+  live session, with its test; no vendored file changed. The README says
+  how to run it.
 - Alpha preparation, no vendored file changed: an MIT `LICENSE` at the root,
   the same license as the vendored ledger; the no-person check exempts
   exactly the MIT copyright line of that file from its deny list and nothing

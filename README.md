@@ -96,6 +96,72 @@ the same way: `ledger-vendor.pin` pins its tag, commit and blob ids,
 this repository in two steps: a pin move here, then a pin move in the
 consumer.
 
+## The default-tier load probe
+
+`scripts/probe-default-tier-load.sh` checks, on a live Claude Code account,
+the three load points the default tier's install design rests on. It is
+read-only: it runs in a fresh home folder of its own, never in the invoking
+user's, and it sets nothing up outside that folder.
+
+```text
+CLAUDE_CODE_OAUTH_TOKEN=<token from `claude setup-token`> scripts/probe-default-tier-load.sh
+```
+
+It needs `claude`, `python3`, `perl` and (load C) `git` on PATH, and network
+access to the public ledger repository for load C. Each probe session is one
+short `claude-haiku-5-5` turn. Options: `--timeout <secs>` (default 120 for
+each command), `--only <A|B|C>` (repeatable), `-h`. Environment:
+
+- `CLAUDE_CODE_OAUTH_TOKEN` is the only credential used. The probe passes it
+  inline to each `claude` command and never prints it. Without it every
+  selected load is `UNVERIFIED` and the script exits 2.
+- `PROBE_HOME` (optional) is an absolute path to a fresh, empty or absent
+  folder to use as the target home. The probe refuses it (exit 3, before any
+  session starts) when it is the invoking user's own home folder, is not an
+  absolute path, or already holds `.claude/rules` or a `.claude` symlink. Use a
+  new folder for each run; the probe leaves a folder you chose in place. With
+  it unset, the probe makes a temp home and removes it on exit.
+- `PROBE_LEDGER_TAG` (optional) names the ledger repository tag to probe in
+  load C; the default is its newest `vX.Y.Z` tag.
+
+Every `claude` command gets `HOME=<target home>` on that one command, with
+`CLAUDE_CONFIG_DIR` and the other variables that could point it at another
+config folder or credential removed.
+
+One line is printed per sub-load, then a summary:
+
+```text
+<PASS|FAIL|UNVERIFIED> <id> — <evidence>
+summary: <n> pass, <n> fail, <n> unverified
+```
+
+| Id | What it asks | PASS means |
+|---|---|---|
+| A1 | does a rules file in the target home's `.claude/rules/` reach the main thread | a one-turn no-tools session returned the file's random sentinel |
+| A2 | ... and a general-purpose subagent | the main thread's own `Agent` call to a general-purpose subagent came back with the sentinel, and the sentinel was not in the prompt it gave the subagent |
+| A3 | ... and a session after compaction | a resumed session was compacted with `/compact` (the stream shows `compact_boundary`), then returned the sentinel; the seed turn never held it |
+| B1 | does a plugin option reach the main thread's Bash commands (diagnostic, not counted) | the main thread's `echo` of the exported variable showed the option value |
+| B2 | does a plugin option reach a general-purpose subagent's Bash commands (the verdict for B) | the subagent's `echo` showed the value set with `claude plugin configure --values-stdin`, with no Bash run by the main thread; the exact value seen is printed |
+| C | are the ledger plugin's hooks silent before setup | with no ledger value set and a call-recording `ledger` first on PATH, session start and one prompt each ran a hook that exited 0 with no output, the recorder was never called and no file was written outside Claude's own state |
+
+What each verdict means:
+
+- `PASS`: a live session in the target home returned the load's own sentinel
+  through the route named, or (C) the hook run was seen and was clean.
+- `FAIL`: the route ran and the sentinel (or the clean hook run) was not
+  there. A FAIL is a finding about the install design, not about the probe.
+- `UNVERIFIED`: the route could not be run or its reply could not be read: no
+  token, no `claude`, a timeout, an unreadable or oversized reply, a
+  compaction the probe could not force, a test plugin that would not install,
+  a main thread that answered for the subagent, or a ledger tag that ships no
+  hooks plugin. It is never counted as a pass.
+
+Exit codes: 0 every counted line PASS; 1 one or more FAIL and no UNVERIFIED; 2
+one or more UNVERIFIED (it wins over FAIL); 3 usage error or refused
+`PROBE_HOME`. The output and the exit codes are pinned by
+`scripts/tests/test_probe_default_tier_load.py`, which runs the script against
+a stubbed `claude` and `git` and touches no real account.
+
 ## Origin
 
 This repository was carved without history from one commit of the repository
