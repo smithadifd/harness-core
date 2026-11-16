@@ -32,14 +32,12 @@ This is the whole contract.
   These three guarantees end once an in-process rollback has restored the home: a hard stop after that point leaves the home as it was before apply, and the next run may proceed, or refuse naming only the leftover backup.
 - **An apply that hard-stops before it changed anything outside its own folder** has changed nothing the person uses; setup's own folder may hold a temp file, a record and a backup, and the next run either proceeds or refuses by name (`leftover settings backup` or the hard-stop refusal). **An apply that hard-stops after line 2 is written** has completed: the next apply refuses `already applied`, and a leftover backup is deleted by remove.
 - **A remove that hard-stops** guarantees that settings.json is whole and the complete record is still in place until remove's last step, so running remove again finishes the job (I3). Remove has completed once the record is deleted; after that, only empty folders can remain, and a failure while pruning them is named as a warning and does not fail the run.
-- **Setup never acts on an unfinished record.** It never deletes, restores or rewrites anything on the strength of one. Recovery after a hard stop is by hand, and the steps in section 8 are advice, not a guarantee.
+- **Setup never acts on an unfinished record.** It never deletes, restores or rewrites anything on the strength of one. Recovery after a hard stop is by hand, and the steps under "After a hard stop" below are advice, not a guarantee.
 
 I2 and I3, as the promise uses them:
 
 - **I2. Never knowingly overwrite or delete bytes setup did not write.** Before rollback or remove deletes a file setup created, it compares the file's sha256 with the one setup wrote; on a difference it keeps the file and names it. Before apply or remove replaces settings.json, it compares the current bytes with the bytes it based its change on, and refuses unwritten on a difference. Rollback restores the pre-apply settings bytes only if the current bytes equal the bytes apply wrote; otherwise it takes apply's items out one by one, as remove does, and names the file.
 - **I3. Exact, re-runnable remove.** Remove acts only on a complete record. Settings items come out one by one: an item comes out only if it is still at its recorded place with its recorded neighbours. Items the person moved or duplicated are kept and named, and nothing else in settings.json is touched. A listed file that is already gone is skipped and named. Remove writes nothing to the record and deletes it last, and each of its steps is decided from the current files, so a remove stopped at any point before the record is deleted can be run again and finishes.
-
-"The steps in section 8" are the steps under "After a hard stop" below.
 
 ### After a hard stop
 

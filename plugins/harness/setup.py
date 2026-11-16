@@ -84,6 +84,11 @@ DENY_RULES: tuple[str, ...] = (
 
 SANDBOX_VALUE: dict[str, Any] = {"enabled": True}
 
+# The one sandbox proposal setup may make, as canonical JSON (sorted keys, no
+# spaces). The proposal gate compares the proposal with this text exactly, so
+# any other value (an extra key, a nested setting, `1` for `true`) refuses.
+SAFE_SANDBOX = '{"enabled":true}'
+
 GRANTING_KEYS = frozenset({
     "allow",
     "additionalDirectories",
@@ -165,6 +170,10 @@ def json_line(data: dict[str, Any]) -> bytes:
     return (json.dumps(data, ensure_ascii=False) + "\n").encode("utf-8")
 
 
+def canonical(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
 def write_all(fd: int, data: bytes) -> None:
     """Write every byte of data, or raise. A write that reports 0 bytes, or
     fails, is an error: a short write never passes as a success."""
@@ -229,10 +238,8 @@ def proposal_is_granting(kind: str, name: str, value: Any) -> bool:
 
 def granting_proposals() -> list[str]:
     found = []
-    if proposal_is_granting("key", "sandbox", SANDBOX_VALUE):
+    if canonical(SANDBOX_VALUE) != SAFE_SANDBOX:
         found.append("sandbox")
-    if any(key in GRANTING_KEYS for key in SANDBOX_VALUE):
-        found.append("sandbox nested grant")
     for rule in DENY_RULES:
         if proposal_is_granting("deny", "deny", rule):
             found.append(f"deny:{rule}")
@@ -257,18 +264,35 @@ def granting_in_settings(settings: dict[str, Any]) -> list[str]:
     return found
 
 
+def html_comment_line(line: str) -> bool:
+    """True when line is one whole HTML comment, `<!--` at its first column
+    and `-->` at its end, closed nowhere earlier: its text holds no `--` and
+    does not start with `>` or `->` (which would close it at once)."""
+    if len(line) < 7 or not line.startswith("<!--") or not line.endswith("-->"):
+        return False
+    inner = line[4:-3]
+    return not ("--" in inner or "\r" in inner
+                or inner.startswith(">") or inner.startswith("->"))
+
+
 def comment_only(text: str) -> bool:
-    for line in text.splitlines():
-        if line.strip() == "":
+    """True when every line is blank (spaces and tabs only) or one whole
+    HTML comment: content the rules loader cannot read as an instruction.
+    A `#` line is a Markdown heading, which Claude Code reads as an
+    instruction, so it is not a comment here."""
+    for line in text.split("\n"):
+        if line.endswith("\r"):
+            line = line[:-1]
+        if line.strip(" \t") == "":
             continue
-        if not line.startswith("#"):
+        if not html_comment_line(line):
             return False
     return True
 
 
 def check_proposals() -> tuple[bytes, bytes]:
     """The fixed proposal table grants nothing and the override starter is
-    comments only. Returns the rules and override bytes."""
+    HTML comments only. Returns the rules and override bytes."""
     grants = granting_proposals()
     if grants:
         raise SetupError("proposals grant: " + ", ".join(grants))
@@ -280,13 +304,13 @@ def check_proposals() -> tuple[bytes, bytes]:
 
 def approved_ids(approve: list[str], approve_all: bool) -> set[str]:
     known = {ident for ident, _text in optional_items()}
-    if approve_all:
-        return known
     found: set[str] = set()
     for ident in approve:
         if ident not in known:
             raise SetupError(f"unknown approval {ident!r}")
         found.add(ident)
+    if approve_all:
+        return known
     return found
 
 
@@ -703,45 +727,88 @@ def read_record(tree: Tree) -> tuple[bytes | None, dict[str, Any] | None, dict[s
 # Settings items
 
 
-def add_items(settings: dict[str, Any], ids: set[str],
-              notes: list[str]) -> tuple[list[dict[str, Any]], bool, bool]:
+def json_type(value: Any) -> str:
+    """The JSON type name of a parsed JSON value."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "a boolean"
+    if isinstance(value, (int, float)):
+        return "a number"
+    if isinstance(value, str):
+        return "a string"
+    if isinstance(value, list):
+        return "an array"
+    if isinstance(value, dict):
+        return "an object"
+    return type(value).__name__
+
+
+def wrong_type(settings: dict[str, Any], ids: set[str]) -> str | None:
+    """The first settings key an approved item adds to that is present with
+    a value of the wrong JSON type (null included), named with its type, or
+    None. Presence is membership, never `get`: such a value is never
+    overwritten, and apply refuses before its first write."""
+    if "sandbox" in ids and "sandbox" in settings and not isinstance(settings["sandbox"], dict):
+        return f"sandbox is {json_type(settings['sandbox'])}, not an object"
+    if any(f"deny:{rule}" in ids for rule in DENY_RULES) and "permissions" in settings:
+        permissions = settings["permissions"]
+        if not isinstance(permissions, dict):
+            return f"permissions is {json_type(permissions)}, not an object"
+        if "deny" in permissions and not isinstance(permissions["deny"], list):
+            return f"permissions.deny is {json_type(permissions['deny'])}, not an array"
+    return None
+
+
+def check_types(tree: Tree, found: tuple[bytes, int, dict[str, Any]] | None,
+                ids: set[str]) -> None:
+    problem = wrong_type(found[2], ids) if found is not None else None
+    if problem is not None:
+        raise SetupError(f"{tree.show(SETTINGS_REL)}: {problem}; setup does not overwrite it")
+
+
+def neighbours(seq: list[Any], index: int) -> tuple[Any, Any]:
+    return (seq[index - 1] if index > 0 else None,
+            seq[index + 1] if index + 1 < len(seq) else None)
+
+
+def add_items(settings: dict[str, Any],
+              ids: set[str]) -> tuple[list[dict[str, Any]], bool, bool]:
     """Add each approved item that is absent. Returns the items with their
-    recorded places, and whether permissions and permissions.deny were made."""
-    items: list[dict[str, Any]] = []
-    if "sandbox" in ids and "sandbox" not in settings:
-        keys = list(settings)
+    recorded places in the final settings, and whether permissions and
+    permissions.deny were made. The caller has checked wrong_type."""
+    added_sandbox = "sandbox" in ids and "sandbox" not in settings
+    if added_sandbox:
         settings["sandbox"] = dict(SANDBOX_VALUE)
-        items.append({"kind": "key", "name": "sandbox", "value": dict(SANDBOX_VALUE),
-                      "index": len(keys), "before": keys[-1] if keys else None,
-                      "after": None})
-    wanted = [rule for rule in DENY_RULES if f"deny:{rule}" in ids]
     created_permissions = created_deny = False
-    permissions = settings.get("permissions")
-    deny = permissions.get("deny") if isinstance(permissions, dict) else None
-    if wanted and permissions is not None and not isinstance(permissions, dict):
-        notes.append(f"not added: deny rules ({SETTINGS_REL} permissions is not an object)")
-        return items, False, False
-    if wanted and deny is not None and not isinstance(deny, list):
-        notes.append(f"not added: deny rules ({SETTINGS_REL} permissions.deny is not a list)")
-        return items, False, False
     added: list[int] = []
-    for rule in wanted:
-        if isinstance(deny, list) and rule in deny:
+    for rule in DENY_RULES:
+        if f"deny:{rule}" not in ids:
             continue
-        if permissions is None:
-            permissions = {}
-            settings["permissions"] = permissions
+        if "permissions" not in settings:
+            settings["permissions"] = {}
             created_permissions = True
-        if deny is None:
-            deny = []
-            permissions["deny"] = deny
+        permissions = settings["permissions"]
+        if "deny" not in permissions:
+            permissions["deny"] = []
             created_deny = True
+        deny = permissions["deny"]
+        if rule in deny:
+            continue
         deny.append(rule)
         added.append(len(deny) - 1)
+    items: list[dict[str, Any]] = []
+    if added_sandbox:
+        keys = list(settings)
+        index = keys.index("sandbox")
+        before, after = neighbours(keys, index)
+        items.append({"kind": "key", "name": "sandbox", "value": dict(SANDBOX_VALUE),
+                      "index": index, "before": before, "after": after})
     for index in added:
+        deny = settings["permissions"]["deny"]
+        before, after = neighbours(deny, index)
         items.append({"kind": "deny", "value": deny[index], "index": index,
-                      "before": deny[index - 1] if index > 0 else None,
-                      "after": deny[index + 1] if index + 1 < len(deny) else None})
+                      "before": before, "after": after})
     return items, created_permissions, created_deny
 
 
@@ -750,6 +817,21 @@ def take_out(settings: dict[str, Any], info: dict[str, Any], shown: str,
     """Take out each recorded item that is still at its recorded place with
     its recorded neighbours, judged on settings as it is now. Anything else
     is kept and named; nothing else in settings is touched."""
+    keys = list(settings)
+    keys_out: list[str] = []
+    for item in info["items"]:
+        if item["kind"] != "key":
+            continue
+        name = item["name"]
+        if name not in settings:
+            gone.append(f"{shown}: {name}")
+            continue
+        index = keys.index(name)
+        if (settings[name] == item["value"] and index == item["index"]
+                and neighbours(keys, index) == (item["before"], item["after"])):
+            keys_out.append(name)
+        else:
+            kept.append(f"{shown}: {name} (moved or changed)")
     permissions = settings.get("permissions")
     deny = permissions.get("deny") if isinstance(permissions, dict) else None
     matched: list[int] = []
@@ -773,16 +855,8 @@ def take_out(settings: dict[str, Any], info: dict[str, Any], shown: str,
         del permissions["deny"]
     if isinstance(permissions, dict) and not permissions and info["created_permissions"]:
         del settings["permissions"]
-    for item in info["items"]:
-        if item["kind"] != "key":
-            continue
-        name = item["name"]
-        if name not in settings:
-            gone.append(f"{shown}: {name}")
-        elif settings[name] == item["value"]:
-            del settings[name]
-        else:
-            kept.append(f"{shown}: {name} (value changed)")
+    for name in keys_out:
+        del settings[name]
 
 
 # ---------------------------------------------------------------------------
@@ -861,12 +935,13 @@ def apply_locked(tree: Tree, lock: int, operator: str, harness: str | None,
     tree.entry(SETTINGS_REL)
     claude = which_claude()
     ids = approved_ids(approve, approve_all)
-    read_settings(tree)
+    check_types(tree, read_settings(tree), ids)
 
     # Configure, then the settings bytes apply builds on.
     configure_ledger(claude, ledger_values(tree.root, operator, harness), lock)
     try:
         base = read_settings(tree)
+        check_types(tree, base, ids)
     except SetupError as exc:
         raise SetupError(f"{exc}; {CONFIGURE_STAYS}") from exc
     except Exception as exc:
@@ -944,7 +1019,7 @@ def apply_changes(tree: Tree, changes: Changes, base: tuple[bytes, int, dict[str
 
     # Settings, only when an approved item is absent.
     obj = json.loads(json.dumps(base[2])) if base is not None else {}
-    items, created_permissions, created_deny = add_items(obj, ids, notes)
+    items, created_permissions, created_deny = add_items(obj, ids)
     info = {"created": False, "sha256": None, "items": [],
             "created_permissions": False, "created_deny": False}
     if items:
@@ -1037,7 +1112,8 @@ def rollback(tree: Tree, changes: Changes, exc: Exception) -> SetupError:
             backup = "none (settings.json did not exist)"
         return SetupError(
             f"rollback incomplete; kept: {', '.join(failed + kept)}; "
-            f"record: {tree.show(RECORD_REL)}; settings backup: {backup}")
+            f"record: {tree.show(RECORD_REL)}; settings backup: {backup}; "
+            f"cause: {message}")
     return SetupError(message + "".join(
         f"; kept for a manual check: {shown}" for shown in kept))
 
@@ -1167,9 +1243,19 @@ def remove_locked(tree: Tree) -> tuple[str, list[str]]:
     current = tree.read(RECORD_REL)
     if current is None or current[0] != raw:
         raise SetupError(f"{tree.show(RECORD_REL)} changed while remove was running")
-    tree.unlink(RECORD_REL)
+    parent, name = tree.parent_of(RECORD_REL)
+    os.unlink(name, dir_fd=parent)
 
+    # Remove has completed: the record's unlink is its commit point. A
+    # failure after it (the folder fsync, pruning) is a named warning, never
+    # a failure that would leave a rerun refusing with no record.
     warnings: list[str] = []
+    try:
+        sync(parent)
+    except Exception as exc:
+        warnings.append(
+            f"warning: could not sync the folder {tree.show(SETUP_DIR_REL)} after deleting "
+            f"the record ({type(exc).__name__}: {one_line(exc)})")
     for rel in sorted((d for d in dirs if d in RECORD_DIRS),
                       key=lambda d: d.count("/"), reverse=True):
         try:

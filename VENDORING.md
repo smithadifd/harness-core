@@ -66,7 +66,7 @@ the text itself.
 | `VENDORING.md` | this file |
 | `ledger-vendor.pin` | the vendored ledger's pin: repository, tag, commit and one blob id per file |
 | `plugins/harness/.claude-plugin/plugin.json` | the harness plugin's manifest: its version and the plugins it depends on |
-| `plugins/harness/files/harness-local.md` | the override starter: comments only, grants nothing |
+| `plugins/harness/files/harness-local.md` | the override starter: HTML comments only, grants nothing |
 | `plugins/harness/files/harness.md` | the rules default placed by setup |
 | `plugins/harness/setup.py` | plan, apply and remove for the default-tier files and settings proposals |
 | `scripts/check-core-manifest.py` | checks that every tracked file is vendored or repository-only |
