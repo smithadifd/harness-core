@@ -480,3 +480,150 @@ def test_apply_does_not_add_a_grant_beside_a_seeded_allow(tmp_path):
     added = [item for item in record_of(home)["settings"]["items"] if item.get("kind") == "key"]
     assert all(item["name"] != "allow" for item in added)
     assert all(item["name"] != "autoAllow" for item in added)
+
+
+FAILING_CLAUDE_STUB = """\
+#!/usr/bin/env python3
+import sys
+sys.stderr.write("configure boom\\n")
+sys.exit(3)
+"""
+
+
+def install_claude_failing(folder: Path) -> Path:
+    bin_dir = folder / "bin"
+    bin_dir.mkdir()
+    claude = bin_dir / "claude"
+    claude.write_text(FAILING_CLAUDE_STUB, encoding="utf-8")
+    claude.chmod(claude.stat().st_mode | stat.S_IXUSR)
+    return bin_dir
+
+
+def test_apply_rolls_back_when_configure_fails(tmp_path):
+    bin_dir = install_claude_failing(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    seeded = home / "seeded.txt"
+    seeded.write_text("keep\n", encoding="utf-8")
+    before = listing(home)
+    done = apply_all(home, bin_dir)
+    assert done.returncode == 1
+    assert "claude plugin configure failed" in done.stderr
+    assert listing(home) == before
+    record = home / ".claude" / "plugins" / "harness-core" / "harness" / "setup-record.json"
+    assert not record.exists()
+
+
+def test_apply_refuses_invalid_settings_json_before_any_write(tmp_path):
+    bin_dir = install_claude(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    settings = home / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    settings.write_text("{not json", encoding="utf-8")
+    extra = home / "seeded.txt"
+    extra.write_text("keep\n", encoding="utf-8")
+    before = listing(home)
+    done = apply_all(home, bin_dir)
+    assert done.returncode == 1
+    assert "not valid JSON" in done.stderr
+    assert listing(home) == before
+    record = home / ".claude" / "plugins" / "harness-core" / "harness" / "setup-record.json"
+    assert not record.exists()
+
+
+def test_apply_sandbox_only_does_not_create_permissions(tmp_path):
+    bin_dir = install_claude(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    settings = home / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    original = json.dumps({"model": "kept"}, indent=2, ensure_ascii=False) + "\n"
+    settings.write_text(original, encoding="utf-8")
+    done = run("apply", home, "--approve", "sandbox", path_prefix=bin_dir)
+    assert done.returncode == 0, done.stderr
+    data = settings_of(home)
+    assert data["sandbox"] == {"enabled": True}
+    assert data["model"] == "kept"
+    assert "permissions" not in data
+    removed = run("remove", home)
+    assert removed.returncode == 0, removed.stderr
+    assert settings.read_bytes() == original.encode("utf-8")
+
+
+def test_apply_sandbox_only_on_absent_settings_removes_the_file(tmp_path):
+    bin_dir = install_claude(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    done = run("apply", home, "--approve", "sandbox", path_prefix=bin_dir)
+    assert done.returncode == 0, done.stderr
+    assert "permissions" not in settings_of(home)
+    removed = run("remove", home)
+    assert removed.returncode == 0, removed.stderr
+    assert not (home / ".claude" / "settings.json").exists()
+
+
+def test_apply_refuses_dangling_symlink_at_rules_path(tmp_path):
+    bin_dir = install_claude(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    rules_dir = home / ".claude" / "rules"
+    rules_dir.mkdir(parents=True)
+    rules = rules_dir / "harness.md"
+    rules.symlink_to("missing-target.md")
+    dest = rules_dir / "missing-target.md"
+    done = apply_all(home, bin_dir)
+    assert done.returncode == 1
+    assert "rules default already exists" in done.stderr
+    assert rules.is_symlink()
+    assert rules.readlink().as_posix() == "missing-target.md"
+    assert not dest.exists()
+    assert not (home / ".claude" / "plugins").exists()
+
+
+def test_apply_second_time_after_rules_deleted_keeps_record(tmp_path):
+    bin_dir = install_claude(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    done = apply_all(home, bin_dir)
+    assert done.returncode == 0, done.stderr
+    rules = home / ".claude" / "rules" / "harness.md"
+    rules.unlink()
+    record_path = home / ".claude" / "plugins" / "harness-core" / "harness" / "setup-record.json"
+    before = record_path.read_bytes()
+    again = apply_all(home, bin_dir)
+    assert again.returncode == 1
+    assert "already applied; run remove first" in again.stderr
+    assert record_path.read_bytes() == before
+
+
+def test_remove_keeps_a_rules_folder_that_existed(tmp_path):
+    bin_dir = install_claude(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    rules_dir = home / ".claude" / "rules"
+    rules_dir.mkdir(parents=True)
+    assert list(rules_dir.iterdir()) == []
+    done = apply_all(home, bin_dir)
+    assert done.returncode == 0, done.stderr
+    removed = run("remove", home)
+    assert removed.returncode == 0, removed.stderr
+    assert rules_dir.is_dir()
+    assert list(rules_dir.iterdir()) == []
+    assert not (home / ".claude" / "rules" / "harness.md").exists()
+
+
+def test_settings_write_keeps_non_ascii(tmp_path):
+    bin_dir = install_claude(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    settings = home / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    original = json.dumps({"model": "café"}, indent=2, ensure_ascii=False) + "\n"
+    settings.write_text(original, encoding="utf-8")
+    done = apply_all(home, bin_dir)
+    assert done.returncode == 0, done.stderr
+    text = settings.read_text(encoding="utf-8")
+    assert "café" in text
+    assert "\\u00e9" not in text
+    assert settings_of(home)["model"] == "café"
