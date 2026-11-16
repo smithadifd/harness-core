@@ -6,7 +6,13 @@ plugin once; the in-repo `harness` plugin is a folder here at the same tag; each
 external plugin is the one expected source for its name, fixed to a full 40-hex
 commit on a release tag; nothing resolves to a branch or a range.
 
-Usage: check-marketplace.py [--source]
+Usage: check-marketplace.py [--source [--expect-owner OWNER]]
+
+Run it as ``python3 -I`` (CI does): the isolated interpreter leaves this
+script's folder and the working folder off the import path and ignores every
+PYTHON* variable and the user site, so a module a pull request adds beside the
+script (``scripts/json.py``) cannot shadow a standard-library import. The
+script imports nothing from this repository.
 
 The check always reads the repository that holds this script (the folder above
 ``scripts/``); there is no option to point it at another tree.
@@ -47,27 +53,56 @@ shown in ``problems``):
   present) a list of plain names, each another entry of this marketplace (no
   version range, no ``name@marketplace``, no object form, not itself).
 
-``--source`` also resolves the tag of each external entry that passed every
-offline check, against the live repository the table above names for that
-plugin (never the url written in the manifest), at use time, with
-``git ls-remote`` on
-``refs/tags/<ref>`` and its peeled form ``refs/tags/<ref>^{}``. An annotated tag
-is peeled (the peeled line is used when it is present); a lightweight tag is its
-own commit. The commit must equal ``sha`` exactly. A tag that is not there, a
-``git ls-remote`` that fails or times out, an output line off the grammar
-``<40 lowercase hex><TAB>refs/tags/<ref>[^{}]``, and a tag that resolves to any
-other commit are each a refusal, never a pass. An entry that failed an offline check is not resolved at all
-and is reported as such. A url that starts with ``-``, holds whitespace or does
-not start with ``https://`` is refused before any subprocess. git runs with no
-shell and a fixed argv that ends its options with ``--`` before the url. It
-runs from a fresh temporary folder that is not inside any repository (so no
-repository-local git configuration applies), with a child environment built
-from scratch: PATH from the parent, HOME a fresh empty temporary folder,
-``GIT_CONFIG_NOSYSTEM=1``, ``GIT_CONFIG_GLOBAL=/dev/null``,
-``GIT_TERMINAL_PROMPT=0``, and no other variable, so no inherited ``GIT_*``
-variable (``GIT_CONFIG_COUNT``, ``GIT_CONFIG_PARAMETERS``, ``GIT_DIR`` and the
-rest) can rewrite a repository url. Both folders are removed afterwards. CI runs
-it in the ``plugin-validate`` job of ci.yml, with no credential.
+``--source`` also asks the GitHub REST API, at use time, which commit the
+release tag of each external entry names now, and refuses unless it is the
+entry's ``sha``. Only an entry that passed every offline check is resolved; any
+other is reported as not resolved. Its rules:
+
+- Host. The literal ``https://api.github.com``. No environment variable
+  (``GITHUB_API_URL`` included) and no option moves it. The default fetch
+  refuses any url whose scheme is not ``https`` or whose network location is
+  not exactly ``api.github.com`` (no user, no port).
+- Path. The repository is the table's (``EXTERNAL_PLUGINS``), never the url in
+  the manifest; the owner is the pin's. Each segment is checked with
+  ``re.fullmatch`` (ASCII classes) before any url is built: owner
+  ``[A-Za-z0-9][A-Za-z0-9-]{0,38}``; repository ``[A-Za-z0-9._-]{1,100}`` and
+  never ``.`` or ``..``; tag ``v[0-9]+.[0-9]+.[0-9]+``; object sha
+  ``[0-9a-f]{40}``. A url is the fixed host, fixed path words and checked
+  segments only.
+- Requests. ``GET /repos/<owner>/<repository>/git/ref/tags/<tag>``: the
+  singular endpoint, which answers 404 on a miss (the plural ``git/refs/``
+  prefix-matches and is never used). The answer's ``ref`` must be exactly
+  ``refs/tags/<tag>``. An object of type ``commit`` is the tag's commit. An
+  object of type ``tag`` is followed with
+  ``GET /repos/<owner>/<repository>/git/tags/<sha>``, at most 4 tag objects; a
+  5th is refused. Any other type (``blob``, ``tree``, anything unknown) is
+  refused by name. Every sha in an answer is checked before it is used in a
+  url or compared. The commit must equal the entry's ``sha``.
+- Each request carries ``Accept: application/vnd.github+json``,
+  ``X-GitHub-Api-Version: 2022-11-28``, a fixed ``User-Agent`` and
+  ``Cache-Control: no-cache`` (so a shared cache does not answer with a moved
+  tag's old commit), each unredirected. No credential: no token, no
+  Authorization header, no credential helper.
+- Fail closed. No redirect is followed (a 3xx is refused by its status). A
+  status other than 200, a socket operation slower than 20 s, a body over
+  256 KiB, a body that is not UTF-8 or not JSON, a JSON value of the wrong
+  shape, and any exception are each a refusal naming what failed; nothing
+  retries, one request per url. A 403 or 429 whose ``x-ratelimit-remaining``
+  is ``0`` is the refusal ``rate limited; rerun``. A slow drip of bytes, each
+  within 20 s, is bounded only by the CI job's ``timeout-minutes``.
+- In CI. The script is in CI when the variable ``GITHUB_ACTIONS`` is present,
+  with any value. In CI, ``--source`` refuses before any request when a
+  variable whose name casefolds to ``https_proxy``, ``all_proxy``,
+  ``ssl_cert_file`` or ``ssl_cert_dir`` holds a value (``proxy or CA override
+  set in CI``, naming the variable), and when ``--expect-owner`` is missing or
+  empty (``no owner anchor in CI``). Outside CI, proxy and CA settings are
+  honoured the way urllib and ssl honour them by default.
+- Owner anchor. ``--expect-owner`` (CI passes ``github.repository_owner``) must
+  be an owner name equal to the pin's owner, compared case-insensitively;
+  otherwise no request is made. A local run without it prints one line saying
+  the run has no owner anchor.
+- The step attests only for an unmodified workflow and script: a pull request
+  that edits either can change what runs (KNOWN-LIMITS.md).
 
 Exit 0 clean; 1 on any refusal, one line per refusal; 2 on usage.
 """
@@ -77,11 +112,12 @@ import argparse
 import json
 import os
 import re
-import subprocess
 import sys
-import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Mapping
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PREFIX = "marketplace:"
@@ -90,12 +126,15 @@ PLUGIN_MANIFEST = ".claude-plugin/plugin.json"
 PIN = "ledger-vendor.pin"
 MARKETPLACE_NAME = "harness-core"
 PLUGIN_NAMES = ("harness", "sdlc", "ledger-hooks", "rails")
-FULL_COMMIT = re.compile(r"[0-9a-f]{40}")
-RELEASE_TAG = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+")
-VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
-LOCAL_SOURCE = re.compile(r"\./[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*")
-OWNER_REPO = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
-LS_REMOTE_LINE = re.compile(r"([0-9a-f]{40})\t(refs/tags/\S+)")
+FULL_COMMIT = re.compile(r"[0-9a-f]{40}", re.ASCII)
+RELEASE_TAG = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+", re.ASCII)
+VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+", re.ASCII)
+LOCAL_SOURCE = re.compile(r"\./[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*", re.ASCII)
+OWNER_REPO = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", re.ASCII)
+# The grammars of the segments of an API url (section "Path" above).
+OWNER = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})", re.ASCII)
+REPOSITORY = re.compile(r"[A-Za-z0-9._-]{1,100}", re.ASCII)
+OBJECT_SHA = re.compile(r"[0-9a-f]{40}", re.ASCII)
 # The fields each external source type needs besides source, ref and sha.
 EXTERNAL_SOURCES = {
     "url": ("url",),
@@ -108,15 +147,32 @@ EXTERNAL_PLUGINS = {
     "sdlc": {"source": "url", "repository": "skills", "path": None},
     "ledger-hooks": {"source": "git-subdir", "repository": "ledger", "path": "plugins/ledger-hooks"},
 }
-LS_REMOTE_SECONDS = 120
+
+# --source: the one host, the request's headers and the bounds of an answer.
+API = "https://api.github.com"
+API_HOST = "api.github.com"
+REQUEST_HEADERS = (
+    ("Accept", "application/vnd.github+json"),
+    ("X-GitHub-Api-Version", "2022-11-28"),
+    ("User-Agent", "harness-core-check-marketplace"),
+    ("Cache-Control", "no-cache"),
+)
+TIMEOUT_SECONDS = 20
+BODY_CAP = 256 * 1024
+MAX_TAG_OBJECTS = 4
+# In CI, a variable whose name casefolds to one of these refuses --source.
+CI_TRIPWIRE = ("https_proxy", "all_proxy", "ssl_cert_file", "ssl_cert_dir")
+RATE_LIMITED = "rate limited; rerun"
+NO_ANCHOR = (f"{PREFIX} no owner anchor: --expect-owner was not given, so the pin's owner "
+             "is not checked against the repository owner (a local run, not an attestation)")
+
+# url -> (status, headers, body). The one boundary to the network.
+Fetch = Callable[[str], "tuple[int, Mapping[str, str], bytes]"]
 
 
 def expected_url(name: str, owner: str) -> str:
     """The one repository url of an external plugin name: the table's, never the manifest's."""
     return f"https://github.com/{owner}/{EXTERNAL_PLUGINS[name]['repository']}.git"
-
-# (url, tag) -> (exit code, stdout). The one boundary to the network.
-LsRemote = Callable[[str, str], "tuple[int, str]"]
 
 
 def load_json(path: Path):
@@ -290,119 +346,202 @@ def problems(root: Path, external: dict | None = None) -> list[str]:
     return found
 
 
-# --source: each external entry's tag against the live repository.
+# --source: each external entry's tag, read from the GitHub REST API.
 
-def url_refusal(url) -> str | None:
-    """The name of what is wrong with a url that is about to reach git, or None."""
-    if not isinstance(url, str) or url == "":
-        return "url is empty"
-    if url.startswith("-"):
-        return "url starts with '-'"
-    if any(char.isspace() for char in url):
-        return "url holds whitespace"
-    if not url.startswith("https://"):
-        return "url is not https"
+class FetchFailed(Exception):
+    """A request that produced no answer to read; its message is the refusal."""
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Follows no redirect: urllib then raises HTTPError with the 3xx status."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def make_opener() -> urllib.request.OpenerDirector:
+    """urllib's default opener (its proxy and CA handling included) with no redirect."""
+    return urllib.request.build_opener(NoRedirect())
+
+
+def read_capped(stream) -> bytes:
+    """At most BODY_CAP bytes of the stream; one byte more is a refusal."""
+    chunks: list[bytes] = []
+    total = 0
+    while total <= BODY_CAP:
+        chunk = stream.read(BODY_CAP + 1 - total)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    if total > BODY_CAP:
+        raise FetchFailed("the answer body is over 256 KiB")
+    return b"".join(chunks)
+
+
+def error_answer(error: urllib.error.HTTPError) -> tuple[int, Mapping[str, str], bytes]:
+    """(status, headers, body) of an HTTP error answer, its body read through the cap."""
+    try:
+        return error.code, error.headers, read_capped(error)
+    except FetchFailed:
+        raise
+    except Exception as exc:
+        raise FetchFailed(f"request failed ({exc.__class__.__name__}) after status {error.code}") from None
+    finally:
+        try:
+            error.close()
+        except Exception:
+            pass
+
+
+def api_fetch(url: str) -> tuple[int, Mapping[str, str], bytes]:
+    """GET the url from api.github.com: (status, headers, body), or FetchFailed.
+
+    The only code that reaches the network. An HTTP error status (a refused
+    redirect, a 403, a 429, a 500) comes back as its status, headers and capped
+    body; every other exception becomes FetchFailed naming its class."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        raise FetchFailed(f"request refused: the url is not on {API}") from None
+    if parts.scheme != "https" or parts.netloc != API_HOST:
+        raise FetchFailed(f"request refused: the url is not on {API}")
+    request = urllib.request.Request(url, method="GET")
+    for name, value in REQUEST_HEADERS:
+        request.add_unredirected_header(name, value)
+    try:
+        with make_opener().open(request, timeout=TIMEOUT_SECONDS) as response:
+            return response.status, response.headers, read_capped(response)
+    except urllib.error.HTTPError as error:
+        return error_answer(error)
+    except FetchFailed:
+        raise
+    except Exception as exc:
+        raise FetchFailed(f"request failed ({exc.__class__.__name__})") from None
+
+
+def header_value(headers, name: str) -> str | None:
+    """The value of a header, its name compared case-insensitively."""
+    for key, value in headers.items():
+        if isinstance(key, str) and key.casefold() == name:
+            return value
     return None
 
 
-def child_env(home: str) -> dict[str, str]:
-    """The environment of the git child, built from scratch: PATH from the parent,
-    the fresh empty HOME, the three git settings, and nothing else (no other
-    GIT_* variable, no credential, nothing the runner set)."""
-    env = {
-        "HOME": home,
-        "GIT_CONFIG_NOSYSTEM": "1",
-        "GIT_CONFIG_GLOBAL": os.devnull,
-        "GIT_TERMINAL_PROMPT": "0",
-    }
-    if "PATH" in os.environ:
-        env["PATH"] = os.environ["PATH"]
-    return env
-
-
-def inside_a_repository(folder: Path) -> bool:
-    """True when the folder or any folder above it holds a .git entry."""
-    return any((parent / ".git").exists() for parent in (folder, *folder.parents))
-
-
-def run_ls_remote(url: str, tag: str) -> tuple[int, str]:
-    """``git ls-remote`` on the tag ref and its peeled form: (exit code, stdout).
-    No shell, a fixed argv whose options end at ``--`` before the repository, no
-    terminal prompt. git runs from a fresh temporary folder that is not inside
-    any repository, with a child environment built from scratch (``child_env``),
-    so neither a repository-local git configuration nor an inherited GIT_*
-    variable can rewrite the url; both temporary folders are removed afterwards.
-    A git that cannot run, times out, or has no folder outside a repository to run
-    from is a non-zero code, never a pass. Callers give it a url that
-    ``url_refusal`` has passed."""
+def read_answer(fetch: Fetch, url: str) -> tuple[dict | None, str | None]:
+    """(the JSON object of a 200 answer, None), or (None, the refusal)."""
     try:
-        with tempfile.TemporaryDirectory(prefix="marketplace-cwd.", ignore_cleanup_errors=True) as cwd, \
-                tempfile.TemporaryDirectory(prefix="marketplace-home.", ignore_cleanup_errors=True) as home:
-            if inside_a_repository(Path(cwd).resolve()):
-                return 255, ""
-            done = subprocess.run(
-                ["git", "ls-remote", "--tags", "--", url, f"refs/tags/{tag}", f"refs/tags/{tag}^{{}}"],
-                shell=False, stdin=subprocess.DEVNULL, capture_output=True, cwd=cwd, env=child_env(home),
-                check=False, timeout=LS_REMOTE_SECONDS,
-            )
-    except (OSError, subprocess.SubprocessError):
-        return 255, ""
-    return done.returncode, done.stdout.decode("utf-8", "replace")
+        status, headers, body = fetch(url)
+    except FetchFailed as exc:
+        return None, str(exc)
+    if len(body) > BODY_CAP:
+        return None, "the answer body is over 256 KiB"
+    if status in (403, 429) and str(header_value(headers, "x-ratelimit-remaining")).strip() == "0":
+        return None, RATE_LIMITED
+    if 300 <= status < 400:
+        return None, f"redirect {status} (renamed or transferred repository?)"
+    if status != 200:
+        return None, f"status {status}"
+    try:
+        text = body.decode("utf-8")
+    except UnicodeDecodeError:
+        return None, "the answer is not UTF-8"
+    try:
+        value = json.loads(text)
+    except (ValueError, RecursionError):
+        return None, "the answer is not JSON"
+    if not isinstance(value, dict):
+        return None, "the answer is not a JSON object"
+    return value, None
 
 
-def git_ls_remote(url: str, tag: str) -> tuple[int, str]:
-    """``run_ls_remote`` for a url that passes ``url_refusal``; any other url is a
-    non-zero code before any subprocess starts."""
-    if url_refusal(url) is not None:
-        return 255, ""
-    return run_ls_remote(url, tag)
+def object_of(answer: dict) -> tuple[str | None, str | None, str | None]:
+    """(type, sha, None) of the answer's object, its sha checked; or (None, None, the refusal)."""
+    target = answer.get("object")
+    if not isinstance(target, dict):
+        return None, None, "the answer has no object"
+    kind, sha = target.get("type"), target.get("sha")
+    if not isinstance(kind, str) or not isinstance(sha, str):
+        return None, None, "the answer's object has no string type and sha"
+    if not OBJECT_SHA.fullmatch(sha):
+        return None, None, "the answer's object sha is not 40 lowercase hex"
+    return kind, sha, None
 
 
-def resolve_tag(output: str, tag: str) -> tuple[str | None, str | None]:
-    """(commit, None) the tag names in ``git ls-remote`` output, or (None, the problem).
+def resolve_commit(owner: str, repository: str, tag: str, fetch: Fetch) -> tuple[str | None, str | None]:
+    """(the commit the tag names, None), or (None, the refusal).
 
-    The peeled line (``refs/tags/<tag>^{}``) is the commit of an annotated tag
-    and is used when present; the plain line is the commit of a lightweight tag."""
-    direct = f"refs/tags/{tag}"
-    seen: dict[str, str] = {}
-    for line in output.split("\n"):
-        if line == "":
-            continue
-        match = LS_REMOTE_LINE.fullmatch(line)
-        if match is None or match.group(2) not in (direct, f"{direct}^{{}}"):
-            return None, "ls-remote output is not <40 hex><TAB>refs/tags/<tag> lines of the tag and its peeled form"
-        if match.group(2) in seen:
-            return None, "ls-remote output is not <40 hex><TAB>refs/tags/<tag> lines of the tag and its peeled form"
-        seen[match.group(2)] = match.group(1)
-    if not seen:
-        return None, f"tag {tag} is not in the source repository"
-    return seen.get(f"{direct}^{{}}", seen.get(direct)), None
+    Every segment is checked before a url is built; a url is the fixed host,
+    fixed path words and checked segments."""
+    if not isinstance(owner, str) or not OWNER.fullmatch(owner):
+        return None, "not resolved, the owner is not a GitHub owner name"
+    if not isinstance(repository, str) or repository in (".", "..") or not REPOSITORY.fullmatch(repository):
+        return None, "not resolved, the repository is not a GitHub repository name"
+    if not isinstance(tag, str) or not RELEASE_TAG.fullmatch(tag):
+        return None, "not resolved, the tag is not a release tag vX.Y.Z"
+    base = f"{API}/repos/{owner}/{repository}/git"
+    answer, problem = read_answer(fetch, f"{base}/ref/tags/{tag}")
+    if problem is not None:
+        return None, problem
+    if answer.get("ref") != f"refs/tags/{tag}":
+        return None, f"the answer's ref is not refs/tags/{tag}"
+    kind, sha, problem = object_of(answer)
+    if problem is not None:
+        return None, problem
+    followed = 0
+    while kind == "tag":
+        if followed == MAX_TAG_OBJECTS:
+            return None, f"more than {MAX_TAG_OBJECTS} tag objects before a commit"
+        followed += 1
+        answer, problem = read_answer(fetch, f"{base}/tags/{sha}")
+        if problem is not None:
+            return None, problem
+        kind, sha, problem = object_of(answer)
+        if problem is not None:
+            return None, problem
+    if kind != "commit":
+        named = f"a {kind!r} object" if re.fullmatch(r"[a-z]{1,16}", kind, re.ASCII) else "an object of an unknown type"
+        return None, f"the tag names {named}, not a commit"
+    return sha, None
 
 
-def source_problems(root: Path, ls_remote: LsRemote = git_ls_remote) -> list[str]:
-    """One refusal for every external entry whose tag does not resolve to its sha.
+def in_ci() -> bool:
+    """In CI: GITHUB_ACTIONS is present, whatever its value."""
+    return "GITHUB_ACTIONS" in os.environ
 
-    Only an entry that passed every offline check is resolved, and its url is the
-    table's (``expected_url``), never the manifest's."""
+
+def tripwire_variables() -> list[str]:
+    """The set proxy and CA-override variables, their names compared casefolded."""
+    return sorted(name for name, value in os.environ.items()
+                  if name.casefold() in CI_TRIPWIRE and value)
+
+
+def resolve_sources(root: Path, expect_owner: str | None, fetch: Fetch) -> list[str]:
+    """One refusal for every external entry whose tag does not resolve to its sha,
+    or the refusals that stop every request (the CI tripwire, the owner anchor)."""
+    if in_ci():
+        tripped = tripwire_variables()
+        if tripped:
+            return [f"proxy or CA override set in CI ({name}); refused before any request"
+                    for name in tripped]
+        if not expect_owner:
+            return ["no owner anchor in CI (--expect-owner is missing or empty); refused before any request"]
     external: dict[str, dict | None] = {}
     problems(root, external)
     owner, _ = pin_owner(root)
+    if expect_owner:
+        if not OWNER.fullmatch(expect_owner):
+            return ["owner anchor: --expect-owner is not a GitHub owner name; refused before any request"]
+        if owner is not None and owner.casefold() != expect_owner.casefold():
+            return [f"owner anchor: the owner in {PIN} is not --expect-owner; refused before any request"]
     found: list[str] = []
     for name, source in external.items():
         label = f"plugin {name}"
         if source is None or owner is None:
             found.append(f"{label}: not resolved, it failed the offline check")
             continue
-        url, ref, sha = expected_url(name, owner), source["ref"], source["sha"]
-        refusal = url_refusal(url)
-        if refusal is not None:
-            found.append(f"{label}: not resolved, {refusal}")
-            continue
-        code, output = ls_remote(url, ref)
-        if code != 0:
-            found.append(f"{label}: git ls-remote failed (exit {code})")
-            continue
-        commit, problem = resolve_tag(output, ref)
+        repository, ref, sha = EXTERNAL_PLUGINS[name]["repository"], source["ref"], source["sha"]
+        commit, problem = resolve_commit(owner, repository, ref, fetch)
         if problem is not None:
             found.append(f"{label}: {problem}")
         elif commit != sha:
@@ -410,17 +549,37 @@ def source_problems(root: Path, ls_remote: LsRemote = git_ls_remote) -> list[str
     return found
 
 
+def source_problems(root: Path, expect_owner: str | None = None, fetch: Fetch = api_fetch) -> list[str]:
+    """``resolve_sources``, with any exception it raises turned into a refusal."""
+    try:
+        return resolve_sources(root, expect_owner, fetch)
+    except Exception as exc:
+        return [f"the resolver raised {exc.__class__.__name__}; nothing is attested"]
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Check the marketplace and the harness plugin's manifest.")
     parser.add_argument("--source", action="store_true",
-                        help="also resolve each external entry's tag with git ls-remote and compare it with the pin")
+                        help="also resolve each external entry's tag through the GitHub REST API "
+                             "and compare it with the pin")
+    parser.add_argument("--expect-owner", metavar="OWNER",
+                        help="with --source: the owner the pin's owner must equal (CI passes "
+                             "github.repository_owner)")
     try:
         args = parser.parse_args(argv)
     except SystemExit as exc:
         return 2 if exc.code else 0
-    found = problems(REPO_ROOT)
-    if args.source:
-        found.extend(source_problems(REPO_ROOT))
+    if args.expect_owner is not None and not args.source:
+        print(f"{PREFIX} usage: --expect-owner is read only with --source", file=sys.stderr)
+        return 2
+    try:
+        found = problems(REPO_ROOT)
+        if args.source:
+            if not in_ci() and not args.expect_owner:
+                print(NO_ANCHOR)
+            found.extend(source_problems(REPO_ROOT, args.expect_owner))
+    except Exception as exc:
+        found = [f"the check raised {exc.__class__.__name__}; nothing is attested"]
     for line in found:
         print(f"{PREFIX} refused: {line}")
     if found:

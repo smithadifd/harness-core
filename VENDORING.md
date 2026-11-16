@@ -68,7 +68,7 @@ the text itself.
 | `plugins/harness/.claude-plugin/plugin.json` | the harness plugin's manifest: its version and the plugins it depends on |
 | `scripts/check-core-manifest.py` | checks that every tracked file is vendored or repository-only |
 | `scripts/check-ledger-vendor.py` | the vendored ledger's drift check |
-| `scripts/check-marketplace.py` | checks the marketplace and the harness plugin's manifest: folders, manifests, each external plugin bound to its expected source, full-commit pins, and, with the source option, each tag against its pin |
+| `scripts/check-marketplace.py` | checks the marketplace and the harness plugin's manifest: folders, manifests, each external plugin bound to its expected source, full-commit pins, and, with the source option, each tag against its pin through the GitHub REST API, with no credential |
 | `scripts/check-no-person.py` | checks that no tracked file names a person, a machine, a home path or a private host |
 | `scripts/ci/check-commit-identity.sh` | the commit identity check the workflow runs |
 | `scripts/ledger-vendor-bump.py` | moves the vendored ledger to a new tag |
@@ -77,8 +77,8 @@ the text itself.
 | `scripts/tests/test_check_core_manifest.py` | tests of the manifest check |
 | `scripts/tests/test_check_ledger_vendor.py` | tests of the ledger drift check |
 | `scripts/tests/test_check_no_person.py` | tests of the no-person check |
-| `scripts/tests/test_ci_workflow.py` | tests of the CI workflows' runners, triggers and gates |
-| `scripts/tests/test_marketplace_manifest.py` | tests of the marketplace check (folders, manifests, expected sources, full-commit pins, tag against pin with a fake ls-remote) and of the plugin validation job |
+| `scripts/tests/test_ci_workflow.py` | tests of the CI workflows' runners, triggers and gates, and that every gate script runs under an isolated python3 |
+| `scripts/tests/test_marketplace_manifest.py` | tests of the marketplace check (folders, manifests, expected sources, full-commit pins, tag against pin with a fake API fetch and with urllib's opener over a local transport) and of the plugin validation job |
 | `scripts/tests/test_probe_default_tier_load.py` | tests of the load probe, against a stubbed claude and git |
 
 ## Carve record

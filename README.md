@@ -114,7 +114,10 @@ Each of the last two is fixed to one full commit id on a release tag, and
 tag of this repository therefore names one tested set; nothing resolves to a
 branch or a range. CI validates both manifests with `claude plugin validate
 --strict` on a pinned Claude Code version (2.1.325), and a test fails when a
-plugin's folder or manifest is missing or a pin is not a full commit id.
+plugin's folder or manifest is missing or a pin is not a full commit id. CI
+also asks the GitHub REST API, with no credential, which commit each external
+plugin's release tag names now, and fails when it is not the pinned commit
+(`scripts/check-marketplace.py --source`).
 
 You need Claude Code, `git`, network access to GitHub, and Python 3.11 or later
 for the ledger's command. The repository must be public or shared with your
