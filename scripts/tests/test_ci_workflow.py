@@ -26,7 +26,7 @@ RUNS_ON = "${{ fromJSON(vars.CORE_CI_RUNNER || '[\"ubuntu-latest\"]') }}"
 # literal of labels. Anything else is unparsed and fails.
 RUNS_ON_SHAPE = re.compile(r"\$\{\{ fromJSON\(vars\.CORE_CI_RUNNER \|\| '(\[[^']*\])'\) \}\}")
 HOSTED_DEFAULT = ["ubuntu-latest"]
-JOBS = ["pytest", "core-manifest", "no-person", "ledger-drift"]
+JOBS = ["pytest", "core-manifest", "no-person", "ledger-drift", "plugin-validate"]
 # Every workflow file and its jobs; a workflow file not listed here fails.
 WORKFLOWS = {CI: JOBS, IDENTITY: ["commit-identity"]}
 PULL_REQUEST_TYPES = ["opened", "synchronize", "reopened", "ready_for_review"]
@@ -248,9 +248,9 @@ def test_no_gate_is_skipped_or_allowed_to_fail():
 def test_each_gate_job_runs_its_check():
     found = jobs(workflow())
     assert [runs(step) for step in steps(found["core-manifest"])][-1] == (
-        "python3 scripts/check-core-manifest.py")
+        "python3 -I scripts/check-core-manifest.py")
     assert [runs(step) for step in steps(found["no-person"])][-1] == (
-        "python3 scripts/check-no-person.py")
+        "python3 -I scripts/check-no-person.py")
     no_person = steps(found["no-person"])[-1]
     assert DENY_FROM_SECRET in no_person
     pytest_step = "\n".join(steps(found["pytest"])[-1])
@@ -281,15 +281,179 @@ def test_the_deny_list_reaches_ci_only_from_the_secret_and_no_step_echoes_it():
 
 def test_j7_the_ledger_drift_job_runs_the_offline_check():
     commands = [runs(step) for step in steps(jobs(workflow())["ledger-drift"])]
-    assert "python3 scripts/check-ledger-vendor.py" in commands
+    assert "python3 -I scripts/check-ledger-vendor.py" in commands
 
 
 def test_j8_the_ledger_drift_job_runs_the_source_check_against_the_owner_ledger():
     job = jobs(workflow())["ledger-drift"]
     source = "\n".join(steps(job)[-1])
-    assert '"scripts/check-ledger-vendor.py", "--source", source' in source
+    assert '["python3", "-I", "scripts/check-ledger-vendor.py", "--source", source]' in source
     assert "OWNER: ${{ github.repository_owner }}" in source
     assert 'expected = f"{owner}/ledger"' in source
+
+
+# Every python3 that runs a gate script, and every python3 step shell, is
+# isolated (python3 -I), so a module a pull request adds beside a script
+# cannot shadow a standard-library import.
+
+GATE_SCRIPT = re.compile(r"scripts/check-[a-z-]+\.py")
+# Each gate script and how many times ci.yml runs it.
+GATE_RUNS = {
+    "scripts/check-core-manifest.py": 1,
+    "scripts/check-no-person.py": 1,
+    "scripts/check-ledger-vendor.py": 2,
+    "scripts/check-marketplace.py": 1,
+}
+ISOLATED_SHELL = "python3 -I {0}"
+
+
+def isolation_problems(text: str) -> list[str]:
+    """Each gate script run, and each python step shell, that is not isolated, by name."""
+    found: list[str] = []
+    counted: dict[str, int] = {}
+    for name, job in jobs(text).items():
+        for step in steps(job):
+            title = step_keys(step).get("name", [""])[0]
+            shell = step_keys(step).get("shell", [None])[0]
+            if shell is not None and "python" in shell and shell != ISOLATED_SHELL:
+                found.append(f"{name}: step {title!r} has the python shell {shell!r}, not {ISOLATED_SHELL!r}")
+            for line in step:
+                if line.lstrip().startswith("#"):
+                    continue
+                for match in GATE_SCRIPT.finditer(line):
+                    counted[match.group(0)] = counted.get(match.group(0), 0) + 1
+                    before = line[:match.start()]
+                    if not (before.endswith("python3 -I ") or before.endswith('"python3", "-I", "')):
+                        found.append(f"{name}: {match.group(0)} does not run under python3 -I")
+    if counted != GATE_RUNS:
+        found.append(f"the gate scripts ci.yml runs are {counted}, not {GATE_RUNS}")
+    return found
+
+
+def test_every_python3_gate_step_runs_isolated():
+    assert isolation_problems(workflow()) == []
+
+
+def nth(text: str, old: str, new: str, number: int) -> str:
+    """The text with the number-th (from 1) occurrence of old replaced."""
+    parts = text.split(old)
+    assert len(parts) > number, (old, number)
+    return old.join(parts[:number]) + new + old.join(parts[number:])
+
+
+SHELL = "        shell: python3 -I {0}\n"
+ISOLATION_NEAR_MISSES = [
+    ("core-manifest", lambda t: t.replace("python3 -I scripts/check-core-manifest.py", "python3 scripts/check-core-manifest.py"),
+     "core-manifest: scripts/check-core-manifest.py does not run under python3 -I"),
+    ("no-person", lambda t: t.replace("python3 -I scripts/check-no-person.py", "python3 scripts/check-no-person.py"),
+     "no-person: scripts/check-no-person.py does not run under python3 -I"),
+    ("ledger-drift-offline", lambda t: t.replace("run: python3 -I scripts/check-ledger-vendor.py", "run: python3 scripts/check-ledger-vendor.py"),
+     "ledger-drift: scripts/check-ledger-vendor.py does not run under python3 -I"),
+    ("ledger-drift-source", lambda t: t.replace('"python3", "-I", "scripts/check-ledger-vendor.py"', '"python3", "scripts/check-ledger-vendor.py"'),
+     "ledger-drift: scripts/check-ledger-vendor.py does not run under python3 -I"),
+    ("plugin-validate-source", lambda t: t.replace("python3 -I scripts/check-marketplace.py", "python3 scripts/check-marketplace.py"),
+     "plugin-validate: scripts/check-marketplace.py does not run under python3 -I"),
+    ("pytest-setup-shell", lambda t: nth(t, SHELL, "        shell: python3 {0}\n", 1),
+     "pytest: step \"Use the runner's python3, or install pytest into a job venv when it lacks pytest\" "
+     "has the python shell 'python3 {0}', not 'python3 -I {0}'"),
+    ("pytest-run-shell", lambda t: nth(t, SHELL, "        shell: python3 {0}\n", 2),
+     "pytest: step 'Run every test suite' has the python shell 'python3 {0}', not 'python3 -I {0}'"),
+    ("ledger-drift-shell", lambda t: nth(t, SHELL, "        shell: python3 {0}\n", 3),
+     "ledger-drift: step 'ledger-vendor.pin matches the ledger repository at the pinned commit (--source)' "
+     "has the python shell 'python3 {0}', not 'python3 -I {0}'"),
+    ("gate-step-removed", lambda t: t.replace("        run: python3 -I scripts/check-core-manifest.py\n", "        run: true\n"),
+     "the gate scripts ci.yml runs are"),
+]
+
+
+@pytest.mark.parametrize("change,expected", [(case[1], case[2]) for case in ISOLATION_NEAR_MISSES],
+                         ids=[case[0] for case in ISOLATION_NEAR_MISSES])
+def test_a_gate_step_without_python3_I_is_refused_by_name(change, expected):
+    changed = change(workflow())
+    assert changed != workflow(), "the change did something"
+    assert any(problem.startswith(expected) for problem in isolation_problems(changed)), isolation_problems(changed)
+
+
+# The sibling-module rule, run: a copy of each gate script beside a planted
+# standard-library name that writes a marker and exits 0 still fails its bad
+# tree under python3 -I, and the planted module never runs.
+
+PLANTED = "import sys\nopen({marker!r}, 'w').close()\nsys.exit(0)\n"
+
+
+def plain_env() -> dict:
+    return {key: value for key, value in os.environ.items()
+            if not key.startswith("GIT_") and key != "NO_PERSON_DENY"}
+
+
+def git_tree(repo: Path, files: dict[str, str]) -> None:
+    """A git work tree at repo with the files tracked."""
+    for name, text in files.items():
+        target = repo / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+    env = plain_env()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True, env=env)
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True, env=env)
+
+
+def run_isolated(script: Path, env: dict) -> subprocess.CompletedProcess:
+    return subprocess.run([sys.executable, "-I", str(script)], cwd=script.parent, env=env,
+                          capture_output=True, text=True, timeout=120)
+
+
+def plant(scripts: Path, module: str, marker: Path) -> None:
+    (scripts / f"{module}.py").write_text(PLANTED.format(marker=str(marker)), encoding="utf-8")
+
+
+def test_core_manifest_under_python_I_ignores_a_planted_module(tmp_path):
+    # Bad tree: a tracked file that neither .core-manifest nor VENDORING.md lists.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git_tree(repo, {".core-manifest": "stray-vendored.txt\n", "stray-vendored.txt": "x\n",
+                    "VENDORING.md": "## Repository-only files\n\n| Path | What it is |\n|---|---|\n"
+                                    "| `.core-manifest` | m |\n| `VENDORING.md` | v |\n",
+                    "unlisted.txt": "x\n"})
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    shutil.copyfile(ROOT / "scripts" / "check-core-manifest.py", scripts / "check-core-manifest.py")
+    marker = tmp_path / "marker"
+    plant(scripts, "subprocess", marker)
+    done = run_isolated(scripts / "check-core-manifest.py", plain_env())
+    assert not marker.exists(), "the planted subprocess.py was imported"
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "unlisted.txt: tracked but unlisted" in done.stdout.splitlines()
+
+
+def test_no_person_under_python_I_ignores_a_planted_module(tmp_path):
+    # Bad tree: a tracked file holding a deny-list word.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git_tree(repo, {"notes.txt": "written by zzplantedword\n"})
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    shutil.copyfile(ROOT / "scripts" / "check-no-person.py", scripts / "check-no-person.py")
+    marker = tmp_path / "marker"
+    plant(scripts, "subprocess", marker)
+    done = run_isolated(scripts / "check-no-person.py", dict(plain_env(), NO_PERSON_DENY="zzplantedword"))
+    assert not marker.exists(), "the planted subprocess.py was imported"
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "notes.txt:1: deny-list" in done.stdout.splitlines()
+
+
+def test_ledger_vendor_under_python_I_ignores_a_planted_module(tmp_path):
+    # Bad tree: one vendored ledger file with one edited byte.
+    repo = _copy_ledger(tmp_path)
+    store = repo / "skills" / "_lib" / "ledger" / "store.py"
+    data = bytearray(store.read_bytes())
+    data[0] ^= 0x01
+    store.write_bytes(bytes(data))
+    marker = tmp_path / "marker"
+    plant(repo / "scripts", "subprocess", marker)
+    done = run_isolated(repo / "scripts" / "check-ledger-vendor.py", plain_env())
+    assert not marker.exists(), "the planted subprocess.py was imported"
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "ledger vendor: drift: changed skills/_lib/ledger/store.py" in done.stdout.splitlines()
 
 
 def _copy_ledger(tmp_path: Path) -> Path:

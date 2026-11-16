@@ -5,7 +5,11 @@ name: CI
 # GitHub-hosted ubuntu-latest runner when it is unset or empty; no job falls
 # back to a self-hosted runner. Python is the runner's own python3: nothing is
 # downloaded to provide it. No step is skipped or allowed to fail: a gate that
-# cannot run fails its job.
+# cannot run fails its job. Every python3 that runs a gate script, and every
+# step whose shell is python3, runs isolated (python3 -I): the script's own
+# folder and the working folder are off the import path and no PYTHON*
+# variable or user site applies, so a module a pull request adds beside a
+# script cannot shadow a standard-library import.
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
@@ -30,7 +34,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Use the runner's python3, or install pytest into a job venv when it lacks pytest
-        shell: python3 {0}
+        shell: python3 -I {0}
         run: |
           import os, subprocess, sys
           found = subprocess.run(["python3", "-c", "import pytest"], capture_output=True)
@@ -46,7 +50,7 @@ jobs:
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as handle:
               handle.write(f"CORE_PYTHON={python}\n")
       - name: Run every test suite
-        shell: python3 {0}
+        shell: python3 -I {0}
         run: |
           import os, subprocess, sys, tempfile
           home = tempfile.mkdtemp(dir=os.environ["RUNNER_TEMP"])
@@ -70,7 +74,7 @@ jobs:
         with:
           persist-credentials: false
       - name: .core-manifest and the repository-only table cover every tracked file
-        run: python3 scripts/check-core-manifest.py
+        run: python3 -I scripts/check-core-manifest.py
 
   # No tracked file names a person, a machine, a home path or a private host.
   # The person and owner words come only from the repository secret
@@ -90,7 +94,7 @@ jobs:
       - name: No tracked file names a person, a machine, a home path or a private host
         env:
           NO_PERSON_DENY: ${{ secrets.NO_PERSON_DENY }}
-        run: python3 scripts/check-no-person.py
+        run: python3 -I scripts/check-no-person.py
 
   # The vendored ledger. skills/_lib/ledger is the public ledger repository's
   # ledger/ tree at the commit ledger-vendor.pin names, byte for byte.
@@ -108,7 +112,7 @@ jobs:
         with:
           persist-credentials: false
       - name: skills/_lib/ledger matches ledger-vendor.pin (offline)
-        run: python3 scripts/check-ledger-vendor.py
+        run: python3 -I scripts/check-ledger-vendor.py
       # The ledger repository is public and belongs to this repository's
       # owner; its URL is built from github.repository_owner, never typed.
       # This step fetches exactly three things, read-only over HTTPS with no
@@ -123,7 +127,7 @@ jobs:
           GIT_CONFIG_GLOBAL: /dev/null
           GIT_TERMINAL_PROMPT: '0'
           OWNER: ${{ github.repository_owner }}
-        shell: python3 {0}
+        shell: python3 -I {0}
         run: |
           import os, re, subprocess, sys, tempfile
           owner = os.environ["OWNER"]
@@ -154,5 +158,56 @@ jobs:
           git("-C", source, "fetch", "--no-tags", url, "refs/heads/main:refs/remotes/origin/main")
           git("-C", source, "fetch", "--no-tags", url, f"refs/tags/{tag}:refs/tags/{tag}")
           git("-C", source, "fetch", "--no-tags", url, sha)
-          check = subprocess.run(["python3", "scripts/check-ledger-vendor.py", "--source", source])
+          check = subprocess.run(["python3", "-I", "scripts/check-ledger-vendor.py", "--source", source])
           sys.exit(check.returncode)
+
+  # The marketplace manifest and the harness plugin validate under Claude Code's
+  # own validator, strict (a warning fails the job), in a fresh HOME so no
+  # account, setting or plugin of the runner is read. Claude Code comes from npm
+  # at one exact version, into a folder of this job; moving that version is a
+  # change to this file. The runner's own node (22 or newer, which that version
+  # needs) is used and checked. Nothing here signs in or fetches a plugin.
+  #
+  # The --source step is the job's one network step. It asks the GitHub REST
+  # API, at the fixed host api.github.com (no variable moves it), with no token
+  # and no Authorization header, which commit each external plugin's release
+  # tag names now: the singular git/ref/tags endpoint, then at most four tag
+  # objects, no redirect followed, one request per url. A tag that does not
+  # name exactly the pinned commit fails the step, and so does any error; a
+  # GitHub rate limit fails it as "rate limited; rerun" (rerun later).
+  # The owner anchor is github.repository_owner, passed as --expect-owner from
+  # the step's env: the owner in ledger-vendor.pin must equal it, and in CI a
+  # missing or empty anchor is refused. A local run without --expect-owner
+  # has no anchor and prints a line saying so. In CI the step also refuses
+  # before any request when a proxy or CA-override variable (https_proxy,
+  # all_proxy, ssl_cert_file or ssl_cert_dir, in any letter case) is set, and
+  # names it. python3 -I keeps a module beside the script from shadowing an
+  # import. The step attests only for an unmodified workflow and script
+  # (KNOWN-LIMITS.md).
+  plugin-validate:
+    name: plugin validate (marketplace and harness plugin, strict)
+    runs-on: ${{ fromJSON(vars.CORE_CI_RUNNER || '["ubuntu-latest"]') }}
+    timeout-minutes: 10
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: The external pins are the commits their tags name (--source)
+        env:
+          EXPECT_OWNER: ${{ github.repository_owner }}
+        run: python3 -I scripts/check-marketplace.py --source --expect-owner "$EXPECT_OWNER"
+      - name: The runner's node is 22 or newer
+        run: |
+          node -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 22 ? 0 : 1)'
+      - name: Install Claude Code at the pinned version into a folder of this job
+        run: |
+          npm install --prefix "$RUNNER_TEMP/claude-code" --no-audit --no-fund "@anthropic-ai/claude-code@2.1.325"
+      - name: Validate the marketplace and the harness plugin, strict, in a fresh home
+        run: |
+          set -euo pipefail
+          home="$(mktemp -d "$RUNNER_TEMP/validate-home.XXXXXX")"
+          claude="$RUNNER_TEMP/claude-code/node_modules/.bin/claude"
+          HOME="$home" "$claude" --version
+          HOME="$home" "$claude" plugin validate --strict .
+          HOME="$home" "$claude" plugin validate --strict plugins/harness

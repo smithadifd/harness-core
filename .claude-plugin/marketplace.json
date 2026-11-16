@@ -1,0 +1,35 @@
+{
+  "name": "harness-core",
+  "description": "The default tier of an AI coding-agent harness: one plugin to install, which brings the skills and the ledger's hooks with it. Each tag of this repository names one tested set.",
+  "owner": {
+    "name": "harness-core maintainers"
+  },
+  "plugins": [
+    {
+      "name": "harness",
+      "description": "The plugin a person installs. It depends on the other plugins of this marketplace, so one install brings the set.",
+      "source": "./plugins/harness"
+    },
+    {
+      "name": "sdlc",
+      "description": "The skills and agents of the harness, including the ticket skill.",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/smithadifd/skills.git",
+        "ref": "v1.3.0",
+        "sha": "b8e013f470f2470630f33664bd1ca9b351b6de7c"
+      }
+    },
+    {
+      "name": "ledger-hooks",
+      "description": "The ledger's session brief and capture hooks. Pinned to one commit of the public ledger repository.",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/smithadifd/ledger.git",
+        "path": "plugins/ledger-hooks",
+        "ref": "v0.3.1",
+        "sha": "346cb3595180fcea702ebdd37b32ff8c36325ea5"
+      }
+    }
+  ]
+}
