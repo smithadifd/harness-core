@@ -22,6 +22,7 @@ with exit 0 (all PASS), 1 (any FAIL, no UNVERIFIED), 2 (any UNVERIFIED) or 3
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -50,7 +51,7 @@ SCRUBBED = [
 ]
 
 CLAUDE_STUB = r'''#!__PYTHON__
-import glob, json, os, re, shutil, subprocess, sys, tempfile, time
+import glob, hashlib, json, os, re, shutil, socket, subprocess, sys, tempfile, time
 
 argv = sys.argv[1:]
 home = os.environ.get("HOME", "")
@@ -173,6 +174,84 @@ def option_value():
     return found.group(1) if found else ""
 
 
+def checkout_path():
+    """The probe's own ledger checkout: the folder `plugin marketplace add` was given."""
+    sources = [p for p in read_state("added").split("\n")
+               if p and os.path.isdir(os.path.join(p, "plugins", "ledger-hooks"))]
+    return sources[-1] if sources else None
+
+
+def where(spec):
+    """"home:<path>" or "checkout:<path>" as a path; "." is the root itself."""
+    root, _sep, rel = spec.partition(":")
+    base = home if root == "home" else checkout_path()
+    return base if rel == "." else os.path.join(base, rel)
+
+
+def run_acts(acts):
+    """The acts a scenario lists (c_pre: during the ledger plugin's install, before
+    the first manifest; c_acts: in the session, between the two manifests). They
+    are the writes a hook of the plugin could make. The first sleep lets a
+    timestamp that should move move."""
+    time.sleep(0.05)
+    for act in acts:
+        op, args = act[0], act[1:]
+        if op in ("write", "append"):
+            full = where(args[0])
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "w" if op == "write" else "a", encoding="utf-8") as handle:
+                handle.write(args[1])
+        elif op == "mkdir":
+            os.makedirs(where(args[0]), exist_ok=True)
+            if len(args) > 1:
+                os.chmod(where(args[0]), args[1])
+        elif op == "symlink":
+            os.symlink(args[1], where(args[0]))
+        elif op == "fifo":
+            os.mkfifo(where(args[0]))
+        elif op == "socket":
+            # A unix socket path is short-limited, so bind a bare name from inside its folder.
+            folder, name = os.path.split(where(args[0]))
+            here = os.getcwd()
+            os.chdir(folder)
+            sock = socket.socket(socket.AF_UNIX)
+            sock.bind(name)
+            sock.close()
+            os.chdir(here)
+        elif op == "remove":
+            os.unlink(where(args[0]))
+        elif op == "rmtree":
+            shutil.rmtree(where(args[0]))
+        elif op == "chmod":
+            os.chmod(where(args[0]), args[1])
+        elif op == "link":
+            os.link(where(args[0]), where(args[1]))
+        elif op == "touch_remove":
+            full = where(args[0])
+            open(full, "w").close()
+            os.unlink(full)
+        elif op == "forge_before":
+            # A session that rewrites the before manifest in the probe's scratch
+            # folder so that it matches the home as it now is (it adds the entry of
+            # the file named by args[0], as the probe's helper would have recorded it).
+            manifest = os.path.join(os.path.dirname(os.environ["PATH"].split(":")[0]), "manifest.before.json")
+            with open(manifest, encoding="utf-8") as handle:
+                document = json.load(handle)
+            full = where("home:" + args[0])
+            info = os.lstat(full)
+            with open(full, "rb") as handle:
+                digest = hashlib.sha256(handle.read()).hexdigest()
+            document["roots"]["home"].append({
+                "path": args[0], "type": "reg", "mode": info.st_mode, "uid": info.st_uid, "gid": info.st_gid,
+                "nlink": info.st_nlink, "size": info.st_size, "mtime_ns": info.st_mtime_ns,
+                "ctime_ns": info.st_ctime_ns, "ino": info.st_ino, "sha256": digest})
+            document["roots"]["home"].sort(key=lambda item: item["path"])
+            with open(manifest, "w", encoding="utf-8") as handle:
+                json.dump(document, handle)
+        else:
+            sys.exit("stub: unknown act %s" % op)
+
+
 def install_ledger(plugin_id):
     """What `claude plugin install` leaves in the target home: the plugin's files in
     a cache folder (a name the probe could not guess) and an install record that
@@ -237,10 +316,9 @@ def run_hooks(event_name):
         shutil.copytree(source, other, dirs_exist_ok=True)
         root = other
     if scn.get("c_prefix_sibling_plugin"):
-        # A plugin folder whose name starts with the trusted one's.
-        other = os.path.join(os.path.dirname(source), "ledger-hooks-evil")
-        shutil.copytree(source, other, dirs_exist_ok=True)
-        root = other
+        # A plugin folder whose name starts with the trusted one's (placed in the
+        # checkout at install time, before the first manifest).
+        root = os.path.join(os.path.dirname(source), "ledger-hooks-evil")
     if scn.get("c_prefix_sibling_checkout"):
         # A checkout folder whose name starts with the trusted one's.
         other = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(source))) + "/ledger-src-evil",
@@ -248,10 +326,9 @@ def run_hooks(event_name):
         shutil.copytree(source, other, dirs_exist_ok=True)
         root = other
     if scn.get("c_sibling_in_checkout"):
-        # Another plugin folder inside the checkout.
-        other = os.path.join(os.path.dirname(source), "other-plugin")
-        shutil.copytree(source, other, dirs_exist_ok=True)
-        root = other
+        # Another plugin folder inside the checkout (placed there at install time,
+        # before the first manifest).
+        root = os.path.join(os.path.dirname(source), "other-plugin")
     if scn.get("c_r3_shape") and event_name == "SessionStart":
         # The live r3 log held 8 sh runs: five of shell one-liners, the option
         # plugin's export hook under the target home, and the two ledger hooks.
@@ -327,6 +404,11 @@ def plugin_command():
         write_state("installed", argv[2] + "\n", "a")
         if argv[2].startswith("ledger-hooks@"):
             install_ledger(argv[2])
+            run_acts(scn.get("c_pre", []))
+            for name, flag in (("other-plugin", "c_sibling_in_checkout"), ("ledger-hooks-evil", "c_prefix_sibling_plugin")):
+                if scn.get(flag):
+                    plugin = os.path.join(checkout_path(), "plugins", "ledger-hooks")
+                    shutil.copytree(plugin, os.path.join(os.path.dirname(plugin), name), dirs_exist_ok=True)
     elif sub == "configure":
         data = sys.stdin.read()
         log(plugin="configure", plugin_id=argv[2], stdin=data)
@@ -487,6 +569,7 @@ def main():
         os.makedirs(os.path.join(home, ".claude", "projects"), exist_ok=True)
         open(os.path.join(home, ".claude", "projects", "s.jsonl"), "w").close()
         open(os.path.join(home, ".claude.json"), "w").close()
+        run_acts(scn.get("c_acts", []))
         labels = {"SessionStart": "SessionStart:startup", "UserPromptSubmit": "UserPromptSubmit"}
         for name in ("SessionStart", "UserPromptSubmit"):
             if mode == "noevent_" + name:
@@ -558,6 +641,53 @@ elif verb == "rev-parse":
     print(os.environ.get("STUB_GIT_HEAD") or open(fetched, encoding="utf-8").read())
 else:
     sys.exit(64)
+'''
+
+# A python3 for the probe's base PATH that runs the real one, and spoils only the snapshot
+# helper's call or the compare's call (the call whose argument after the program text is
+# "snapshot" or "compare"): the second snapshot for fail-after, hang-after and no-digest, the
+# first for fail-before, and the compare for the compare-* modes. The real program runs first,
+# so a valid manifest, digest and output exist: only the exit status, the alarm or the missing
+# or malformed output tells the probe the call failed. Every other python3 call of the probe
+# goes straight through.
+PYSHIM = r'''#!__PYTHON__
+import os, subprocess, sys, time
+
+real = "__PYTHON__"
+argv = sys.argv[1:]
+mode = os.environ.get("PYSHIM", "")
+program = argv[3:4]
+if mode and argv[:2] == ["-I", "-c"] and program in (["snapshot"], ["compare"]):
+    done = subprocess.run([real] + argv, capture_output=True, text=True)
+    out, code = done.stdout, done.returncode
+    if program == ["snapshot"]:
+        state = os.environ["STUB_STATE"]
+        os.makedirs(state, exist_ok=True)
+        marker = os.path.join(state, "pyshim-snapshots")
+        with open(marker, "a", encoding="utf-8") as handle:
+            handle.write("x")
+        with open(marker, encoding="utf-8") as handle:
+            count = len(handle.read())
+        if (mode, count) in (("fail-after", 2), ("fail-before", 1)):
+            code = 7
+        elif (mode, count) == ("hang-after", 2):
+            time.sleep(5)
+        elif (mode, count) == ("no-digest", 2):
+            out = ""
+    elif mode == "compare-fail":
+        code = 7
+    elif mode == "compare-hang":
+        time.sleep(5)
+    elif mode == "compare-noise":
+        out = "HELLO\n"
+    elif mode == "compare-short":
+        out = 'DIFF 3\nhome "a" added reg\n'
+    elif mode == "compare-extra":
+        out = "SAME\nextra\n"
+    sys.stdout.write(out)
+    sys.stderr.write(done.stderr)
+    sys.exit(code)
+os.execv(real, [real] + argv)
 '''
 
 PIN = (
@@ -659,10 +789,10 @@ class World:
         self.fixture = ledger_fixture(tmp / "ledger-fixture")
         self.runs = 0
 
-    def tools(self, without=()) -> Path:
+    def tools(self, without=(), pyshim=False) -> Path:
         """A folder of links to the few real tools the probe needs, and to
         neither a real claude nor a real git."""
-        folder = self.tmp / ("tools" + "".join("-without-" + name for name in without))
+        folder = self.tmp / ("tools" + "".join("-without-" + name for name in without) + ("-pyshim" if pyshim else ""))
         if not folder.exists():
             folder.mkdir()
             names = ["env", "perl", "find", "sort", "comm", "head", "cut", "tr", "wc", "awk",
@@ -673,20 +803,24 @@ class World:
                 if name not in without:
                     (folder / name).symlink_to(found)
             if "python3" not in without:
-                (folder / "python3").symlink_to(sys.executable)
+                if pyshim:
+                    write_exec(folder / "python3", PYSHIM)
+                else:
+                    (folder / "python3").symlink_to(sys.executable)
         return folder
 
     def canary(self):
         return sorted(str(p.relative_to(self.real_home)) for p in self.real_home.rglob("*"))
 
     def run(self, *args, scenario=None, env=None, token=TOKEN, stubs=True, home=None,
-            unset=(), without=()):
+            unset=(), without=(), pyshim=None):
         self.runs += 1
         self.log.write_text("")
         shutil.rmtree(self.state, ignore_errors=True)
         before = self.canary()
-        path = os.pathsep.join(([str(self.bin)] if stubs else []) + [str(self.tools(without))])
+        path = os.pathsep.join(([str(self.bin)] if stubs else []) + [str(self.tools(without, bool(pyshim)))])
         environ = {
+            "PYSHIM": pyshim or "",
             "PATH": path, "HOME": str(home or self.real_home), "TMPDIR": str(self.tmpdir),
             "STUB_LOG": str(self.log), "STUB_STATE": str(self.state), "STUB_EXPECT_TOKEN": TOKEN,
             "STUB_SCENARIO": json.dumps(scenario or {}),
@@ -920,12 +1054,13 @@ def test_c_fails_when_a_hook_calls_the_ledger_command_with_no_value_set(world):
     result = world.run("--only", "C", scenario={"c_call_ledger": True})
     assert result.status("C") == "FAIL"
     assert "called the ledger command: resume --brief" in result.evidence("C")
+    assert "changed the target home" not in result.evidence("C"), "the ledger call is named first"
 
 
 def test_c_fails_when_the_session_writes_a_file_outside_claudes_own_state(world):
     result = world.run("--only", "C", scenario={"c_write": True})
     assert result.status("C") == "FAIL"
-    assert "./.local/share/ledger/ledger.db" in result.evidence("C")
+    assert 'home ".local/share/ledger/ledger.db" added reg' in result.evidence("C")
 
 
 @pytest.mark.parametrize("mode, event", [
@@ -1487,28 +1622,32 @@ def test_c_unverified_evidence_names_the_scripts_that_ran_under_the_untrusted_ro
 
 
 @pytest.mark.parametrize("scenario, path", [
-    ("c_write_cache", "./.cache/ledger/ledger.db"),
-    ("c_write_npm", "./.npm/_logs/a.log"),
+    ("c_write_cache", ".cache/ledger/ledger.db"),
+    ("c_write_npm", ".npm/_logs/a.log"),
 ])
 def test_c_fails_when_a_hook_writes_under_cache_or_npm(world, scenario, path):
     result = world.run("--only", "C", scenario={scenario: True})
     assert result.status("C") == "FAIL", result.out
-    assert path in result.evidence("C")
+    assert 'home "%s" added reg' % path in result.evidence("C")
     assert result.rc == 1
 
 
 def test_c_fail_names_every_new_path(world):
     result = world.run("--only", "C", scenario={"c_write_cache": True, "c_write_npm": True, "c_write": True})
     assert result.status("C") == "FAIL"
-    for path in ("./.cache/ledger/ledger.db", "./.npm/_logs/a.log", "./.local/share/ledger/ledger.db"):
-        assert path in result.evidence("C")
+    for path in (".cache/ledger/ledger.db", ".npm/_logs/a.log", ".local/share/ledger/ledger.db"):
+        assert 'home "%s" added reg' % path in result.evidence("C")
 
 
-def test_c_fail_says_how_many_paths_past_the_twenty_it_names(world):
+def test_c_fail_says_how_many_differences_past_the_twenty_it_names(world):
+    # 23 new files and the two new folders that hold them: 25 differences, 20 named.
     result = world.run("--only", "C", scenario={"c_write_many": 23})
     assert result.status("C") == "FAIL"
-    assert "./.cache/many/f19" in result.evidence("C") and "./.cache/many/f20" not in result.evidence("C")
-    assert "(and 3 more)" in result.evidence("C")
+    evidence = result.evidence("C")
+    assert ": 25 difference(s): " in evidence
+    assert 'home ".cache/many/f17" added reg' in evidence and ".cache/many/f18" not in evidence
+    assert evidence.endswith("(and 5 more)")
+    assert evidence.count("; ") == 19
 
 
 @pytest.mark.parametrize("scenario", ["c_write_claude", "c_write_claude_json"])
@@ -1613,15 +1752,35 @@ def test_c_is_unverified_when_the_hooks_run_from_a_folder_named_like_the_trusted
     assert result.rc == 2
 
 
-def test_c_is_unverified_when_the_logged_script_no_longer_exists_whatever_its_spelling(world):
-    # The log names the pinned checkout's hook scripts exactly as the probe spells it,
-    # but the files are gone when the log is read: a path that cannot be resolved to a
-    # file is never trusted by its spelling.
+def test_c_fails_when_the_session_removes_the_hook_scripts_from_the_pinned_checkout(world):
+    # The session removes the checkout's hook scripts after they ran. That used to be
+    # read as "the logged script no longer exists" (see the analyzer test below); the
+    # removal itself is a change of the checkout, which the manifest now reports first.
     result = world.run("--only", "C", scenario={"c_script_gone": True})
-    assert result.status("C") == "UNVERIFIED", result.out
-    assert "logged no run of session-start.sh, prompt.sh" in result.evidence("C")
-    assert "/ledger-src/plugins/ledger-hooks/hooks/session-start.sh" in result.evidence("C")
-    assert result.rc == 2
+    assert result.status("C") == "FAIL", result.out
+    assert 'checkout "plugins/ledger-hooks/hooks/session-start.sh" removed reg' in result.evidence("C")
+    assert 'checkout "plugins/ledger-hooks/hooks/prompt.sh" removed reg' in result.evidence("C")
+    assert result.rc == 1
+
+
+def test_a_logged_script_that_does_not_exist_is_never_trusted_whatever_its_spelling(tmp_path):
+    # The log names the pinned checkout's hook scripts exactly as the probe spells it,
+    # but the files are not there when the log is read: a path that cannot be resolved
+    # to a file is never trusted by its spelling. (Run on the reader directly: a stubbed
+    # session that removed the files would now be reported by the manifest first.)
+    root = tmp_path / "ledger-src" / "plugins" / "ledger-hooks"
+    (root / "hooks").mkdir(parents=True)
+    log = tmp_path / "sh-calls.log"
+    log.write_text("".join("RUN\t%s\tEND\n" % (root / "hooks" / name) for name in ("session-start.sh", "prompt.sh")))
+
+    def verdict():
+        return subprocess.run([sys.executable, "-I", "-c", embedded("ANALYZER"), "shimlog", str(log),
+                               "pinned checkout:%s" % root], capture_output=True, text=True, timeout=30).stdout
+
+    assert verdict().startswith("NORUN|session-start.sh, prompt.sh|"), verdict()
+    for name in ("session-start.sh", "prompt.sh"):
+        (root / "hooks" / name).write_text("")
+    assert verdict().startswith("RAN|"), verdict()
 
 
 def test_the_recording_sh_writes_each_record_with_one_command(world):
@@ -1657,3 +1816,627 @@ def test_c_is_unverified_when_the_logged_scripts_are_given_as_relative_paths(wor
     assert result.status("C") == "UNVERIFIED", result.out
     assert "logged no run of session-start.sh, prompt.sh" in result.evidence("C")
     assert result.rc == 2
+
+
+# --- load C's no-write check: the manifest of both roots ---------------------------
+#
+# Each live-path case below is a stubbed act in the fake session world: the stubbed
+# install (c_pre, before the first manifest) or the stubbed session (c_acts, between
+# the two manifests) makes the write a hook of the plugin could make. The walk cases
+# run the snapshot helper's own source under a fault-injecting wrapper, and the
+# compare cases run the compare's source on synthetic manifests. Each case says
+# which one-site mutation of the script turns it red.
+
+
+def embedded(name):
+    """The python source embedded in the script as the heredoc `name`."""
+    text = SCRIPT.read_text(encoding="utf-8")
+    found = re.search(r"^IFS= read -r -d '' %s <<'PYEOF' \|\| true\n(.*?)^PYEOF$" % name, text, re.S | re.M)
+    assert found, name
+    return found.group(1)
+
+
+def c_run(world, acts=(), pre=(), *args, **kwargs):
+    scenario = {"c_acts": list(acts), "c_pre": list(pre)}
+    scenario.update(kwargs.pop("scenario", {}))
+    return world.run("--only", "C", *args, scenario=scenario, **kwargs)
+
+
+FILE_F = [["write", "home:f", "abcd"], ["chmod", "home:f", 0o644]]
+
+
+@pytest.mark.parametrize("pre, acts, wanted", [
+    # 1-4: a new entry that is not a regular file. Mutation M1 (record regular files only).
+    pytest.param([], [["symlink", "home:x", "/etc"]], [r'home "x" added lnk'], id="row01-new-symlink"),
+    pytest.param([], [["mkdir", "home:d"]], [r'home "d" added dir'], id="row02-new-empty-folder"),
+    # 3 also shows that the walk never opens a fifo (extra mutation M28: open every entry that is
+    # not a folder or a symlink for hashing; the fifo then fails the regular-file check, UNVERIFIED).
+    pytest.param([], [["fifo", "home:p"]], [r'home "p" added fifo'], id="row03-new-fifo"),
+    pytest.param([], [["socket", "home:s"]], [r'home "s" added sock'], id="row04-new-socket"),
+    # 5-9: a removal or a change of an entry that was there. Mutation M2 (report additions only).
+    pytest.param([], [["remove", "home:probe-bin/ledger"]],
+                 [r'home "probe-bin/ledger" removed reg', r'home "probe-bin" changed'], id="row05-deleted-file"),
+    pytest.param(FILE_F, [["write", "home:f", "wxyz"]],
+                 [r'home "f" changed [a-z0-9_,]*sha256'], id="row06-same-size-rewrite"),
+    pytest.param(FILE_F, [["chmod", "home:f", 0o600]],
+                 [r'home "f" changed mode,ctime_ns(;|$)'], id="row07-chmod"),
+    pytest.param(FILE_F, [["link", "home:f", "home:.claude/g"]],
+                 [r'1 difference\(s\): home "f" changed nlink,ctime_ns$'], id="row08-hard-link-from-exempt-state"),
+    pytest.param([["mkdir", "home:sub"]], [["touch_remove", "home:sub/t"]],
+                 [r'home "sub" changed [a-z0-9_,]*mtime_ns'], id="row09-create-then-delete-in-a-subfolder"),
+    # 10: a write in the pinned checkout, where the hooks run. Mutation M3 (compare the home only).
+    pytest.param([], [["append", "checkout:.claude-plugin/marketplace.json", "\n"]],
+                 [r'checkout "\.claude-plugin/marketplace\.json" changed [a-z0-9_,]*sha256'],
+                 id="row10-write-in-the-checkout"),
+    # 11: a newline in a name. Mutation M4 (print the path unquoted).
+    pytest.param([], [["write", "home:a\nb", "x"]],
+                 [r'1 difference\(s\): home "a\\nb" added reg$'], id="row11-newline-in-a-name"),
+    # 12: the session's own working folder is compared. Mutation M5 (exempt probe-work).
+    pytest.param([], [["touch_remove", "home:probe-work/t"]],
+                 [r'home "probe-work" changed [a-z0-9_,]*mtime_ns'], id="row12-probe-work-touched"),
+    # 13: the home root's mode is compared. Mutation M6 (exempt every field of the home root).
+    pytest.param([], [["chmod", "home:.", 0o710]],
+                 [r'1 difference\(s\): home "\." changed mode$'], id="row13-home-root-mode"),
+])
+def test_c_manifest_fails_and_names_each_entry_and_field_that_changed(world, pre, acts, wanted):
+    result = c_run(world, acts, pre)
+    assert result.status("C") == "FAIL", result.out
+    evidence = result.evidence("C")
+    assert "the session changed the target home or the ledger checkout: " in evidence
+    for pattern in wanted:
+        assert re.search(pattern, evidence), (pattern, evidence)
+    assert result.rc == 1
+
+
+@pytest.mark.parametrize("act, words", [
+    # 14: an unreadable folder. 15: an unreadable regular file. Mutation M7 (swallow walk errors).
+    pytest.param([["mkdir", "home:u", 0]], "Permission denied: 'u'", id="row14-unreadable-folder"),
+    pytest.param([["write", "home:z", "x"], ["chmod", "home:z", 0]], "Permission denied: 'z'",
+                 id="row15-unreadable-file"),
+])
+def test_c_manifest_is_unverified_when_the_walk_cannot_read_an_entry(world, tmp_path, act, words):
+    # The caller's own PROBE_HOME stays after the probe's scratch folder is removed, so
+    # the mode is put back here. Permissions are not enforced for uid 0, where this fails
+    # for want of an error to see; the same two errors are injected for any user by the
+    # walk cases below (W5 and W6).
+    chosen = tmp_path / "chosen-home"
+    try:
+        result = c_run(world, act, (), env={"PROBE_HOME": str(chosen)})
+    finally:
+        for name, mode in (("u", 0o755), ("z", 0o644)):
+            if (chosen / name).exists():
+                (chosen / name).chmod(mode)
+    assert result.status("C") == "UNVERIFIED", result.out
+    assert "the after snapshot failed" in result.evidence("C")
+    assert words in result.evidence("C")
+    assert result.rc == 2
+
+
+def test_c_row16_manifest_is_unverified_when_a_root_is_gone_at_the_after_snapshot(world):
+    # Mutation M8 (a missing root reads as an empty list: the entries would read as removed, a FAIL).
+    result = c_run(world, [["rmtree", "checkout:."]])
+    assert result.status("C") == "UNVERIFIED", result.out
+    assert "the after snapshot failed: exit 1: the checkout root cannot be opened as a folder" in result.evidence("C")
+    assert result.rc == 2
+
+
+def test_c_row17_manifest_is_unverified_when_the_helper_exits_non_zero_after_the_session(world):
+    # The shim runs the real helper, so a valid manifest and digest exist, then exits 7:
+    # only the exit status says the call failed (mutation M9, ignore the helper's exit).
+    result = world.run("--only", "C", pyshim="fail-after")
+    assert result.status("C") == "UNVERIFIED", result.out
+    assert "the after snapshot failed: exit 7" in result.evidence("C")
+    assert result.rc == 2
+
+
+def test_c_row18_manifest_is_unverified_when_the_helper_hangs_past_the_alarm(world):
+    # The shim runs the real helper, then sleeps 5 seconds: only the alarm stops it
+    # (mutation M16, no alarm around the helper: the call ends, with a valid digest, and C passes).
+    result = world.run("--only", "C", "--timeout", "2", pyshim="hang-after")
+    assert result.status("C") == "UNVERIFIED", result.out
+    assert "the after snapshot failed: timed out after 2s" in result.evidence("C")
+    assert result.rc == 2
+
+
+def test_c_manifest_before_snapshot_that_fails_stops_the_run_before_the_session(world):
+    # Mutation M23 (carry on after a before snapshot that failed).
+    result = world.run("--only", "C", pyshim="fail-before")
+    assert result.status("C") == "UNVERIFIED", result.out
+    assert "the before snapshot failed: exit 7, so no session was run" in result.evidence("C")
+    assert result.tagged("C") == []
+    assert result.rc == 2
+
+
+def test_c_row19_manifest_is_unverified_when_the_session_rewrites_the_baseline(world):
+    # The stubbed session writes a file in the home and rewrites the before manifest in
+    # the probe's scratch folder to list it: the two manifests then agree, and only the
+    # digest the probe holds says the baseline is not the one it took (mutation M17).
+    result = c_run(world, [["write", "home:forged", "payload"], ["forge_before", "forged"]])
+    assert result.status("C") == "UNVERIFIED", result.out
+    assert "the manifest compare failed: exit 1: the before manifest does not match its digest" in result.evidence("C")
+    assert result.rc == 2
+
+
+def test_c_row20_passes_when_only_claude_state_moves(world):
+    # Mutation M10 (compare the home root's mtime_ns, ctime_ns, nlink and size).
+    result = c_run(world, [
+        ["write", "home:.claude/state/z.json", "x"], ["write", "home:.claude.json.backup", "x"],
+        ["write", "home:.claude.json.lock", "x"], ["remove", "home:.claude.json.lock"]])
+    assert result.status("C") == "PASS", result.out
+    assert result.rc == 0
+
+
+def test_c_row21_passes_with_a_dangling_symlink_at_rest(world):
+    # Mutation M11 (follow symlinks: the dangling one cannot be stat-ed, so UNVERIFIED).
+    result = c_run(world, (), [["symlink", "home:dl", "/nonexistent"]])
+    assert result.status("C") == "PASS", result.out
+
+
+def test_c_row22_the_ledger_call_is_named_before_the_manifest_difference(world):
+    # The recorder writes probe-ledger-calls.log in the home, a new file too.
+    # Mutation M12 (the manifest verdict before the ledger-call check).
+    result = c_run(world, (), (), scenario={"c_call_ledger": True})
+    assert result.status("C") == "FAIL", result.out
+    assert "called the ledger command: resume --brief" in result.evidence("C")
+    assert "changed the target home" not in result.evidence("C")
+
+
+def test_c_pass_says_what_no_file_was_left_written_changed_or_removed_where(world):
+    result = world.run("--only", "C")
+    assert ("no file was left written, changed or removed in the target home or the pinned ledger "
+            "checkout outside Claude's own state (the .claude folder and the .claude.json files)") in result.evidence("C")
+
+
+# --- the snapshot helper, run directly ---------------------------------------------
+
+
+def snapshot_run(args, source=None, timeout=30):
+    return subprocess.run([sys.executable, "-I", "-c", source or embedded("SNAPSHOT_HELPER"), "snapshot", *map(str, args)],
+                          capture_output=True, text=True, timeout=timeout)
+
+
+def test_w0_snapshot_records_every_entry_in_full_and_exempts_only_top_level_claude_state(tmp_path):
+    # Mutation M26 (exempt the names at every depth, not only at the top of the home).
+    home, checkout = tmp_path / "home", tmp_path / "checkout"
+    for folder in (".claude/x", ".claude.json.d", "sub/.claude", ".git"):
+        target = home / folder if folder != ".git" else checkout / folder
+        target.mkdir(parents=True)
+    (home / ".claude" / "x" / "in.txt").write_text("in")
+    (home / ".claude.json").write_text("{}")
+    (home / ".claude.json.d" / "in.txt").write_text("in")
+    (home / "sub" / ".claude" / "y").write_text("y")
+    (home / "f").write_text("hi\n")
+    (home / "dl").symlink_to("/nonexistent")
+    os.mkfifo(home / "p")
+    (checkout / ".git" / "a").write_text("a")
+    out = tmp_path / "scratch.json"
+    done = snapshot_run([out, home, checkout])
+    assert done.returncode == 0 and done.stderr == "", done.stderr
+    data = out.read_bytes()
+    assert done.stdout == hashlib.sha256(data).hexdigest() + "\n"
+    document = json.loads(data)
+    assert document["version"] == 1 and set(document["roots"]) == {"home", "checkout"}
+    paths = [item["path"] for item in document["roots"]["home"]]
+    assert paths == sorted(paths)
+    assert set(paths) == {".", "dl", "f", "p", "sub", "sub/.claude", "sub/.claude/y"}
+    assert [item["path"] for item in document["roots"]["checkout"]] == [".", ".git", ".git/a"]
+    by_path = {item["path"]: item for item in document["roots"]["home"]}
+    f = by_path["f"]
+    info = os.lstat(home / "f")
+    assert f == {"path": "f", "type": "reg", "mode": info.st_mode, "uid": info.st_uid, "gid": info.st_gid,
+                 "nlink": info.st_nlink, "size": 3, "mtime_ns": info.st_mtime_ns, "ctime_ns": info.st_ctime_ns,
+                 "ino": info.st_ino, "sha256": hashlib.sha256(b"hi\n").hexdigest()}
+    assert by_path["dl"]["target"] == "/nonexistent" and "sha256" not in by_path["dl"]
+    assert by_path["p"]["type"] == "fifo" and by_path["sub"]["type"] == "dir" and by_path["."]["type"] == "dir"
+
+
+def test_w0_exempt_state_is_never_entered_so_nothing_inside_it_can_raise_an_error(tmp_path):
+    # Mutation M27 (walk the exempt names too: the unreadable folder inside .claude is then an error).
+    home, checkout = tmp_path / "home", tmp_path / "checkout"
+    (home / ".claude" / "locked").mkdir(parents=True)
+    checkout.mkdir()
+    (home / ".claude" / "locked").chmod(0)
+    try:
+        done = snapshot_run([tmp_path / "m.json", home, checkout])
+    finally:
+        (home / ".claude" / "locked").chmod(0o755)
+    assert done.returncode == 0, done.stderr
+    assert [item["path"] for item in json.loads((tmp_path / "m.json").read_bytes())["roots"]["home"]] == ["."]
+
+
+def test_w0_the_snapshot_records_no_access_time(tmp_path):
+    # The walk itself reads every file, so atime is not recorded; ctime is (it covers a metadata-only
+    # write that a process cannot hide). Mutation M45 (record atime_ns as well).
+    (tmp_path / "home").mkdir()
+    (tmp_path / "checkout").mkdir()
+    (tmp_path / "home" / "f").write_text("x")
+    done = snapshot_run([tmp_path / "m.json", tmp_path / "home", tmp_path / "checkout"])
+    assert done.returncode == 0, done.stderr
+    item = next(item for item in json.loads((tmp_path / "m.json").read_bytes())["roots"]["home"] if item["path"] == "f")
+    assert "ctime_ns" in item and not [key for key in item if "atime" in key]
+
+
+@pytest.mark.parametrize("make, words", [
+    # Mutations M24 (no overlap check) and M25 (no check that the manifest lies outside both roots).
+    pytest.param(lambda t: (t / "home", t / "home" / "inner", t / "m.json"), "the two roots overlap", id="checkout-inside-home"),
+    pytest.param(lambda t: (t / "home" / "inner", t / "home", t / "m.json"), "the two roots overlap", id="home-inside-checkout"),
+    pytest.param(lambda t: (t / "home", t / "checkout", t / "home" / "m.json"), "the manifest path lies inside a root",
+                 id="manifest-in-home"),
+    pytest.param(lambda t: (t / "home", t / "checkout", t / "checkout" / "deeper" / "m.json"),
+                 "the manifest path lies inside a root", id="manifest-in-checkout"),
+])
+def test_w7_the_helper_refuses_overlapping_roots_and_a_manifest_inside_a_root(tmp_path, make, words):
+    for name in ("home/inner", "checkout/deeper"):
+        (tmp_path / name).mkdir(parents=True)
+    home, checkout, out = make(tmp_path)
+    done = snapshot_run([out, home, checkout])
+    assert done.returncode == 1 and done.stdout == ""
+    assert words in done.stderr
+    assert not out.exists()
+
+
+def test_w7_the_helper_never_follows_a_root_that_is_a_symlink(tmp_path):
+    (tmp_path / "real").mkdir()
+    (tmp_path / "checkout").mkdir()
+    (tmp_path / "home").symlink_to(tmp_path / "real", target_is_directory=True)
+    done = snapshot_run([tmp_path / "m.json", tmp_path / "home", tmp_path / "checkout"])
+    assert done.returncode == 1 and "the home root cannot be opened as a folder" in done.stderr
+
+
+HELPER_HARNESS = r'''
+import errno, os, sys
+
+# A test-only program: it runs the snapshot helper's own source with one function of
+# the os module replaced by a wrapper that acts between the helper's stat and its open
+# (or its stat and its second stat), as another process could. The production script
+# has no hook for this.
+source_file, MODE, base = sys.argv[1:4]
+namespace = {"__name__": "snapshot_helper"}
+with open(source_file, encoding="utf-8") as handle:
+    exec(compile(handle.read(), "snapshot-helper", "exec"), namespace)
+real_open, real_stat, real_read = os.open, os.stat, os.read
+stats = {"victim.txt": 0}
+
+
+def open_wrapper(path, flags, *rest, dir_fd=None):
+    if dir_fd is None and MODE == "root-decoy" and path == os.path.join(os.path.realpath(base), "home"):
+        path = os.path.join(base, "decoyroot")     # a swap of the root, then a swap back
+    if dir_fd is not None:
+        if MODE == "folder-decoy" and path == "victim":
+            path = "decoy"      # what a swap of the folder, then a swap back, shows the helper
+        elif MODE == "folder-symlink" and path == "victim":
+            os.rename("victim", "moved", src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            os.symlink(os.path.join(base, "outside"), "victim", dir_fd=dir_fd)
+        elif MODE == "file-fifo" and path == "victim.txt":
+            os.unlink(path, dir_fd=dir_fd)
+            os.mkfifo(path, dir_fd=dir_fd)
+        elif MODE == "file-decoy" and path == "victim.txt":
+            path = "decoy.txt"  # what a swap of the file, then a swap back, shows the helper
+        elif MODE == "folder-denied" and path == "victim":
+            raise PermissionError(errno.EACCES, "Permission denied", path)
+    return real_open(path, flags, *rest, dir_fd=dir_fd)
+
+
+def stat_wrapper(path, *, dir_fd=None, follow_symlinks=True):
+    if MODE == "replace-while-hashed" and dir_fd is not None and path == "victim.txt":
+        stats["victim.txt"] += 1
+        if stats["victim.txt"] == 2:    # the stat after the contents were hashed
+            os.rename("replacement.txt", "victim.txt", src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+    return real_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+
+def read_wrapper(fd, length):
+    if MODE == "file-unreadable":
+        raise OSError(errno.EIO, "Input/output error")
+    return real_read(fd, length)
+
+
+os.open, os.stat, os.read = open_wrapper, stat_wrapper, read_wrapper
+home, checkout = os.path.join(base, "home"), os.path.join(base, "checkout")
+sys.exit(namespace["main"](["snapshot", os.path.join(base, "out.json"), home, checkout]))
+'''
+
+
+def harness_run(tmp_path, mode):
+    base = tmp_path / "w"
+    (base / "home" / "victim").mkdir(parents=True)
+    (base / "home" / "decoy").mkdir()
+    (base / "outside").mkdir()
+    (base / "decoyroot").mkdir()
+    (base / "checkout").mkdir()
+    (base / "home" / "victim" / "inner.txt").write_text("inner")
+    (base / "home" / "decoy" / "other.txt").write_text("other")
+    for name in ("victim.txt", "decoy.txt", "replacement.txt"):
+        (base / "home" / name).write_text(name + " contents")
+    (base / "checkout" / "f").write_text("f")
+    source, harness = tmp_path / "helper.py", tmp_path / "harness.py"
+    source.write_text(embedded("SNAPSHOT_HELPER"), encoding="utf-8")
+    harness.write_text(HELPER_HARNESS, encoding="utf-8")
+    try:
+        return subprocess.run([sys.executable, "-I", str(harness), str(source), mode, str(base)],
+                              capture_output=True, text=True, timeout=20)
+    except subprocess.TimeoutExpired:
+        pytest.fail("the snapshot helper blocked (mode %s): a file swapped for a fifo was opened without O_NONBLOCK" % mode)
+
+
+def test_w0_the_fault_injecting_harness_runs_the_helper_clean_when_it_injects_nothing(tmp_path):
+    done = harness_run(tmp_path, "none")
+    assert done.returncode == 0, done.stderr
+    assert (tmp_path / "w" / "out.json").is_file()
+
+
+@pytest.mark.parametrize("mode, words", [
+    # W1, mutation M18 (drop the folder identity check): the decoy is a real folder, so only the check sees it.
+    pytest.param("folder-decoy", "a folder changed between its stat and its open: victim", id="W1-folder-swapped-for-another"),
+    # W1, the root itself (extra mutation M29, drop the root identity check).
+    pytest.param("root-decoy", "the home root changed between its stat and its open", id="W1-root-swapped-for-another"),
+    # W1: swapped for a symlink to an outside folder; the open refuses it (O_NOFOLLOW).
+    pytest.param("folder-symlink", "victim", id="W1-folder-swapped-for-a-symlink"),
+    # W2, mutation M19a (drop O_NONBLOCK): the open of a fifo with no writer would block.
+    pytest.param("file-fifo", "a file changed between its stat and its open: victim.txt", id="W2-file-swapped-for-a-fifo"),
+    # W2, mutation M19b (drop the file identity check): the decoy is a regular file, and the name still
+    # reads as the first stat after the swap back, so only the identity check sees it.
+    pytest.param("file-decoy", "a file changed between its stat and its open: victim.txt", id="W2-file-swapped-for-another"),
+    # W4, mutation M21 (drop the post-hash stat).
+    pytest.param("replace-while-hashed", "a file changed while it was hashed: victim.txt", id="W4-file-replaced-while-hashed"),
+    # W5 and W6, mutation M7 (swallow walk errors), for any user, root included.
+    pytest.param("folder-denied", "Permission denied", id="W5-folder-cannot-be-opened"),
+    pytest.param("file-unreadable", "Input/output error", id="W6-file-cannot-be-read"),
+])
+def test_w_the_helper_exits_non_zero_naming_the_fault(tmp_path, mode, words):
+    done = harness_run(tmp_path, mode)
+    assert done.returncode == 1, (done.stdout, done.stderr)
+    assert done.stdout == ""
+    assert words in done.stderr, done.stderr
+    assert not (tmp_path / "w" / "out.json").exists(), "no manifest is left for a failed snapshot"
+
+
+def test_w3_every_file_type_maps_to_its_own_name_and_an_unknown_one_to_other():
+    # A char or block device cannot be made without privilege, so the mapping is called on modes.
+    # Mutation M20 (map chr and blk to other).
+    namespace = {"__name__": "snapshot_helper"}
+    exec(compile(embedded("SNAPSHOT_HELPER"), "snapshot-helper", "exec"), namespace)
+    kind = namespace["kind"]
+    table = [(stat.S_IFREG, "reg"), (stat.S_IFDIR, "dir"), (stat.S_IFLNK, "lnk"), (stat.S_IFIFO, "fifo"),
+             (stat.S_IFSOCK, "sock"), (stat.S_IFCHR, "chr"), (stat.S_IFBLK, "blk")]
+    assert [kind(fmt | 0o644) for fmt, _name in table] == [name for _fmt, name in table]
+    assert kind(stat.S_IFMT(0o170000) | 0o644) == "other"
+
+
+# --- the compare, run directly on synthetic manifests --------------------------------
+
+
+def rec(path, **fields):
+    item = {"path": path, "type": "reg", "mode": 33188, "uid": 501, "gid": 20, "nlink": 1, "size": 4,
+            "mtime_ns": 1000, "ctime_ns": 2000, "ino": 77, "sha256": "ab" * 32}
+    item.update(fields)
+    return {key: value for key, value in item.items() if value is not None}
+
+
+def manifest_file(tmp_path, name, home=(), checkout=(), version=1, raw=None):
+    data = raw if raw is not None else json.dumps(
+        {"version": version, "roots": {"home": list(home), "checkout": list(checkout)}}, ensure_ascii=True).encode("ascii")
+    path = tmp_path / name
+    path.write_bytes(data)
+    return str(path), hashlib.sha256(data).hexdigest()
+
+
+def compare_run(before, after, source=None):
+    return subprocess.run([sys.executable, "-I", "-c", source or embedded("MANIFEST_COMPARE"), "compare",
+                           before[0], after[0], before[1], after[1]], capture_output=True, text=True, timeout=30)
+
+
+C1_PAIRS = {
+    "type": ({"type": "reg"}, {"type": "dir"}),
+    "mode": ({"mode": 33188}, {"mode": 33261}),
+    "uid": ({"uid": 501}, {"uid": 502}),
+    "gid": ({"gid": 20}, {"gid": 21}),
+    "nlink": ({"nlink": 1}, {"nlink": 2}),
+    "size": ({"size": 4}, {"size": 5}),
+    "mtime_ns": ({"mtime_ns": 1000}, {"mtime_ns": 1001}),
+    "ctime_ns": ({"ctime_ns": 2000}, {"ctime_ns": 2001}),
+    "ino": ({"ino": 77}, {"ino": 78}),
+    "target": ({"type": "lnk", "sha256": None, "target": "a"}, {"type": "lnk", "sha256": None, "target": "b"}),
+    "sha256": ({"sha256": "ab" * 32}, {"sha256": "cd" * 32}),
+}
+
+
+@pytest.mark.parametrize("field", list(C1_PAIRS))
+def test_c1_compare_names_a_field_that_alone_differs(tmp_path, field):
+    # Mutation M13 (drop this field from the compared fields), one run per field.
+    old, new = C1_PAIRS[field]
+    done = compare_run(manifest_file(tmp_path, "b.json", [rec("f", **old)]),
+                       manifest_file(tmp_path, "a.json", [rec("f", **new)]))
+    assert (done.returncode, done.stdout) == (0, 'DIFF 1\nhome "f" changed %s\n' % field), done.stderr
+
+
+def test_c1_compare_names_a_field_present_on_one_side_only(tmp_path):
+    done = compare_run(manifest_file(tmp_path, "b.json", [rec("l", type="lnk", sha256=None)]),
+                       manifest_file(tmp_path, "a.json", [rec("l", type="lnk", sha256=None, target="a")]))
+    assert done.stdout == 'DIFF 1\nhome "l" changed target\n'
+
+
+def test_c2_compare_reads_a_renamed_path_as_one_removed_and_one_added(tmp_path):
+    # Mutation M2 (report added paths only).
+    done = compare_run(manifest_file(tmp_path, "b.json", [rec("a")]), manifest_file(tmp_path, "a.json", [rec("b")]))
+    assert done.stdout == 'DIFF 2\nhome "a" removed reg\nhome "b" added reg\n'
+
+
+def test_c2_compare_sorts_by_root_then_path_and_quotes_every_path(tmp_path):
+    before = manifest_file(tmp_path, "b.json", [rec("z")], [rec("m")])
+    after = manifest_file(tmp_path, "a.json", [rec("z", size=9), rec("a\nb")], [rec("m", size=9)])
+    done = compare_run(before, after)
+    assert done.stdout == ('DIFF 3\ncheckout "m" changed size\nhome "a\\nb" added reg\nhome "z" changed size\n')
+
+
+def test_c3_compare_leaves_four_fields_of_the_home_root_entry_out(tmp_path):
+    # Mutation M10 (compare them).
+    root = {"type": "dir", "mode": 16877, "sha256": None}
+    before = manifest_file(tmp_path, "b.json", [rec(".", **root)])
+    after = manifest_file(tmp_path, "a.json", [rec(".", mtime_ns=5, ctime_ns=6, nlink=7, size=8, **root)])
+    done = compare_run(before, after)
+    assert (done.returncode, done.stdout) == (0, "SAME\n")
+
+
+@pytest.mark.parametrize("field, value", [("mode", 16832), ("uid", 502), ("gid", 21), ("ino", 78), ("type", "lnk")])
+def test_c3_compare_still_compares_the_other_fields_of_the_home_root_entry(tmp_path, field, value):
+    # Mutation M6 (exempt every field of the home root entry).
+    root = {"type": "dir", "mode": 16877, "sha256": None}
+    before = manifest_file(tmp_path, "b.json", [rec(".", **root)])
+    after = manifest_file(tmp_path, "a.json", [rec(".", **dict(root, **{field: value}))])
+    assert compare_run(before, after).stdout == 'DIFF 1\nhome "." changed %s\n' % field
+
+
+def test_c4_compare_leaves_nothing_out_for_the_checkout_root_entry(tmp_path):
+    # Mutation M14 (apply the home root's exemption to both roots).
+    root = {"type": "dir", "mode": 16877, "sha256": None}
+    before = manifest_file(tmp_path, "b.json", checkout=[rec(".", **root)])
+    after = manifest_file(tmp_path, "a.json", checkout=[rec(".", mtime_ns=5, **root)])
+    assert compare_run(before, after).stdout == 'DIFF 1\ncheckout "." changed mtime_ns\n'
+
+
+def test_c4_compare_reads_the_checkout_root_too(tmp_path):
+    # Mutation M3 (compare the home only).
+    done = compare_run(manifest_file(tmp_path, "b.json", checkout=[rec("a")]), manifest_file(tmp_path, "a.json"))
+    assert done.stdout == 'DIFF 1\ncheckout "a" removed reg\n'
+
+
+def with_home(*items):
+    return {"version": 1, "roots": {"home": list(items), "checkout": []}}
+
+
+@pytest.mark.parametrize("name, raw, words", [
+    # Mutation M15 (read an unparsable manifest as an empty one) for the first two; for each other
+    # case the mutation drops the one check whose message is named.
+    pytest.param("truncated", b'{"version": 1, "roots": {"home": [{"path"', "does not parse", id="truncated"),
+    pytest.param("not-ascii", '{"version": 1, "roots": {"home": [], "checkout": ["é"]}}'.encode("utf-8"),
+                 "does not parse", id="not-ascii"),
+    pytest.param("wrong-version", json.dumps({"version": 2, "roots": {"home": [], "checkout": []}}).encode(),
+                 "is not version 1", id="wrong-version"),
+    pytest.param("true-version", json.dumps({"version": True, "roots": {"home": [], "checkout": []}}).encode(),
+                 "is not version 1", id="boolean-version"),
+    pytest.param("not-an-object", b"[]", "is not version 1", id="not-an-object-document"),
+    pytest.param("no-roots", b'{"version": 1, "roots": []}', "has no roots", id="no-roots"),
+    pytest.param("missing-root", b'{"version": 1, "roots": {"home": []}}', "lacks the checkout root", id="missing-root"),
+    pytest.param("entry-not-object", b'{"version": 1, "roots": {"home": [1], "checkout": []}}',
+                 "a home entry is not an object", id="entry-not-an-object"),
+    pytest.param("no-path", json.dumps(with_home({"type": "reg"})).encode(), "a home entry has no path", id="entry-without-path"),
+    pytest.param("no-type", json.dumps(with_home({"path": "a"})).encode(), "has no known type", id="entry-without-type"),
+    pytest.param("odd-type", json.dumps(with_home(rec("a", type="weird"))).encode(), "has no known type", id="entry-odd-type"),
+    pytest.param("no-integer", json.dumps(with_home(rec("a", mode="x"))).encode(), "has no integer mode", id="entry-text-for-a-number"),
+    pytest.param("bool-integer", json.dumps(with_home(rec("a", size=True))).encode(), "has no integer size", id="entry-boolean-for-a-number"),
+    pytest.param("bad-target", json.dumps(with_home(rec("a", target=5))).encode(), "has a bad target", id="entry-bad-target"),
+    pytest.param("bad-sha", json.dumps(with_home(rec("a", sha256="zz"))).encode(), "has a bad sha256", id="entry-bad-sha256"),
+    pytest.param("twice", json.dumps(with_home(rec("a"), rec("a"))).encode(), "lists a twice", id="duplicate-path"),
+])
+def test_c5_compare_exits_non_zero_and_prints_nothing_on_bad_input(tmp_path, name, raw, words):
+    good = manifest_file(tmp_path, "b.json", [rec("a")])
+    done = compare_run(good, manifest_file(tmp_path, "bad.json", raw=raw))
+    assert done.returncode == 1 and done.stdout == "", (done.stdout, done.stderr)
+    assert words in done.stderr, done.stderr
+
+
+def test_c5_compare_refuses_a_digest_that_is_not_the_files(tmp_path):
+    # Mutation M17 (no digest check), on either side.
+    good = manifest_file(tmp_path, "b.json", [rec("a")])
+    other = manifest_file(tmp_path, "o.json", [rec("b")])
+    for name, pair in {"after": (good, (other[0], good[1])), "before": ((good[0], other[1]), other)}.items():
+        done = compare_run(*pair)
+        assert done.returncode == 1 and done.stdout == "", (name, done.stdout)
+        assert "the %s manifest does not match its digest" % name in done.stderr, (name, done.stderr)
+
+
+def test_c5_compare_refuses_a_digest_that_is_not_a_sha256_and_a_wrong_argument_count(tmp_path):
+    good = manifest_file(tmp_path, "b.json", [rec("a")])
+    done = compare_run(good, (good[0], "not-a-digest"))
+    assert done.returncode == 1 and "the after digest is not a sha256" in done.stderr
+    done = subprocess.run([sys.executable, "-I", "-c", embedded("MANIFEST_COMPARE"), "compare", good[0]],
+                          capture_output=True, text=True, timeout=30)
+    assert done.returncode == 1 and "usage: compare" in done.stderr and done.stdout == ""
+
+
+COMPARE_HARNESS = r'''
+import builtins, io, sys
+
+# A test-only program: it runs the compare's own source with the open of the before
+# manifest replaced by one that, as another process could, rewrites the file with forged
+# bytes right after its true bytes were read. The production script has no hook for this.
+source_file, target, forged_file = sys.argv[1:4]
+namespace = {"__name__": "manifest_compare"}
+with open(source_file, encoding="utf-8") as handle:
+    exec(compile(handle.read(), "manifest-compare", "exec"), namespace)
+real_open = builtins.open
+state = {"swapped": False}
+
+
+def swapping_open(path, mode="r", *rest, **named):
+    if not state["swapped"] and str(path) == target and "b" in mode:
+        state["swapped"] = True
+        with real_open(path, "rb") as handle:
+            data = handle.read()
+        with real_open(forged_file, "rb") as handle:
+            forged = handle.read()
+        with real_open(path, "wb") as handle:
+            handle.write(forged)
+        return io.BytesIO(data)
+    return real_open(path, mode, *rest, **named)
+
+
+builtins.open = swapping_open
+sys.exit(namespace["main"](["compare"] + sys.argv[4:8]))
+'''
+
+
+def test_c6_compare_never_parses_bytes_it_did_not_hash(tmp_path):
+    # Mutation M22 (parse the manifest from a second read instead of the hashed buffer).
+    before = manifest_file(tmp_path, "b.json", [rec("a")])
+    after = manifest_file(tmp_path, "a.json", [rec("a"), rec("added")])
+    forged = tmp_path / "forged.json"
+    forged.write_bytes(Path(after[0]).read_bytes())
+    source, harness = tmp_path / "compare.py", tmp_path / "compare-harness.py"
+    source.write_text(embedded("MANIFEST_COMPARE"), encoding="utf-8")
+    harness.write_text(COMPARE_HARNESS, encoding="utf-8")
+    done = subprocess.run([sys.executable, "-I", str(harness), str(source), before[0], str(forged),
+                           before[0], after[0], before[1], after[1]], capture_output=True, text=True, timeout=30)
+    # The forged before manifest equals the after one: parsed, it would read SAME.
+    assert done.stdout != "SAME\n", "the forged bytes were parsed"
+    assert done.returncode != 0 or done.stdout == 'DIFF 1\nhome "added" added reg\n', (done.stdout, done.stderr)
+
+
+@pytest.mark.parametrize("mode, extra, words", [
+    # Each mode leaves the real compare's run alone and spoils what the probe reads from it.
+    pytest.param("compare-fail", [], "the manifest compare failed: exit 7", id="compare-exits-non-zero"),
+    pytest.param("compare-hang", ["--timeout", "2"], "the manifest compare failed: timed out after 2s", id="compare-hangs"),
+    pytest.param("compare-noise", [], "its output is neither SAME nor DIFF <n> with its lines", id="compare-prints-noise"),
+    pytest.param("compare-extra", [], "its output is neither SAME nor DIFF <n> with its lines", id="compare-prints-more-than-SAME"),
+    pytest.param("compare-short", [], "the manifest compare failed: DIFF 3 is followed by 1 line(s)", id="compare-count-is-not-its-lines"),
+])
+def test_c_manifest_is_unverified_when_the_compare_fails_or_prints_what_it_should_not(world, mode, extra, words):
+    # Mutations: M40 (ignore the compare's exit), M39 (no alarm around the compare), M41 (no check that the
+    # first line is SAME or DIFF <n>), M43 (SAME with more after it read as SAME), M42 (no count of lines).
+    result = world.run("--only", "C", *extra, pyshim=mode)
+    assert result.status("C") == "UNVERIFIED", result.out
+    assert words in result.evidence("C")
+    assert result.rc == 2
+
+
+def test_c_manifest_is_unverified_when_the_helper_prints_no_digest(world):
+    # Mutation M38 (no check that the helper printed a sha256 and wrote a manifest).
+    result = world.run("--only", "C", pyshim="no-digest")
+    assert result.status("C") == "UNVERIFIED", result.out
+    assert "the after snapshot failed: the helper printed no sha256 of a manifest file" in result.evidence("C")
+
+
+@pytest.mark.parametrize("args, words", [
+    pytest.param([], "usage: snapshot", id="no-arguments"),
+    pytest.param(["m.json", "home", "checkout"], "the home root is not an absolute path", id="relative-path"),
+    pytest.param(["/tmp/never-written.json", "/", "/tmp"], "the home root has no final name", id="root-of-the-filesystem"),
+])
+def test_w7_the_helper_refuses_a_bad_command_line(tmp_path, args, words):
+    # Mutations: M30 (no argument count check), M31 (no absolute path check), M32 (no final name check).
+    (tmp_path / "home").mkdir()
+    (tmp_path / "checkout").mkdir()
+    done = subprocess.run([sys.executable, "-I", "-c", embedded("SNAPSHOT_HELPER"), "snapshot", *args],
+                          capture_output=True, text=True, timeout=30, cwd=tmp_path)
+    assert done.returncode == 1 and done.stdout == ""
+    assert words in done.stderr, done.stderr

@@ -880,17 +880,416 @@ group_b() {
 }
 
 # --- load C: the ledger hooks are silent before setup -----------------------------
-# Every file in the target home except Claude Code's own state: the .claude
-# folder and the .claude.json files beside it. The .cache and .npm folders are
-# listed like any other: a live Claude Code home held neither, so no path under
-# them is known to be Claude Code's own, and a new entry there (a hook writing
-# .cache/ledger/ledger.db, say) is a write the check reports.
-home_listing() {
-  (
-    cd "$target_home" || exit 1
-    find . \( -path ./.claude -o -path './.claude.json*' \) -prune \
-      -o -type f -print 2>/dev/null | LC_ALL=C sort
-  )
+# The no-write check is a manifest taken before the session and one taken after
+# it, over two roots: the target home and the probe's pinned ledger checkout (a
+# plugin installed from a local-directory marketplace runs its hooks from that
+# checkout). Every entry under both roots is recorded in full by a python3
+# helper that walks by descriptor and follows no symlink, and the two manifests
+# are compared for equality. Claude Code's own state is the only exemption, and
+# it is not recorded: the top-level .claude folder and the top-level
+# .claude.json files of the target home, never walked. Beside it, the target
+# home root entry's own mtime_ns, ctime_ns, nlink and size are not compared (all
+# four follow from the root's entry set, which is compared in full). The
+# .cache and .npm folders, probe-work, probe-bin and the whole checkout are
+# compared like any other entry. The probe holds each manifest's digest in a
+# shell variable the session cannot reach, and the compare refuses a manifest
+# that does not match it. Any error is UNVERIFIED, never PASS. The claim covers
+# state left on disk by the session and its hooks once they have exited: a
+# process a hook leaves running in the background is outside it.
+IFS= read -r -d '' SNAPSHOT_HELPER <<'PYEOF' || true
+import hashlib, json, os, stat, sys
+
+# One snapshot of both roots of load C as a manifest file, by descriptor: no
+# path is looked up again after it was checked, and no symlink is followed.
+# Usage: snapshot <manifest file> <target home> <ledger checkout>
+# On success the manifest's sha256 is the only line printed; on any error the
+# reason is one line on stderr and the exit status is 1.
+VERSION = 1
+CHUNK = 1 << 20
+TYPES = {
+    stat.S_IFREG: "reg",
+    stat.S_IFDIR: "dir",
+    stat.S_IFLNK: "lnk",
+    stat.S_IFIFO: "fifo",
+    stat.S_IFSOCK: "sock",
+    stat.S_IFCHR: "chr",
+    stat.S_IFBLK: "blk",
+}
+
+
+class SnapshotError(Exception):
+    pass
+
+
+def require(ok, message):
+    if not ok:
+        raise SnapshotError(message)
+
+
+def kind(mode):
+    return TYPES.get(stat.S_IFMT(mode), "other")
+
+
+def same_object(left, right):
+    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def parts(path):
+    return [piece for piece in path.split("/") if piece]
+
+
+def inside(path, base):
+    here, there = parts(path), parts(base)
+    return here[:len(there)] == there
+
+
+def physical(path, what):
+    # The folder part resolved, the last name kept: a root that is itself a
+    # symlink is refused when it is opened, never followed.
+    require(os.path.isabs(path), "%s is not an absolute path" % what)
+    folder, name = os.path.split(path.rstrip("/"))
+    require(name, "%s has no final name" % what)
+    return os.path.join(os.path.realpath(folder), name)
+
+
+def exempt_home(name):
+    # Claude Code's own state at the top of the target home, never walked.
+    return name == ".claude" or name.startswith(".claude.json")
+
+
+def record(path, info, target=None, digest=None):
+    item = {
+        "path": path,
+        "type": kind(info.st_mode),
+        "mode": info.st_mode,
+        "uid": info.st_uid,
+        "gid": info.st_gid,
+        "nlink": info.st_nlink,
+        "size": info.st_size,
+        "mtime_ns": info.st_mtime_ns,
+        "ctime_ns": info.st_ctime_ns,
+        "ino": info.st_ino,
+    }
+    if target is not None:
+        item["target"] = target
+    if digest is not None:
+        item["sha256"] = digest
+    return item
+
+
+def hash_file(dir_fd, name, first, path):
+    # O_NONBLOCK so a file swapped for a fifo cannot block the open; the
+    # descriptor must be the very regular file that was stat-ed.
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+    try:
+        opened = os.fstat(fd)
+        require(stat.S_ISREG(opened.st_mode) and same_object(opened, first),
+                "a file changed between its stat and its open: " + path)
+        digest = hashlib.sha256()
+        while True:
+            block = os.read(fd, CHUNK)
+            if not block:
+                break
+            digest.update(block)
+    finally:
+        os.close(fd)
+    again = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    require(same_object(again, first) and again.st_size == first.st_size
+            and again.st_mtime_ns == first.st_mtime_ns and again.st_ctime_ns == first.st_ctime_ns,
+            "a file changed while it was hashed: " + path)
+    return digest.hexdigest()
+
+
+def visit(dir_fd, rel, name, records, exempt):
+    path = name if not rel else rel + "/" + name
+    info = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    if stat.S_ISDIR(info.st_mode):
+        child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
+        try:
+            require(same_object(os.fstat(child), info),
+                    "a folder changed between its stat and its open: " + path)
+            records.append(record(path, info))
+            walk(child, path, records, None)
+        finally:
+            os.close(child)
+    elif stat.S_ISLNK(info.st_mode):
+        records.append(record(path, info, target=os.readlink(name, dir_fd=dir_fd)))
+    elif stat.S_ISREG(info.st_mode):
+        records.append(record(path, info, digest=hash_file(dir_fd, name, info, path)))
+    else:
+        records.append(record(path, info))
+
+
+def walk(dir_fd, rel, records, exempt):
+    with os.scandir(dir_fd) as listing:
+        names = sorted(entry.name for entry in listing)
+    for name in names:
+        if exempt is not None and exempt(name):
+            continue
+        visit(dir_fd, rel, name, records, exempt)
+
+
+def walk_root(path, label, exempt):
+    try:
+        first = os.lstat(path)
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as error:
+        raise SnapshotError("the %s root cannot be opened as a folder: %s" % (label, error))
+    try:
+        require(same_object(os.fstat(fd), first), "the %s root changed between its stat and its open" % label)
+        records = [record(".", first)]
+        walk(fd, "", records, exempt)
+    finally:
+        os.close(fd)
+    return sorted(records, key=lambda item: item["path"])
+
+
+def snapshot(out, home, checkout):
+    home = physical(home, "the home root")
+    checkout = physical(checkout, "the checkout root")
+    require(not inside(home, checkout) and not inside(checkout, home), "the two roots overlap")
+    target = physical(out, "the manifest path")
+    require(not inside(target, home) and not inside(target, checkout), "the manifest path lies inside a root")
+    document = {"version": VERSION, "roots": {
+        "home": walk_root(home, "home", exempt_home),
+        "checkout": walk_root(checkout, "checkout", None),
+    }}
+    data = json.dumps(document, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("ascii")
+    descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        view = memoryview(data)
+        while view:
+            view = view[os.write(descriptor, view):]
+    finally:
+        os.close(descriptor)
+    return hashlib.sha256(data).hexdigest()
+
+
+def main(argv):
+    try:
+        require(len(argv) == 4 and argv[0] == "snapshot",
+                "usage: snapshot <manifest file> <target home> <ledger checkout>")
+        digest = snapshot(argv[1], argv[2], argv[3])
+    except Exception as error:
+        text = str(error) if isinstance(error, SnapshotError) else "%s: %s" % (type(error).__name__, error)
+        sys.stderr.write(" ".join(text.splitlines()) + "\n")
+        return 1
+    sys.stdout.write(digest + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
+PYEOF
+
+IFS= read -r -d '' MANIFEST_COMPARE <<'PYEOF' || true
+import hashlib, json, re, sys
+
+# The comparison of load C's two manifests. Each manifest file is read once, into
+# memory; its digest is checked on that buffer and the same buffer is parsed.
+# Usage: compare <before file> <after file> <before sha256> <after sha256>
+# Output: SAME, or DIFF <n> then one line per difference, a path always printed
+# as a JSON string so that no name can break a line:
+#   <root> <path> added <type> | removed <type> | changed <field>,<field>...
+# On any error nothing is printed on stdout, one line goes to stderr, exit 1.
+VERSION = 1
+ROOTS = ("checkout", "home")
+RECORDED = ("type", "mode", "uid", "gid", "nlink", "size", "mtime_ns", "ctime_ns", "ino", "target", "sha256")
+COMPARED = ("type", "mode", "uid", "gid", "nlink", "size", "mtime_ns", "ctime_ns", "ino", "target", "sha256")
+NUMBERS = ("mode", "uid", "gid", "nlink", "size", "mtime_ns", "ctime_ns", "ino")
+KINDS = ("reg", "dir", "lnk", "fifo", "sock", "chr", "blk", "other")
+# On the target home's root entry only: all four follow from the root's entry
+# set, which is compared in full.
+HOME_ROOT_FIELDS = ("mtime_ns", "ctime_ns", "nlink", "size")
+ABSENT = object()
+
+
+class CompareError(Exception):
+    pass
+
+
+def require(ok, message):
+    if not ok:
+        raise CompareError(message)
+
+
+def check_record(label, root, item):
+    require(isinstance(item, dict), "%s manifest: a %s entry is not an object" % (label, root))
+    require(isinstance(item.get("path"), str), "%s manifest: a %s entry has no path" % (label, root))
+    require(item.get("type") in KINDS, "%s manifest: %s entry %s has no known type" % (label, root, item["path"]))
+    for field in NUMBERS:
+        require(type(item.get(field)) is int, "%s manifest: %s entry %s has no integer %s" % (
+            label, root, item["path"], field))
+    if "target" in item:
+        require(isinstance(item["target"], str), "%s manifest: %s entry %s has a bad target" % (
+            label, root, item["path"]))
+    if "sha256" in item:
+        require(isinstance(item["sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", item["sha256"]),
+                "%s manifest: %s entry %s has a bad sha256" % (label, root, item["path"]))
+
+
+def load(label, path, digest):
+    require(re.fullmatch(r"[0-9a-f]{64}", digest) is not None, "the %s digest is not a sha256" % label)
+    with open(path, "rb") as handle:
+        data = handle.read()
+    require(hashlib.sha256(data).hexdigest() == digest, "the %s manifest does not match its digest" % label)
+    try:
+        document = json.loads(data.decode("ascii"))
+    except ValueError as error:
+        raise CompareError("the %s manifest does not parse: %s" % (label, error))
+    require(isinstance(document, dict) and type(document.get("version")) is int and document["version"] == VERSION,
+            "the %s manifest is not version %d" % (label, VERSION))
+    roots = document.get("roots")
+    require(isinstance(roots, dict), "the %s manifest has no roots" % label)
+    found = {}
+    for root in ROOTS:
+        require(isinstance(roots.get(root), list), "the %s manifest lacks the %s root" % (label, root))
+        found[root] = {}
+        for item in roots[root]:
+            check_record(label, root, item)
+            require(item["path"] not in found[root], "the %s manifest lists %s twice" % (label, item["path"]))
+            found[root][item["path"]] = item
+    return found
+
+
+def exempt(root, path, field):
+    return root == "home" and path == "." and field in HOME_ROOT_FIELDS
+
+
+def differences(before, after):
+    lines = []
+    for root in ROOTS:
+        old, new = before[root], after[root]
+        for path in sorted(set(old) | set(new)):
+            if path not in old:
+                text = "added " + new[path]["type"]
+            elif path not in new:
+                text = "removed " + old[path]["type"]
+            else:
+                names = [field for field in COMPARED
+                         if not exempt(root, path, field)
+                         and old[path].get(field, ABSENT) != new[path].get(field, ABSENT)]
+                if not names:
+                    continue
+                text = "changed " + ",".join(names)
+            lines.append("%s %s %s" % (root, json.dumps(path), text))
+    return lines
+
+
+def main(argv):
+    try:
+        require(len(argv) == 5 and argv[0] == "compare",
+                "usage: compare <before file> <after file> <before sha256> <after sha256>")
+        before = load("before", argv[1], argv[3])
+        after = load("after", argv[2], argv[4])
+        lines = differences(before, after)
+    except Exception as error:
+        text = str(error) if isinstance(error, CompareError) else "%s: %s" % (type(error).__name__, error)
+        sys.stderr.write(" ".join(text.splitlines()) + "\n")
+        return 1
+    if lines:
+        sys.stdout.write("DIFF %d\n" % len(lines) + "".join(line + "\n" for line in lines))
+    else:
+        sys.stdout.write("SAME\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
+PYEOF
+
+manifest_digest=""; manifest_err=""; manifest_diff=""
+
+# take_manifest <before|after> <manifest file> <target home> <ledger checkout>:
+# one snapshot of both roots by the python3 on the probe's own PATH (never the
+# session's), under the same per-command alarm as git_run. Returns 0 with
+# manifest_digest set to the sha256 of the manifest file the helper wrote; else
+# 1 with manifest_err naming what went wrong. A timeout is an exit other than 0.
+take_manifest() {
+  local label=$1 out=$2 digest rc detail
+  manifest_digest=""
+  manifest_err=""
+  digest="$(perl -e 'alarm shift; exec @ARGV' "$probe_timeout" \
+    python3 -I -c "$SNAPSHOT_HELPER" snapshot "$out" "$3" "$4" 2>"$scratch/manifest.err")"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    if [ "$rc" -eq 142 ]; then
+      detail="timed out after ${probe_timeout}s"
+    else
+      detail="$(head -n 1 "$scratch/manifest.err" | cut -c1-300)"
+      detail="exit $rc${detail:+: $detail}"
+    fi
+    manifest_err="the $label snapshot failed: $detail"
+    return 1
+  fi
+  case "$digest" in
+    *[!0-9a-f]*) digest="" ;;
+  esac
+  if [ "${#digest}" -ne 64 ] || [ ! -f "$out" ]; then
+    manifest_err="the $label snapshot failed: the helper printed no sha256 of a manifest file"
+    return 1
+  fi
+  manifest_digest=$digest
+  return 0
+}
+
+# compare_manifests <before file> <after file> <before sha256> <after sha256>:
+# returns 0 with manifest_diff empty (the manifests are equal) or set to
+# "<n> difference(s): <the first 20 lines joined by "; "> (and <n-20> more)";
+# returns 1 with manifest_err set when the compare failed or its output is not
+# SAME, or DIFF <n> followed by exactly n non-empty lines.
+compare_manifests() {
+  local out rc detail first rest line n count shown blank
+  manifest_err=""
+  manifest_diff=""
+  out="$(perl -e 'alarm shift; exec @ARGV' "$probe_timeout" \
+    python3 -I -c "$MANIFEST_COMPARE" compare "$1" "$2" "$3" "$4" 2>"$scratch/manifest.err")"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    if [ "$rc" -eq 142 ]; then
+      detail="timed out after ${probe_timeout}s"
+    else
+      detail="$(head -n 1 "$scratch/manifest.err" | cut -c1-300)"
+      detail="exit $rc${detail:+: $detail}"
+    fi
+    manifest_err="the manifest compare failed: $detail"
+    return 1
+  fi
+  first="${out%%$'\n'*}"
+  if [ "$first" = SAME ] && [ "$out" = SAME ]; then
+    return 0
+  fi
+  n=""
+  case "$first" in
+    DIFF\ [1-9]*) n="${first#DIFF }" ;;
+  esac
+  case "$n" in
+    *[!0-9]*) n="" ;;
+  esac
+  if [ -z "$n" ] || [ "${#n}" -gt 9 ] || [ "$out" = "$first" ]; then
+    manifest_err="the manifest compare failed: its output is neither SAME nor DIFF <n> with its lines"
+    return 1
+  fi
+  rest="${out#*$'\n'}"
+  count=0
+  blank=0
+  shown=""
+  while IFS= read -r line; do
+    count=$((count + 1))
+    [ -n "$line" ] || blank=1
+    if [ "$count" -le 20 ]; then
+      shown="${shown:+$shown; }$line"
+    fi
+  done <<<"$rest"
+  if [ "$blank" -ne 0 ] || [ "$count" -ne "$n" ]; then
+    manifest_err="the manifest compare failed: DIFF $n is followed by $count line(s)"
+    return 1
+  fi
+  manifest_diff="$n difference(s): $shown"
+  if [ "$n" -gt 20 ]; then
+    manifest_diff="$manifest_diff (and $((n - 20)) more)"
+  fi
+  return 0
 }
 
 # git_run <args...>: git in the target home, with no user or system git
@@ -903,9 +1302,10 @@ git_run() {
 }
 
 group_c() {
-  local repo url ledger_src head_sha market_name before after calls new_files step spath bin_dir calls_log
+  local repo url ledger_src head_sha market_name calls step spath bin_dir calls_log
+  local before_m after_m before_digest after_digest m_err
   local plugin_root plugin_root_real shim_dir sh_log real_sh h_code h_one h_two s_code s_one s_two
-  local src_root new_count
+  local src_root
   if [ ! -f "$pin_file" ]; then
     emit UNVERIFIED C 'ledger-vendor.pin is not next to this script, so the ledger repository is unknown'
     return
@@ -1006,15 +1406,30 @@ print(data["name"] if sys.argv[2] in names else "")
   fi
   spath="$shim_dir:$bin_dir:$base_path"
 
-  before="$scratch/listing.before"
-  after="$scratch/listing.after"
-  home_listing >"$before"
+  # The before snapshot is taken after everything the probe placed (the checkout,
+  # the install, probe-bin, the recording sh) and before the session. A before
+  # snapshot that fails is UNVERIFIED and the session is not run.
+  before_m="$scratch/manifest.before.json"
+  after_m="$scratch/manifest.after.json"
+  if ! take_manifest before "$before_m" "$target_home" "$ledger_src"; then
+    emit UNVERIFIED C "$manifest_err, so no session was run"
+    return
+  fi
+  before_digest=$manifest_digest
   if ! session "$spath" -p '[probe C] Reply with the single word ACK.' --model "$MODEL" --max-turns 1 \
       --no-session-persistence --output-format stream-json --verbose --include-hook-events --tools ""; then
     emit UNVERIFIED C "the ledger session failed: $why"
     return
   fi
-  home_listing >"$after"
+  # The after snapshot and the compare, whatever the stream shows: an error here
+  # is kept and read in the verdict, after the ledger-call check.
+  m_err=""
+  if take_manifest after "$after_m" "$target_home" "$ledger_src"; then
+    after_digest=$manifest_digest
+    compare_manifests "$before_m" "$after_m" "$before_digest" "$after_digest" || m_err=$manifest_err
+  else
+    m_err=$manifest_err
+  fi
   analyze hooks "$out_file"
   if [ "$a_code" = BAD ]; then
     emit UNVERIFIED C "$a_one"
@@ -1029,13 +1444,12 @@ print(data["name"] if sys.argv[2] in names else "")
   s_code=$a_code; s_one=$a_one; s_two=$a_two
   calls=""
   [ -s "$calls_log" ] && calls="$(head -n 1 "$calls_log" | cut -c1-120)"
-  new_files="$(comm -13 "$before" "$after" | head -n 20 | tr '\n' ' ')"
-  new_count="$(comm -13 "$before" "$after" | wc -l | tr -d ' ')"
-  [ "$new_count" -gt 20 ] && new_files="$new_files(and $((new_count - 20)) more) "
   if [ -n "$calls" ]; then
     emit FAIL C "with no ledger value set a hook called the ledger command: $calls"
-  elif [ -n "$new_files" ]; then
-    emit FAIL C "with no ledger value set the session wrote new file(s): $new_files"
+  elif [ -n "$m_err" ]; then
+    emit UNVERIFIED C "$m_err, so the claim that nothing was left written, changed or removed is not shown"
+  elif [ -n "$manifest_diff" ]; then
+    emit FAIL C "with no ledger value set the session changed the target home or the ledger checkout: $manifest_diff"
   elif [ "$s_code" != RAN ]; then
     emit UNVERIFIED C "the recording sh logged no run of $s_one under the install folder of $LEDGER_PLUGIN or its pinned checkout ($s_two), so no hook run of the plugin is shown"
   elif [ "$h_code" = NOEVENT ]; then
@@ -1043,7 +1457,7 @@ print(data["name"] if sys.argv[2] in names else "")
   elif [ "$h_code" = DIRTY ]; then
     emit FAIL C "with no ledger value set a hook was not silent (the stream names the event, not the plugin): $h_one"
   else
-    emit PASS C "$LEDGER_PLUGIN $LEDGER_PIN_TAG (commit $LEDGER_PIN_SHA): the recording sh logged a run of hooks/session-start.sh and hooks/prompt.sh from the $s_two ($s_one), the stream's hook responses exited clean with no output ($h_one; seen: $h_two), the ledger command was never called, no file was written outside Claude's own state"
+    emit PASS C "$LEDGER_PLUGIN $LEDGER_PIN_TAG (commit $LEDGER_PIN_SHA): the recording sh logged a run of hooks/session-start.sh and hooks/prompt.sh from the $s_two ($s_one), the stream's hook responses exited clean with no output ($h_one; seen: $h_two), the ledger command was never called, and no file was left written, changed or removed in the target home or the pinned ledger checkout outside Claude's own state (the .claude folder and the .claude.json files)"
   fi
 }
 
