@@ -378,6 +378,10 @@ NEAR_MISSES = [
      "plugin harness: dependencies must be a list of plain plugin names, no range"),
     ("dependency-on-itself", lambda m, p, r: set_key(p, "dependencies", ["harness"]),
      "plugin harness: depends on itself"),
+    ("harness-without-an-external-dependency", lambda m, p, r: set_key(p, "dependencies", ["sdlc"]),
+     "plugin harness: does not depend on external plugin 'ledger-hooks'"),
+    ("harness-with-an-external-dependency-twice", lambda m, p, r: set_key(p, "dependencies", ["sdlc", "ledger-hooks", "sdlc"]),
+     "plugin harness: depends on external plugin 'sdlc' more than once"),
     ("plugin-listed-twice", lambda m, p, r: m["plugins"].append(copy.deepcopy(entry_of(m, "sdlc"))),
      "plugin sdlc: is listed twice"),
     ("plugin-name-unknown", lambda m, p, r: m["plugins"].append({"name": "extra", "source": "./plugins/harness"}),
@@ -408,6 +412,48 @@ def test_a_near_miss_is_refused_by_name(tmp_path, change, expected):
     else:
         (tmp_path / MARKETPLACE).write_text(json.dumps(market), encoding="utf-8")
     assert expected in problems(tmp_path)
+
+
+# harness brings the set: its dependencies name each EXTERNAL_PLUGINS entry
+# exactly once. Each case is the only refusal of an otherwise good tree.
+
+@pytest.mark.parametrize("dependencies,expected", [
+    (["sdlc"], ["plugin harness: does not depend on external plugin 'ledger-hooks'"]),
+    (["ledger-hooks"], ["plugin harness: does not depend on external plugin 'sdlc'"]),
+    ([], ["plugin harness: does not depend on external plugin 'sdlc'",
+          "plugin harness: does not depend on external plugin 'ledger-hooks'"]),
+    (None, ["plugin harness: does not depend on external plugin 'sdlc'",
+            "plugin harness: does not depend on external plugin 'ledger-hooks'"]),
+], ids=["no-ledger-hooks", "no-sdlc", "empty-list", "no-dependencies-key"])
+def test_a_missing_external_dependency_of_harness_is_refused_by_name(tmp_path, dependencies, expected):
+    plugin = copy.deepcopy(GOOD_PLUGIN)
+    if dependencies is None:
+        del plugin["dependencies"]
+    else:
+        plugin["dependencies"] = dependencies
+    write_tree(tmp_path, GOOD_MARKETPLACE, plugin)
+    assert problems(tmp_path) == expected
+
+
+@pytest.mark.parametrize("dependencies,expected", [
+    (["sdlc", "ledger-hooks", "sdlc"],
+     ["plugin harness: depends on external plugin 'sdlc' more than once"]),
+    (["ledger-hooks", "sdlc", "ledger-hooks", "ledger-hooks"],
+     ["plugin harness: depends on external plugin 'ledger-hooks' more than once"]),
+], ids=["sdlc-twice", "ledger-hooks-three-times"])
+def test_a_duplicate_external_dependency_of_harness_is_refused_by_name(tmp_path, dependencies, expected):
+    plugin = copy.deepcopy(GOOD_PLUGIN)
+    plugin["dependencies"] = dependencies
+    write_tree(tmp_path, GOOD_MARKETPLACE, plugin)
+    assert problems(tmp_path) == expected
+
+
+def test_the_expected_external_dependencies_are_read_from_the_table(tmp_path, monkeypatch):
+    """A name added to EXTERNAL_PLUGINS is required of harness with no second list."""
+    write_tree(tmp_path, GOOD_MARKETPLACE, GOOD_PLUGIN)
+    monkeypatch.setitem(cm.EXTERNAL_PLUGINS, "rails",
+                        {"source": "url", "repository": "rails", "path": None})
+    assert problems(tmp_path) == ["plugin harness: does not depend on external plugin 'rails'"]
 
 
 def test_a_duplicate_json_key_is_refused_by_name(tmp_path):

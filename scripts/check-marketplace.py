@@ -46,7 +46,10 @@ shown in ``problems``):
   share one owner), so this file never names the owner. Any other type, URL or
   path, an external entry for any other name, and a folder source for one of
   these two names, is refused.
-- ``harness`` is listed and is a folder in this repository.
+- ``harness`` is listed and is a folder in this repository, and its manifest's
+  ``dependencies`` name each external plugin (each name of
+  ``EXTERNAL_PLUGINS``) exactly once: a missing one and a repeated one are
+  each refused by name. That is how installing ``harness`` brings the set.
 - A folder plugin's manifest: one JSON object with no duplicate key, whose
   ``name`` equals its entry's ``name``, with a ``version`` that is ``X.Y.Z`` set
   in the manifest only (not also in the entry), and ``dependencies`` (when
@@ -240,24 +243,26 @@ def external_problems(label: str, name: str, source: dict, owner: str | None) ->
     return found
 
 
-def folder_problems(root: Path, label: str, entry: dict, source: str) -> tuple[list[str], list]:
-    """(problems, dependencies) of a plugin that is a folder in this repository."""
+def folder_problems(root: Path, label: str, entry: dict, source: str) -> tuple[list[str], list | None]:
+    """(problems, dependencies) of a plugin that is a folder in this repository.
+    The dependencies are None when the manifest or its list could not be read
+    (that is already refused, so nothing more is said about them)."""
     if not LOCAL_SOURCE.fullmatch(source) or ".." in source.split("/"):
-        return [f"{label}: source is not a ./ folder path inside the repository"], []
+        return [f"{label}: source is not a ./ folder path inside the repository"], None
     folder = root / source[2:]
     if not folder.resolve().is_relative_to(root.resolve()):
-        return [f"{label}: source resolves outside the repository"], []
+        return [f"{label}: source resolves outside the repository"], None
     if not folder.is_dir():
-        return [f"{label}: folder {source} is missing"], []
+        return [f"{label}: folder {source} is missing"], None
     manifest = folder / PLUGIN_MANIFEST
     if not manifest.is_file():
-        return [f"{label}: manifest {source}/{PLUGIN_MANIFEST} is missing"], []
+        return [f"{label}: manifest {source}/{PLUGIN_MANIFEST} is missing"], None
     try:
         data = load_json(manifest)
     except ValueError as exc:
-        return [f"{label}: manifest is not valid JSON ({exc})"], []
+        return [f"{label}: manifest is not valid JSON ({exc})"], None
     if not isinstance(data, dict):
-        return [f"{label}: manifest is not a JSON object"], []
+        return [f"{label}: manifest is not a JSON object"], None
     found: list[str] = []
     if data.get("name") != entry.get("name"):
         found.append(f"{label}: manifest name {data.get('name')!r} differs from the entry name")
@@ -269,7 +274,7 @@ def folder_problems(root: Path, label: str, entry: dict, source: str) -> tuple[l
     dependencies = data.get("dependencies", [])
     if not isinstance(dependencies, list) or not all(isinstance(d, str) for d in dependencies):
         found.append(f"{label}: dependencies must be a list of plain plugin names, no range")
-        dependencies = []
+        return found, None
     return found, dependencies
 
 
@@ -323,8 +328,10 @@ def problems(root: Path, external: dict | None = None) -> list[str]:
                 if external is not None:
                     external[name] = None
                 continue
-            more, dependencies[name] = folder_problems(root, label, entry, source)
+            more, listed = folder_problems(root, label, entry, source)
             found.extend(more)
+            if listed is not None:
+                dependencies[name] = listed
         elif isinstance(source, dict):
             more = external_problems(label, name, source, owner)
             found.extend(more)
@@ -343,6 +350,15 @@ def problems(root: Path, external: dict | None = None) -> list[str]:
                 found.append(f"plugin {name}: depends on itself")
             elif dependency not in entries:
                 found.append(f"plugin {name}: dependency {dependency!r} is not an entry of this marketplace")
+    # harness brings the set: its dependencies name each external plugin once.
+    # The expected names are EXTERNAL_PLUGINS's, never a second list.
+    if "harness" in dependencies:
+        for external_name in EXTERNAL_PLUGINS:
+            times = dependencies["harness"].count(external_name)
+            if times == 0:
+                found.append(f"plugin harness: does not depend on external plugin {external_name!r}")
+            elif times > 1:
+                found.append(f"plugin harness: depends on external plugin {external_name!r} more than once")
     return found
 
 
