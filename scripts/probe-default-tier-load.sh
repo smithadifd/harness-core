@@ -331,7 +331,8 @@ rand_hex() {
 # (the wanted text is, or is not, in the route under test; field 1 is the
 # value seen, field 2 an excerpt), NOSPAWN, COUNT, NOTGP, BGRUN, TOPBASH or
 # LEAK (the route was not the one under test; COUNT is more or fewer than one
-# Agent/Task call or result), NOBOUNDARY or LEAKSEED (the compaction was not
+# Agent/Task call or result; NOBASH is, for B2, more or fewer than one Bash call
+# of the subagent itself or than one non-error result for it), NOBOUNDARY or LEAKSEED (the compaction was not
 # shown, or the sentinel was there before it), ROOT (the install folder the
 # install record names), RAN or NORUN (the recording sh logged the plugin's two
 # hook scripts under a trusted root, or did not; RAN's second field names the
@@ -608,6 +609,27 @@ if mode == "subagent":
     # subagent's final reply; reading it as the reply would be a false FAIL.
     if LAUNCH.search(reply):
         out("BGRUN", "subagent ran in the background", reply)
+    if len(extra) > 2 and extra[2] == "nested-bash":
+        # B2 only. The Agent call's reply is what the main thread was handed, and
+        # the main thread could have read the value itself and passed it on; the
+        # subagent's own Bash is what the line says saw it. So the Agent call must
+        # have exactly one Bash call of its own (a tool_use whose parent_tool_use_id
+        # is the Agent call's id) and exactly one non-error result for that call,
+        # and the value is read from that result, never from the Agent's reply.
+        agent_id = next(iter(spawned))
+        nested = [item.get("id") for event in events
+                  if event.get("type") == "assistant" and event.get("parent_tool_use_id") == agent_id
+                  for item in blocks(event)
+                  if item.get("type") == "tool_use" and item.get("name") == "Bash"]
+        ids = [ident for ident in nested if isinstance(ident, str) and ident]
+        shown = [block_text(item.get("content")) for event in events if event.get("type") == "user"
+                 for item in blocks(event)
+                 if item.get("type") == "tool_result" and item.get("tool_use_id") in ids
+                 and not item.get("is_error")]
+        if len(nested) != 1 or len(ids) != 1 or len(shown) != 1:
+            out("NOBASH", "the Agent call has %d nested Bash call(s) and %d non-error result(s) for them, "
+                "expected exactly one of each" % (len(nested), len(shown)))
+        reply = shown[0]
     if pattern in reply:
         out("FOUND", seen_option(reply), reply)
     out("MISSING", seen_option(reply), reply)
@@ -703,6 +725,7 @@ route_not_run() {
     NOTGP) printf 'the subagent type was %s, not general-purpose' "$a_one" ;;
     BGRUN) printf '%s, so the subagent'"'"'s own final reply was not read' "$a_one" ;;
     TOPBASH) printf '%s, so the subagent route was not isolated' "$a_one" ;;
+    NOBASH) printf '%s, so the output of a subagent'"'"'s own Bash is not shown' "$a_one" ;;
     LEAK) printf '%s, so its reply proves nothing' "$a_one" ;;
     *) printf '%s' "${a_one:-unreadable reply}" ;;
   esac
@@ -868,10 +891,10 @@ group_b() {
   if session "$base_path" -p "$P_B2" --model "$MODEL" --max-turns 6 --no-session-persistence \
       --output-format stream-json --verbose --permission-mode dontAsk \
       --allowedTools=Agent,Bash --tools=Agent,Bash; then
-    analyze subagent "$out_file" "$value" "PROBE_OPT=[$value]"
+    analyze subagent "$out_file" "$value" "PROBE_OPT=[$value]" nested-bash
     case "$a_code" in
       FOUND) emit PASS B2 "a general-purpose subagent's Bash saw HARNESS_PROBE_OPTION=$a_one (expected $value)" ;;
-      MISSING) emit FAIL B2 "a general-purpose subagent's Bash saw HARNESS_PROBE_OPTION=[$a_one], expected [$value]; reply: $a_two" ;;
+      MISSING) emit FAIL B2 "a general-purpose subagent's Bash saw HARNESS_PROBE_OPTION=[$a_one], expected [$value]; Bash output: $a_two" ;;
       *) emit UNVERIFIED B2 "$(route_not_run)" ;;
     esac
   else
@@ -895,7 +918,10 @@ group_b() {
 # shell variable the session cannot reach, and the compare refuses a manifest
 # that does not match it. Any error is UNVERIFIED, never PASS. The claim covers
 # state left on disk by the session and its hooks once they have exited: a
-# process a hook leaves running in the background is outside it.
+# process a hook leaves running in the background is outside it. The ledger
+# call recorder's log lives in probe-bin and is created, empty, before the
+# first manifest, so it is in both and compared like any other file: an
+# append, a truncation, a removal and a replacement are each a difference.
 IFS= read -r -d '' SNAPSHOT_HELPER <<'PYEOF' || true
 import hashlib, json, os, stat, sys
 
@@ -1380,11 +1406,15 @@ print(data["name"] if sys.argv[2] in names else "")
 
   # A ledger command that records every call stands on PATH, and no ledger
   # value is set: a hook that went past its "no values" check would call it.
+  # Its log is created here, empty, beside it and before the before manifest, so
+  # the log is in both manifests: a hook that calls the recorder and then removes,
+  # empties or replaces the log changes an entry that was already recorded.
   bin_dir="$target_home/probe-bin"
-  calls_log="$target_home/probe-ledger-calls.log"
+  calls_log="$bin_dir/ledger-calls.log"
   mkdir -p "$bin_dir" \
     && printf '#!/bin/sh\nprintf "%%s\\n" "$*" >>"%s"\nexit 0\n' "$calls_log" >"$bin_dir/ledger" \
     && chmod 755 "$bin_dir/ledger" \
+    && : >"$calls_log" \
     || { emit UNVERIFIED C 'could not place the ledger call recorder'; return; }
 
   # A recording sh stands before everything on PATH, in the probe's own scratch
@@ -1442,8 +1472,12 @@ print(data["name"] if sys.argv[2] in names else "")
   src_root="$ledger_src/plugins/$LEDGER_PLUGIN"
   analyze shimlog "$sh_log" "install:$plugin_root" "pinned checkout:$src_root"
   s_code=$a_code; s_one=$a_one; s_two=$a_two
+  # The log is read only while it is still a regular file (a symlink, a fifo or a
+  # folder put in its place is read as nothing, and the manifest names the change).
   calls=""
-  [ -s "$calls_log" ] && calls="$(head -n 1 "$calls_log" | cut -c1-120)"
+  if [ -f "$calls_log" ] && [ ! -L "$calls_log" ] && [ -s "$calls_log" ]; then
+    calls="$(head -n 1 "$calls_log" | cut -c1-120)"
+  fi
   if [ -n "$calls" ]; then
     emit FAIL C "with no ledger value set a hook called the ledger command: $calls"
   elif [ -n "$m_err" ]; then

@@ -58,6 +58,7 @@ the text itself.
 | `.github/workflows/commit-identity.yml` | CI: the commit identity check on every pull request |
 | `.gitignore` | keeps the bytecode Python writes out of the tree |
 | `CHANGELOG.md` | the changes of each tag |
+| `KNOWN-LIMITS.md` | limits that are known and out of scope for the current stage, one per line |
 | `LICENSE` | the license: MIT, the same as the vendored ledger's |
 | `README.md` | what this repository is and how it is vendored |
 | `SECURITY.md` | how to report a vulnerability |

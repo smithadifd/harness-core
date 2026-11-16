@@ -230,6 +230,8 @@ def run_acts(acts):
             full = where(args[0])
             open(full, "w").close()
             os.unlink(full)
+        elif op == "truncate":
+            open(where(args[0]), "w").close()
         elif op == "forge_before":
             # A session that rewrites the before manifest in the probe's scratch
             # folder so that it matches the home as it now is (it adds the entry of
@@ -498,7 +500,7 @@ def main():
             inner = sentinel if mode in (
                 "ok", "okfg", "leak", "nospawn", "topbash", "nottgp", "noresult",
                 "missingtype", "emptytype", "casetype", "twocalls", "twocalls_task",
-                "tworesults", "noid") else "NONE"
+                "tworesults", "noid", "nobash", "twobash") else "NONE"
             pattern = inner
         else:
             value = "" if mode == "empty" else option_value()
@@ -528,7 +530,26 @@ def main():
             pattern = "NONE"
         if mode == "topbash":
             tool_use("Bash", {"command": "echo hi"}, "toolu_2")
-        tool_use("Bash", {"command": "echo inner"}, "toolu_3", parent="toolu_1")
+        # The subagent's own Bash call and its result: events whose parent_tool_use_id
+        # is the Agent call's id (a Bash result's content is a plain string). The
+        # modes below leave the call out, double it, leave its result out, make the
+        # result an error or double it, give the call another parent, keep the value
+        # out of the Bash result (bashmiss: the Agent's reply still has it) or out of
+        # the Agent's reply (replyfree: the Bash result has it).
+        nested_text = "PROBE_OPT=[]" if mode == "bashmiss" else pattern
+        if mode == "replyfree":
+            pattern = "The subagent has finished."
+        owner = "toolu_8" if mode == "bashforeign" else "toolu_1"
+        if mode != "nobash":
+            tool_use("Bash", {"command": "echo inner"}, "toolu_3", parent=owner)
+            if mode == "twobash":
+                tool_use("Bash", {"command": "echo again"}, "toolu_6", parent=owner)
+            if mode != "bashnores":
+                tool_result("toolu_3", nested_text, parent=owner, is_error=(mode == "basherr"))
+                if mode == "twobash":
+                    tool_result("toolu_6", nested_text, parent=owner)
+                if mode == "bashtworesults":
+                    tool_result("toolu_3", nested_text, parent=owner)
         if mode in ("background", "launch_notice"):
             pattern = LAUNCH_NOTICE
         if mode != "noresult":
@@ -1704,6 +1725,65 @@ def test_the_counts_are_in_the_evidence_of_a_missing_call_or_result(world, ident
     assert counts in result.evidence(ident)
 
 
+# B2 reads the value from the subagent's own Bash result. A stream-json --verbose stream
+# marks a subagent's events with the id of the Agent call that started it: its Bash call
+# is an assistant event, its result a user event, each with that id as parent_tool_use_id
+# (top-level events carry null). The stub follows that shape.
+
+
+def test_b2_reads_the_value_from_the_subagents_own_bash_result_never_from_the_agent_reply(world):
+    # The Agent's reply holds no value and the nested Bash result does: PASS. Mutation F17-b
+    # (read the Agent's reply instead of the nested Bash result).
+    result = world.run("--only", "B", scenario={"B2": "replyfree"})
+    assert result.status("B2") == "PASS", result.out
+    assert "saw HARNESS_PROBE_OPTION=PROBE-OPT-" in result.evidence("B2")
+    assert result.rc == 0
+
+
+def test_b2_fails_when_the_subagents_own_bash_result_lacks_the_value_though_the_reply_has_it(world):
+    # The Agent's reply (what the main thread was handed) holds the value; the subagent's own
+    # Bash result does not: FAIL. Mutation F17-b.
+    result = world.run("--only", "B", scenario={"B2": "bashmiss"})
+    assert result.status("B2") == "FAIL", result.out
+    assert "HARNESS_PROBE_OPTION=[]" in result.evidence("B2")
+    assert "Bash output: PROBE_OPT=[]" in result.evidence("B2")
+    assert result.rc == 1
+
+
+@pytest.mark.parametrize("mode, counts", [
+    # The Sol probe's shape: the value only in the Agent reply, no Bash of the subagent's own.
+    # Mutation F17-a (do not require a nested Bash call).
+    pytest.param("nobash", "0 nested Bash call(s) and 0 non-error result(s)", id="no-nested-bash"),
+    # Mutation F17-c (accept more than one nested Bash call).
+    pytest.param("twobash", "2 nested Bash call(s) and 2 non-error result(s)", id="two-nested-bash"),
+    # Mutation F17-d (accept a nested Bash call that has no result).
+    pytest.param("bashnores", "1 nested Bash call(s) and 0 non-error result(s)", id="nested-bash-without-result"),
+    # Mutation F17-e (count an error result as a result).
+    pytest.param("basherr", "1 nested Bash call(s) and 0 non-error result(s)", id="nested-bash-error-result"),
+    # Mutation F17-f (accept more than one result for the call).
+    pytest.param("bashtworesults", "1 nested Bash call(s) and 2 non-error result(s)", id="nested-bash-two-results"),
+    # Mutation F17-g (count a Bash call whatever its parent).
+    pytest.param("bashforeign", "0 nested Bash call(s) and 0 non-error result(s)", id="bash-of-another-parent"),
+])
+def test_b2_is_unverified_unless_the_agent_call_has_exactly_one_nested_bash_call_and_result(world, mode, counts):
+    result = world.run("--only", "B", scenario={"B2": mode})
+    assert result.status("B2") == "UNVERIFIED", result.out
+    evidence = result.evidence("B2")
+    assert counts in evidence
+    assert "expected exactly one of each" in evidence
+    assert "the output of a subagent's own Bash is not shown" in evidence
+    assert "saw HARNESS_PROBE_OPTION" not in evidence
+    assert result.rc == 2
+
+
+@pytest.mark.parametrize("mode", ["nobash", "twobash"])
+def test_a2_needs_no_nested_bash_call(world, mode):
+    # A2's evidence is the subagent's context, not a command: its rule is unchanged. Mutation
+    # F17-h (apply the nested Bash rule to A2 as well).
+    result = world.run("--only", "A", scenario={"A2": mode})
+    assert result.status("A2") == "PASS", result.out
+
+
 def test_c_passes_in_the_live_r4_shape_logged_through_a_symlink_while_the_root_is_held_resolved(world):
     # Live r4: the hooks ran from the pinned checkout, but the recording sh logged them
     # as /var/... while the probe held the checkout as /private/var/... (and, with a
@@ -1973,12 +2053,86 @@ def test_c_row21_passes_with_a_dangling_symlink_at_rest(world):
 
 
 def test_c_row22_the_ledger_call_is_named_before_the_manifest_difference(world):
-    # The recorder writes probe-ledger-calls.log in the home, a new file too.
+    # The recorder appends to probe-bin/ledger-calls.log, which is in the first manifest too.
     # Mutation M12 (the manifest verdict before the ledger-call check).
     result = c_run(world, (), (), scenario={"c_call_ledger": True})
     assert result.status("C") == "FAIL", result.out
     assert "called the ledger command: resume --brief" in result.evidence("C")
     assert "changed the target home" not in result.evidence("C")
+
+
+CALLS_LOG = "home:probe-bin/ledger-calls.log"
+CALLS_LOG_PATH = r'home "probe-bin/ledger-calls\.log"'
+
+
+def test_c_f18_the_calls_log_exists_empty_in_probe_bin_before_the_session_starts(world):
+    # The log is in the first manifest only if it is there before it. Mutation F18-a (create
+    # the log lazily, on the recorder's first call).
+    result = world.run("--only", "C")
+    assert result.status("C") == "PASS", result.out
+    files = result.tagged("C")[0]["home_files"]
+    assert "probe-bin/ledger-calls.log" in files
+    assert "probe-ledger-calls.log" not in files, "no recorder log at the top of the home"
+
+
+def test_c_f18_a_hook_that_calls_the_recorder_then_removes_the_log_is_a_fail(world):
+    # The shape a review probe used: the log never existed in the first manifest and the home
+    # root's four fields are not compared, so the removal was invisible. Mutation F18-a.
+    result = c_run(world, [["remove", CALLS_LOG]], scenario={"c_call_ledger": True})
+    assert result.status("C") == "FAIL", result.out
+    evidence = result.evidence("C")
+    assert re.search(CALLS_LOG_PATH + " removed reg", evidence), evidence
+    assert "never called" not in evidence
+    assert result.rc == 1
+
+
+def test_c_f18_a_hook_that_calls_the_recorder_then_empties_the_log_is_a_fail(world):
+    # Mutation F18-a (lazy creation names the log as added, not changed).
+    result = c_run(world, [["truncate", CALLS_LOG]], scenario={"c_call_ledger": True})
+    assert result.status("C") == "FAIL", result.out
+    evidence = result.evidence("C")
+    assert re.search(CALLS_LOG_PATH + r" changed [a-z0-9_,]*mtime_ns", evidence), evidence
+    assert "called the ledger command" not in evidence, "the log reads empty: the manifest names it"
+    assert result.rc == 1
+
+
+def test_c_f18_a_hook_that_removes_and_recreates_the_log_is_a_fail(world):
+    # An empty log recreated in place is the same bytes under a new inode and new times.
+    # Mutation F18-a.
+    result = c_run(world, [["remove", CALLS_LOG], ["write", CALLS_LOG, ""]])
+    assert result.status("C") == "FAIL", result.out
+    assert re.search(CALLS_LOG_PATH + r" changed [a-z0-9_,]*ctime_ns", result.evidence("C")), result.evidence("C")
+    assert result.rc == 1
+
+
+def test_c_f18_a_call_that_leaves_the_log_is_the_ledger_call_fail(world):
+    result = c_run(world, (), (), scenario={"c_call_ledger": True})
+    assert result.status("C") == "FAIL", result.out
+    assert "called the ledger command: resume --brief" in result.evidence("C")
+
+
+def test_c_f18_a_log_swapped_for_a_symlink_to_a_file_with_text_is_never_read_as_a_call(world):
+    # The ledger-call check reads the log only while it is still a regular file; a symlink put
+    # in its place is read as nothing and the manifest names the change. Mutation F18-b (read
+    # the log without checking that it is still a regular file).
+    result = c_run(world, [["write", "home:decoy.txt", "resume --brief\n"], ["remove", CALLS_LOG],
+                           ["symlink", CALLS_LOG, "../decoy.txt"]])
+    assert result.status("C") == "FAIL", result.out
+    evidence = result.evidence("C")
+    assert re.search(CALLS_LOG_PATH + r" changed type", evidence), evidence
+    assert "called the ledger command" not in evidence
+    assert "never called" not in evidence
+    assert result.rc == 1
+
+
+def test_c_f18_a_log_swapped_for_a_folder_is_never_read_and_the_probe_prints_nothing_to_stderr(world):
+    # Reading a folder as the log would make head complain on the probe's stderr. Mutation F18-d
+    # (read the log without checking that it is a regular file, leaving the symlink check).
+    result = c_run(world, [["remove", CALLS_LOG], ["mkdir", CALLS_LOG]])
+    assert result.status("C") == "FAIL", result.out
+    assert re.search(CALLS_LOG_PATH + r" changed type", result.evidence("C")), result.evidence("C")
+    assert "called the ledger command" not in result.evidence("C")
+    assert result.err == "", result.err
 
 
 def test_c_pass_says_what_no_file_was_left_written_changed_or_removed_where(world):

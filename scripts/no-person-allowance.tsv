@@ -1,4 +1,5 @@
 # path	sha256 of the lowercased matched text (hashes only; the deny list comes from the environment variable NO_PERSON_DENY, which CI fills from the repository secret of that name)	reason
+KNOWN-LIMITS.md	95a86be226161e30e5f20e9938d8ed0947429cabacc4f481dded0ad2a45f0d94	the owner's handle in this repository's pull request reference
 ledger-vendor.pin	95a86be226161e30e5f20e9938d8ed0947429cabacc4f481dded0ad2a45f0d94	the owner's handle in the public ledger repository slug
 scripts/ledger-vendor-bump.py	95a86be226161e30e5f20e9938d8ed0947429cabacc4f481dded0ad2a45f0d94	the owner's handle in the public ledger repository slug
 scripts/omp-harness-rules.py	fcf56c2c0e488ee1bff443cdcfc0c98e222f37a43756de591e4aaaf667bc0007	the toolkit's own repository name (config folder and marker)
