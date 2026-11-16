@@ -8,7 +8,13 @@ addition with its position and neighbours. Remove takes out exactly what
 apply recorded. A rule the person has since moved or duplicated is kept
 and named. Nothing that grants is ever proposed. Apply is all-or-nothing:
 every precondition is checked before the first write, and a later failure
-rolls back every change this run made.
+rolls back every change this run made: the files, the settings and the setup
+record. The record is written before `claude plugin configure` runs, so a
+record that cannot be written fails before configure and leaves the home as it
+was. A configure that has succeeded is not undone, and does not need to be,
+because nothing that can fail runs after it. Apply refuses to overwrite a
+settings.json that changed since it was read, and rollback leaves a
+settings.json that changed after apply wrote it, naming it for a manual check.
 """
 from __future__ import annotations
 
@@ -87,11 +93,26 @@ def pairs(items):
     return seen
 
 
-def load_json_object(path: Path) -> dict[str, Any]:
+def read_named(path: Path) -> bytes:
     try:
-        text = path.read_text(encoding="utf-8")
+        return path.read_bytes()
     except OSError as exc:
         raise SetupError(f"cannot read {path}: {exc}") from exc
+
+
+def decode_text(raw: bytes, path: Path) -> str:
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise SetupError(f"{path} is not valid UTF-8 ({exc})") from exc
+
+
+def load_json_object(path: Path) -> dict[str, Any]:
+    return parse_json_object(read_named(path), path)
+
+
+def parse_json_object(raw: bytes, path: Path) -> dict[str, Any]:
+    text = decode_text(raw, path)
     try:
         data = json.loads(text, object_pairs_hook=pairs)
     except ValueError as exc:
@@ -289,9 +310,25 @@ def note_created_dirs(path: Path, home: Path, created_dirs: list[str]) -> None:
             created_dirs.append(rel)
 
 
+def current_bytes(path: Path) -> bytes | None:
+    try:
+        return path.read_bytes()
+    except OSError:
+        return None
+
+
 def restore_apply(home: Path, originals: dict[Path, bytes | None],
-                  created_dirs: list[str]) -> None:
+                  created_dirs: list[str],
+                  written: dict[Path, bytes]) -> list[Path]:
+    """Undo this run's changes. A path whose bytes apply wrote and that no
+    longer hold those bytes was changed by someone else since: it is left
+    as it is and returned, so the caller can name it."""
+    kept: list[Path] = []
     for path, prior in reversed(list(originals.items())):
+        expected = written.get(path)
+        if expected is not None and current_bytes(path) != expected:
+            kept.append(path)
+            continue
         if prior is None:
             if lexists(path):
                 try:
@@ -304,6 +341,16 @@ def restore_apply(home: Path, originals: dict[Path, bytes | None],
             except OSError:
                 pass
     prune_created(home, created_dirs)
+    return kept
+
+
+def with_kept(exc: SetupError, home: Path, kept: list[Path]) -> SetupError:
+    if not kept:
+        return exc
+    names = ", ".join(path.relative_to(home).as_posix() for path in kept)
+    return SetupError(
+        f"{exc}; changed after apply wrote it, left as it is, "
+        f"needs a manual check: {names}")
 
 
 def prune_created(home: Path, created_dirs: list) -> None:
@@ -336,18 +383,27 @@ def configure_ledger(claude: str, values: dict[str, str]) -> None:
         raise SetupError(f"claude plugin configure failed: {detail}")
 
 
-def load_settings(path: Path) -> tuple[dict[str, Any], bool, int | str]:
+def read_current(path: Path) -> bytes | None:
+    """The bytes at path, or None when nothing is there."""
     if not lexists(path):
-        return {}, False, 2
-    data = load_json_object(path)
-    indent = detect_indent(path.read_text(encoding="utf-8"))
-    return data, True, indent
+        return None
+    return read_named(path)
+
+
+def load_settings(path: Path) -> tuple[dict[str, Any], bool, int | str, bytes | None]:
+    raw = read_current(path)
+    if raw is None:
+        return {}, False, 2, None
+    data = parse_json_object(raw, path)
+    return data, True, detect_indent(raw.decode("utf-8")), raw
 
 
 def save_settings(path: Path, data: dict[str, Any],
-                  indent: int | str = 2) -> None:
+                  indent: int | str = 2) -> bytes:
+    payload = dump_json(data, indent=indent).encode("utf-8")
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(dump_json(data, indent=indent), encoding="utf-8")
+    path.write_bytes(payload)
+    return payload
 
 
 def approved_ids(approve: list[str], approve_all: bool) -> set[str]:
@@ -441,12 +497,14 @@ def apply_verb(home: Path, operator: str, harness: str | None,
         raise SetupError(f"rules default already exists: {RULES_REL}")
     claude = which_claude()
     ids = approved_ids(approve, approve_all)
-    settings, settings_existed, settings_indent = load_settings(settings_path)
+    settings, settings_existed, settings_indent, settings_raw = load_settings(
+        settings_path)
 
     messages: list[str] = []
     files: list[dict[str, Any]] = []
     created_dirs: list[str] = []
     originals: dict[Path, bytes | None] = {}
+    written: dict[Path, bytes] = {}
 
     def snapshot(path: Path) -> None:
         if path in originals:
@@ -489,12 +547,15 @@ def apply_verb(home: Path, operator: str, harness: str | None,
         settings_records.extend(apply_deny_rules(settings, deny_wanted))
         settings_written = bool(settings_records)
         if settings_written:
+            if read_current(settings_path) != settings_raw:
+                raise SetupError(
+                    f"{SETTINGS_REL} changed while apply was running; "
+                    "it was not written")
             snapshot(settings_path)
-            save_settings(settings_path, settings, indent=settings_indent)
+            written[settings_path] = save_settings(
+                settings_path, settings, indent=settings_indent)
 
         values = ledger_values(home, operator, harness)
-        configure_ledger(claude, values)
-
         snapshot(record_path)
         record = {
             "version": 1,
@@ -509,14 +570,17 @@ def apply_verb(home: Path, operator: str, harness: str | None,
             "configure": {"plugin": LEDGER_PLUGIN, "values": values},
         }
         write_new_file(record_path, dump_json(record))
+        configure_ledger(claude, values)
         messages.append(f"applied: {RECORD_REL}")
         return "\n".join(messages) + ("\n" if messages else "")
-    except SetupError:
-        restore_apply(home, originals, created_dirs)
+    except SetupError as exc:
+        kept = restore_apply(home, originals, created_dirs, written)
+        if kept:
+            raise with_kept(exc, home, kept) from exc
         raise
     except OSError as exc:
-        restore_apply(home, originals, created_dirs)
-        raise SetupError(f"apply failed: {exc}") from exc
+        kept = restore_apply(home, originals, created_dirs, written)
+        raise with_kept(SetupError(f"apply failed: {exc}"), home, kept) from exc
 
 
 def neighbours_match(deny: list[Any], item: dict[str, Any]) -> bool:

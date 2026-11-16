@@ -49,6 +49,9 @@ def listing(home: Path) -> dict[str, str]:
         for name in filenames:
             path = base / name
             rel = path.relative_to(home).as_posix()
+            if path.is_symlink():
+                found[rel] = "link:" + os.readlink(path)
+                continue
             found[rel] = hashlib.sha256(path.read_bytes()).hexdigest()
     return found
 
@@ -627,3 +630,123 @@ def test_settings_write_keeps_non_ascii(tmp_path):
     assert "café" in text
     assert "\\u00e9" not in text
     assert settings_of(home)["model"] == "café"
+
+
+# Round 3: the record comes before configure, a concurrent settings.json edit
+# is never overwritten on save or on rollback, a non-UTF-8 settings.json is a
+# named refusal, and the module docstring states the rollback scope.
+
+def test_apply_record_write_failure_happens_before_configure(tmp_path):
+    bin_dir = install_claude(tmp_path)
+    home = tmp_path / "home"
+    plugins = home / ".claude" / "plugins"
+    plugins.mkdir(parents=True)
+    # A dangling link where the record's folder must be made: the folder
+    # cannot be created, so the record cannot be written.
+    (plugins / "harness-core").symlink_to("nowhere")
+    before = listing(home)
+    done = apply_all(home, bin_dir)
+    assert done.returncode == 1
+    assert "apply failed" in done.stderr
+    assert not (bin_dir / "claude-log.json").exists()
+    assert listing(home) == before
+
+
+@pytest.mark.parametrize("existing", [True, False])
+def test_apply_refuses_when_settings_change_between_load_and_save(
+        tmp_path, monkeypatch, existing):
+    bin_dir = install_claude(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    settings = home / ".claude" / "settings.json"
+    if existing:
+        settings.parent.mkdir(parents=True)
+        settings.write_text('{"model": "kept"}\n', encoding="utf-8")
+    other = b'{"model": "edited elsewhere"}\n'
+    real = mod.write_new_file
+
+    def racing(path, content):
+        real(path, content)
+        if path.name == "harness-local.md":
+            settings.parent.mkdir(parents=True, exist_ok=True)
+            settings.write_bytes(other)
+
+    monkeypatch.setattr(mod, "write_new_file", racing)
+    monkeypatch.setenv("PATH", str(bin_dir) + os.pathsep + os.environ.get("PATH", ""))
+    with pytest.raises(mod.SetupError, match="changed while apply was running"):
+        mod.apply_verb(home.resolve(), OPERATOR, HARNESS, [], True)
+    assert settings.read_bytes() == other
+    assert not (bin_dir / "claude-log.json").exists()
+    assert listing(home) == {".claude/settings.json": hashlib.sha256(other).hexdigest()}
+
+
+def install_claude_editing_settings(folder: Path, settings_path: Path,
+                                    payload: bytes) -> Path:
+    bin_dir = folder / "bin"
+    bin_dir.mkdir()
+    claude = bin_dir / "claude"
+    claude.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "from pathlib import Path\n"
+        f"Path({str(settings_path)!r}).write_bytes({payload!r})\n"
+        "sys.stderr.write('configure boom\\n')\n"
+        "sys.exit(3)\n",
+        encoding="utf-8")
+    claude.chmod(claude.stat().st_mode | stat.S_IXUSR)
+    return bin_dir
+
+
+@pytest.mark.parametrize("existing", [True, False])
+def test_rollback_keeps_a_settings_edit_made_after_apply_wrote_it(tmp_path, existing):
+    home = tmp_path / "home"
+    home.mkdir()
+    settings = home / ".claude" / "settings.json"
+    if existing:
+        settings.parent.mkdir(parents=True)
+        settings.write_text('{"model": "kept"}\n', encoding="utf-8")
+    other = b'{"model": "edited while configure ran"}\n'
+    bin_dir = install_claude_editing_settings(tmp_path, settings, other)
+    done = apply_all(home, bin_dir)
+    assert done.returncode == 1
+    assert "configure boom" in done.stderr
+    assert ".claude/settings.json" in done.stderr
+    assert "needs a manual check" in done.stderr
+    assert settings.read_bytes() == other
+    assert listing(home) == {".claude/settings.json": hashlib.sha256(other).hexdigest()}
+
+
+def test_apply_refuses_non_utf8_settings_by_name_before_any_write(tmp_path):
+    bin_dir = install_claude(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    settings = home / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    settings.write_bytes(b'\xff\xfe{"model": "kept"}\n')
+    before = listing(home)
+    done = apply_all(home, bin_dir)
+    assert done.returncode == 1
+    assert "is not valid UTF-8" in done.stderr
+    assert "Traceback" not in done.stderr
+    assert listing(home) == before
+    assert not (bin_dir / "claude-log.json").exists()
+
+
+def test_apply_refuses_unreadable_settings_by_name_before_any_write(tmp_path):
+    bin_dir = install_claude(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".claude" / "settings.json").mkdir(parents=True)
+    before = listing(home)
+    done = apply_all(home, bin_dir)
+    assert done.returncode == 1
+    assert "cannot read" in done.stderr
+    assert "Traceback" not in done.stderr
+    assert listing(home) == before
+
+
+def test_module_docstring_states_record_first_and_rollback_scope():
+    doc = " ".join(mod.__doc__.split())
+    assert "rolls back every change this run made: the files, the settings and the setup record" in doc
+    assert "The record is written before `claude plugin configure` runs" in doc
+    assert "A configure that has succeeded is not undone" in doc
