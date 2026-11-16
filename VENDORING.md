@@ -55,7 +55,7 @@ the text itself.
 |---|---|
 | `.claude-plugin/marketplace.json` | the plugin marketplace named harness-core: the in-repo harness plugin and the two external plugins, each pinned to a full commit id on a release tag |
 | `.core-manifest` | the list of vendored files: the folders this repository owns entirely, then every vendored path |
-| `.github/workflows/ci.yml` | CI: the stand-alone tests, the manifest check, the no-person check, the ledger drift check and the strict plugin validation |
+| `.github/workflows/ci.yml` | CI: the stand-alone tests, the manifest check, the no-person check, the ledger drift check, the strict plugin validation and the pins against their tags |
 | `.github/workflows/commit-identity.yml` | CI: the commit identity check on every pull request |
 | `.gitignore` | keeps the bytecode Python writes out of the tree |
 | `CHANGELOG.md` | the changes of each tag |
@@ -68,6 +68,7 @@ the text itself.
 | `plugins/harness/.claude-plugin/plugin.json` | the harness plugin's manifest: its version and the plugins it depends on |
 | `scripts/check-core-manifest.py` | checks that every tracked file is vendored or repository-only |
 | `scripts/check-ledger-vendor.py` | the vendored ledger's drift check |
+| `scripts/check-marketplace.py` | checks the marketplace and the harness plugin's manifest: folders, manifests, each external plugin bound to its expected source, full-commit pins, and, with the source option, each tag against its pin |
 | `scripts/check-no-person.py` | checks that no tracked file names a person, a machine, a home path or a private host |
 | `scripts/ci/check-commit-identity.sh` | the commit identity check the workflow runs |
 | `scripts/ledger-vendor-bump.py` | moves the vendored ledger to a new tag |
@@ -77,7 +78,7 @@ the text itself.
 | `scripts/tests/test_check_ledger_vendor.py` | tests of the ledger drift check |
 | `scripts/tests/test_check_no_person.py` | tests of the no-person check |
 | `scripts/tests/test_ci_workflow.py` | tests of the CI workflows' runners, triggers and gates |
-| `scripts/tests/test_marketplace_manifest.py` | tests of the marketplace and plugin manifests (folders, manifests, full-commit pins) and of the plugin validation job |
+| `scripts/tests/test_marketplace_manifest.py` | tests of the marketplace check (folders, manifests, expected sources, full-commit pins, tag against pin with a fake ls-remote) and of the plugin validation job |
 | `scripts/tests/test_probe_default_tier_load.py` | tests of the load probe, against a stubbed claude and git |
 
 ## Carve record

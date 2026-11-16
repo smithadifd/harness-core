@@ -162,7 +162,10 @@ jobs:
   # account, setting or plugin of the runner is read. Claude Code comes from npm
   # at one exact version, into a folder of this job; moving that version is a
   # change to this file. The runner's own node (22 or newer, which that version
-  # needs) is used and checked. Nothing here signs in or fetches a plugin.
+  # needs) is used and checked. Nothing here signs in or fetches a plugin. The
+  # one network step reads the tag refs of the two external repositories,
+  # read-only over HTTPS with no credential (git ls-remote), and refuses a tag
+  # that does not resolve to the commit the marketplace pins.
   plugin-validate:
     name: plugin validate (marketplace and harness plugin, strict)
     runs-on: ${{ fromJSON(vars.CORE_CI_RUNNER || '["ubuntu-latest"]') }}
@@ -172,6 +175,8 @@ jobs:
         uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - name: The external pins are the commits their tags name (--source)
+        run: python3 scripts/check-marketplace.py --source
       - name: The runner's node is 22 or newer
         run: |
           node -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 22 ? 0 : 1)'
