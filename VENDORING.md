@@ -66,6 +66,9 @@ the text itself.
 | `VENDORING.md` | this file |
 | `ledger-vendor.pin` | the vendored ledger's pin: repository, tag, commit and one blob id per file |
 | `plugins/harness/.claude-plugin/plugin.json` | the harness plugin's manifest: its version and the plugins it depends on |
+| `plugins/harness/files/harness-local.md` | the override starter: comments only, grants nothing |
+| `plugins/harness/files/harness.md` | the rules default placed by setup |
+| `plugins/harness/setup.py` | plan, apply and remove for the default-tier files and settings proposals |
 | `scripts/check-core-manifest.py` | checks that every tracked file is vendored or repository-only |
 | `scripts/check-ledger-vendor.py` | the vendored ledger's drift check |
 | `scripts/check-marketplace.py` | checks the marketplace and the harness plugin's manifest: folders, manifests, each external plugin bound to its expected source, full-commit pins, and, with the source option, each tag against its pin through the GitHub REST API, with no credential |
@@ -78,6 +81,7 @@ the text itself.
 | `scripts/tests/test_check_ledger_vendor.py` | tests of the ledger drift check |
 | `scripts/tests/test_check_no_person.py` | tests of the no-person check |
 | `scripts/tests/test_ci_workflow.py` | tests of the CI workflows' runners, triggers and gates, and that every gate script runs under an isolated python3 |
+| `scripts/tests/test_harness_setup.py` | fixture-home tests of the harness plan, apply and remove script |
 | `scripts/tests/test_marketplace_manifest.py` | tests of the marketplace check (folders, manifests, expected sources, full-commit pins, tag against pin with a fake API fetch and with urllib's opener over a local transport) and of the plugin validation job |
 | `scripts/tests/test_probe_default_tier_load.py` | tests of the load probe, against a stubbed claude and git |
 

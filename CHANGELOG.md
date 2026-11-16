@@ -5,6 +5,10 @@ and any pin move of the vendored ledger.
 
 ## Unreleased
 
+- `plugins/harness/setup.py`, the plan, apply and remove script for the
+  default-tier setup: places the rules default and the override starter,
+  proposes deny rules and the sandbox switch, records each addition, and
+  removes exactly what it recorded. Fixture-home tests cover it.
 - `scripts/probe-default-tier-load.sh`, a read-only probe of where a rules
   file, a general-purpose subagent, a compaction and plugin options reach a
   live session, with its test; no vendored file changed. The README says
