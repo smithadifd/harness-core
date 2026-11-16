@@ -26,6 +26,13 @@ RUNS_ON = "${{ fromJSON(vars.CORE_CI_RUNNER || '[\"ubuntu-latest\"]') }}"
 # literal of labels. Anything else is unparsed and fails.
 RUNS_ON_SHAPE = re.compile(r"\$\{\{ fromJSON\(vars\.CORE_CI_RUNNER \|\| '(\[[^']*\])'\) \}\}")
 HOSTED_DEFAULT = ["ubuntu-latest"]
+# The one named per-job exception to the hosted default. The pytest job falls
+# back to ubuntu-24.04, whose stat is GNU coreutils: the rails guard reads a
+# worktree's birth time to the nanosecond, and the uutils stat ubuntu-latest
+# ships prints whole seconds. Every other job keeps the hosted default, and
+# any other exception fails.
+RUNNER_EXCEPTIONS = {CI: {"pytest": ["ubuntu-24.04"]}}
+PYTEST_RUNS_ON = "${{ fromJSON(vars.CORE_CI_RUNNER || '[\"ubuntu-24.04\"]') }}"
 JOBS = ["pytest", "core-manifest", "no-person", "ledger-drift", "plugin-validate"]
 # Every workflow file and its jobs; a workflow file not listed here fails.
 WORKFLOWS = {CI: JOBS, IDENTITY: ["commit-identity"]}
@@ -155,15 +162,90 @@ def runner_default(expression: str) -> list[str]:
     return value
 
 
+def runs_on_for(labels: list[str]) -> str:
+    """The one runs-on expression whose fallback is labels."""
+    return "${{ fromJSON(vars.CORE_CI_RUNNER || '" + json.dumps(labels) + "') }}"
+
+
+def expected_labels(path: Path, name: str) -> list[str]:
+    return RUNNER_EXCEPTIONS.get(path, {}).get(name, HOSTED_DEFAULT)
+
+
+def runner_problems(path: Path, text: str) -> list[str]:
+    """Each job of the workflow whose runs-on is not the override with its
+    expected fallback (the hosted default, or its named exception), by name."""
+    problems = []
+    for name, job in jobs(text).items():
+        want = runs_on_for(expected_labels(path, name))
+        found = field(job, "runs-on")
+        if found != [want]:
+            problems.append(f"{path.name}: {name}: runs-on is {found!r}, not [{want!r}]")
+    return problems
+
+
 # J9: every job runs on the CORE_CI_RUNNER override, else a GitHub-hosted runner.
 
 def test_j9_every_job_runs_on_the_runner_variable_with_the_hosted_default():
     for path in workflow_files():
-        found = jobs(path.read_text(encoding="utf-8"))
+        text = path.read_text(encoding="utf-8")
+        found = jobs(text)
         assert sorted(found) == sorted(WORKFLOWS[path]), path.name
+        assert runner_problems(path, text) == []
         for name, job in found.items():
-            assert field(job, "runs-on") == [RUNS_ON], (path.name, name)
-            assert runner_default(field(job, "runs-on")[0]) == HOSTED_DEFAULT, (path.name, name)
+            assert runner_default(field(job, "runs-on")[0]) == expected_labels(path, name), (
+                path.name, name)
+
+
+def test_j9_the_one_runner_exception_is_the_pytest_job_on_ubuntu_24_04():
+    """pytest is the only job off the hosted default, and its runs-on keeps the
+    override grammar; every other job, in every workflow, is on the default."""
+    assert RUNNER_EXCEPTIONS == {CI: {"pytest": ["ubuntu-24.04"]}}
+    assert HOSTED_DEFAULT == ["ubuntu-latest"]
+    assert runs_on_for(["ubuntu-24.04"]) == PYTEST_RUNS_ON
+    assert runs_on_for(HOSTED_DEFAULT) == RUNS_ON
+    for path in workflow_files():
+        for name, job in jobs(path.read_text(encoding="utf-8")).items():
+            want = PYTEST_RUNS_ON if (path, name) == (CI, "pytest") else RUNS_ON
+            assert field(job, "runs-on") == [want], (path.name, name)
+
+
+DEFAULT_LINE = "    runs-on: " + RUNS_ON + "\n"
+PINNED_LINE = "    runs-on: " + PYTEST_RUNS_ON + "\n"
+RUNNER_NEAR_MISSES = [
+    ("core-manifest-pinned", CI, lambda t: nth(t, DEFAULT_LINE, PINNED_LINE, 1),
+     "ci.yml: core-manifest: runs-on is"),
+    ("no-person-pinned", CI, lambda t: nth(t, DEFAULT_LINE, PINNED_LINE, 2),
+     "ci.yml: no-person: runs-on is"),
+    ("ledger-drift-pinned", CI, lambda t: nth(t, DEFAULT_LINE, PINNED_LINE, 3),
+     "ci.yml: ledger-drift: runs-on is"),
+    ("plugin-validate-pinned", CI, lambda t: nth(t, DEFAULT_LINE, PINNED_LINE, 4),
+     "ci.yml: plugin-validate: runs-on is"),
+    ("commit-identity-pinned", IDENTITY, lambda t: t.replace(DEFAULT_LINE, PINNED_LINE),
+     "commit-identity.yml: commit-identity: runs-on is"),
+    ("pytest-no-override", CI,
+     lambda t: t.replace(PINNED_LINE, "    runs-on: ${{ fromJSON('[\"ubuntu-24.04\"]') }}\n"),
+     "ci.yml: pytest: runs-on is"),
+    ("pytest-other-variable", CI,
+     lambda t: t.replace(PINNED_LINE, PINNED_LINE.replace("vars.CORE_CI_RUNNER", "vars.OTHER_RUNNER")),
+     "ci.yml: pytest: runs-on is"),
+    ("pytest-bare-label", CI, lambda t: t.replace(PINNED_LINE, "    runs-on: ubuntu-24.04\n"),
+     "ci.yml: pytest: runs-on is"),
+    ("pytest-back-to-latest", CI, lambda t: t.replace(PINNED_LINE, DEFAULT_LINE),
+     "ci.yml: pytest: runs-on is"),
+    ("pytest-other-image", CI,
+     lambda t: t.replace(PINNED_LINE, PINNED_LINE.replace("ubuntu-24.04", "ubuntu-22.04")),
+     "ci.yml: pytest: runs-on is"),
+]
+
+
+@pytest.mark.parametrize("path,change,expected", [case[1:] for case in RUNNER_NEAR_MISSES],
+                         ids=[case[0] for case in RUNNER_NEAR_MISSES])
+def test_j9_a_runner_near_miss_is_refused_by_name(path, change, expected):
+    text = path.read_text(encoding="utf-8")
+    changed = change(text)
+    assert changed != text, "the change did something"
+    problems = runner_problems(path, changed)
+    assert [problem for problem in problems if problem.startswith(expected)] == problems != [], problems
 
 
 def test_j9_no_job_falls_back_to_a_self_hosted_runner():

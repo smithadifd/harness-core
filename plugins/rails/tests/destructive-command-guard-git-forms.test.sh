@@ -160,7 +160,9 @@ STUB
 # does not. It takes only the -c syntax and answers every field from the real
 # file (the owner, the whole mode, the identity and the size), so a registry
 # the host reports as group- or world-writable stays that way. STUB_STAT_UID
-# overrides only the reported owner.
+# overrides only the reported owner. STUB_STAT_WHOLE_SECONDS=1 answers the
+# birth time as uutils coreutils 0.10.0 does, in whole seconds with no
+# fraction.
 cat >"$STUBS/uutils/stat" <<'STUB'
 #!/bin/bash
 [ -z "${STUB_STAT_LOG:-}" ] || printf 'uutils %s\n' "$*" >>"$STUB_STAT_LOG"
@@ -175,8 +177,10 @@ case "$2" in
     while [ "${mode#0}" != "$mode" ]; do mode="${mode#0}"; done
     printf '%s %s\n' "${STUB_STAT_UID:-$owner}" "$mode" ;;
   "%d %i %.9W")
-    [ "$host_gnu" = 1 ] && exec /usr/bin/stat -c '%d %i %.9W' -- "$4"
-    exec /usr/bin/stat -f '%d %i %.9FB' -- "$4" ;;
+    if [ "$host_gnu" = 1 ]; then out="$(/usr/bin/stat -c '%d %i %.9W' -- "$4")" || exit 1
+    else out="$(/usr/bin/stat -f '%d %i %.9FB' -- "$4")" || exit 1; fi
+    [ "${STUB_STAT_WHOLE_SECONDS:-}" != 1 ] || out="${out%.*}"
+    printf '%s\n' "$out" ;;
   "%s")
     [ "$host_gnu" = 1 ] && exec /usr/bin/stat -c '%s' -- "$4"
     exec /usr/bin/stat -f '%z' -- "$4" ;;
@@ -504,6 +508,40 @@ run_case "uutils stat, trusted registry, owner is this user" accepted "$PRIMARY"
 run_uutils_registry "uutils stat, world-writable registry file" "$REG_BAD" lane_registry_untrusted
 run_uutils_registry "uutils stat, group-writable registry folder" "$REG_GW" lane_registry_untrusted
 run_uutils_registry "uutils stat, registry owned by another uid" "$REG" lane_registry_untrusted "$((REAL_UID + 1))"
+
+# A uutils stat that prints the birth time in whole seconds (0.10.0 does)
+# fails closed: a registered, unchanged tree whose recorded identity holds the
+# same whole-second birth time still denies, because the guard needs the
+# birth time to the nanosecond and has no whole-second fallback. The tree has
+# its own registry, so the identity rows above keep theirs.
+whole_second_token() { # WORKTREE -> its token, the birth time cut to whole seconds
+  local t rest birth
+  t="$(token "$1")" || return 1
+  rest="${t%:*}"; birth="${rest##*:}"
+  printf '%s:%s:%s' "${rest%:*}" "${birth%%.*}" "${t##*:}"
+}
+WT_D="$TMP/scratch/wt-d"
+REG_WS_DIR="$TMP/seat-ws/scratch"
+REG_WS="$REG_WS_DIR/lane-roots.tsv"
+git_q -C "$PRIMARY" worktree add -q --detach "$WT_D" HEAD || exit 1
+mkdir -p "$REG_WS_DIR"
+printf 'path\trepo\tbranch\tcreated_at\n%s\t%s\t%s\t%s\n' "$WT_D" "$PRIMARY" "(detached)" "2026-09-30T00:00:00Z" >"$REG_WS"
+plant_nonce "$WT_D" >/dev/null || exit 1
+WS_TOKEN="$(whole_second_token "$WT_D")" || exit 1
+case "$WS_TOKEN" in *:*:*:*.*:*) printf 'FAIL: the whole-second token kept a fraction: %s\n' "$WS_TOKEN"; exit 1 ;; esac
+printf 'lane-roots-ids/v1\tpath\tgeneration\tidentity\tseat\tregistered_at\n%s\t1\t%s\tseat-test\t2026-10-21T00:00:00Z\n' \
+  "$WT_D" "$WS_TOKEN" >"$REG_WS_DIR/lane-roots.ids.tsv"
+printf 'lane-prune-pending/v1\tpath\trepo\tgeneration\tidentity\texpires_at\n%s\t%s\t1\t%s\t%s\n' \
+  "$WT_D" "$PRIMARY" "$WS_TOKEN" "$(($(/bin/date +%s) + 3600))" >"$REG_WS_DIR/lane-prune-pending.tsv"
+chmod 600 "$REG_WS" "$REG_WS_DIR/lane-roots.ids.tsv" "$REG_WS_DIR/lane-prune-pending.tsv"; chmod 700 "$REG_WS_DIR"
+ws_out="$(cd "$TMP" && printf '%s' "$($JQ -cn --arg cwd "$PRIMARY" --arg command "git worktree remove $WT_D" '{cwd:$cwd,command:$command}')" \
+  | env STUB_STAT_WHOLE_SECONDS=1 LANE_ROOTS_REGISTRY="$REG_WS" HOME="$TMP/githome" /bin/bash --noprofile --norc -p "$GUARD_UUTILS" --policy 2>/dev/null)"
+ws_reason="$(printf '%s' "$ws_out" | "$JQ" -er 'select(.decision == "deny") | .reason' 2>/dev/null || printf invalid)"
+if [ "$ws_reason" = unsafe_worktree_remove ]; then
+  pass "uutils stat, whole-second birth time, registered unchanged tree -> deny/$ws_reason (fails closed)"
+else
+  fail "uutils stat, whole-second birth time, registered unchanged tree: expected deny/unsafe_worktree_remove, got ${ws_out:-no output}"
+fi
 
 printf '%s\n' '== stat is never resolved through PATH =='
 run_plant() { # LABEL EXPECT REGISTRY [plant] -> runs with the planted stat first on PATH when asked

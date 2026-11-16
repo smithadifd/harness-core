@@ -27,7 +27,13 @@ jobs:
   # plugin's guard suites run in a step of their own, under python3 -I.
   pytest:
     name: pytest (vendored and repository-only tests, stand-alone)
-    runs-on: ${{ fromJSON(vars.CORE_CI_RUNNER || '["ubuntu-latest"]') }}
+    # This job alone falls back to ubuntu-24.04, not ubuntu-latest. The rails
+    # guard reads a worktree's birth time to the nanosecond from GNU stat;
+    # ubuntu-latest ships the uutils coreutils stat (0.10.0), which prints
+    # whole seconds, so identity-checked removals deny there. CORE_CI_RUNNER
+    # still wins when it is set. The pin goes when DT-CP2-RAILS-UUTILS-IDENTITY1
+    # lands.
+    runs-on: ${{ fromJSON(vars.CORE_CI_RUNNER || '["ubuntu-24.04"]') }}
     timeout-minutes: 30
     steps:
       - name: Check out the repository
