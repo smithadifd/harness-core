@@ -322,7 +322,7 @@ def format_plan(home: Path, operator: str, harness: str | None) -> str:
 
 class Tree:
     def __init__(self, home: Path) -> None:
-        self.home = home
+        self.root = home
         self.fds: dict[str, int] = {}
         self.temps: set[str] = set()
         self.fds[""] = os.open(str(home), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
@@ -336,7 +336,7 @@ class Tree:
         self.fds.clear()
 
     def show(self, rel: str) -> str:
-        return str(self.home.joinpath(*rel.split("/"))) if rel else str(self.home)
+        return str(self.root.joinpath(*rel.split("/"))) if rel else str(self.root)
 
     def refuse_entry(self, parent: int, name: str, rel: str, exc: OSError) -> None:
         try:
@@ -864,7 +864,7 @@ def apply_locked(tree: Tree, lock: int, operator: str, harness: str | None,
     read_settings(tree)
 
     # Configure, then the settings bytes apply builds on.
-    configure_ledger(claude, ledger_values(tree.home, operator, harness), lock)
+    configure_ledger(claude, ledger_values(tree.root, operator, harness), lock)
     try:
         base = read_settings(tree)
     except SetupError as exc:
@@ -1181,7 +1181,7 @@ def remove_locked(tree: Tree) -> tuple[str, list[str]]:
 
     lines = [f"kept for a manual check: {item}" for item in kept]
     lines += [f"already gone: {item}" for item in gone]
-    lines.append(f"kept: ledger database at {database_path(tree.home)} (person's data)")
+    lines.append(f"kept: ledger database at {database_path(tree.root)} (person's data)")
     lines.append(f"removed: {tree.show(RECORD_REL)}")
     return "".join(line + "\n" for line in lines), warnings
 
@@ -1221,7 +1221,7 @@ def resolve_home(value: str) -> Path:
 
 def run(argv: list[str]) -> tuple[str, list[str]]:
     args = build_parser().parse_args(argv)
-    home = resolve_home(args.home)
+    home = resolve_home(vars(args)["home"])
     if args.verb == "remove":
         return remove_verb(home)
     if not args.operator:
