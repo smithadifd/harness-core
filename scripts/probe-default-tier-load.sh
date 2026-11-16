@@ -333,7 +333,7 @@ rand_hex() {
 # LEAK (the route was not the one under test; COUNT is more or fewer than one
 # Agent/Task call or result; NOBASH is, for B2, more or fewer than one Bash call
 # of the subagent itself, than one result for it, or a result not under the
-# Agent call, or a command that does not name the option; TOPBASH is any
+# Agent call, or a command that is not exactly the one the prompt gave it; TOPBASH is any
 # top-level tool call but the Agent call; LEAK is also the value in that
 # Bash command), NOBOUNDARY or LEAKSEED (the compaction was not
 # shown, or the sentinel was there before it), ROOT (the install folder the
@@ -617,8 +617,10 @@ if mode == "subagent":
         # the main thread could have read the value itself and passed it on; the
         # subagent's own Bash is what the line says saw it. So the Agent call must
         # have exactly one Bash call of its own (a tool_use whose parent_tool_use_id
-        # is the Agent call's id), the command must name HARNESS_PROBE_OPTION and not
-        # carry the value, and the call must have exactly one result of any kind:
+        # is the Agent call's id), the command must not carry the value and must equal,
+        # after stripping surrounding whitespace only, the command the prompt hands the
+        # subagent (the shell passes it from the same constant the prompt is built from),
+        # and the call must have exactly one result of any kind:
         # every tool_result for its id is counted whatever its parent and is_error,
         # and that one must be a non-error result whose own parent_tool_use_id is
         # the Agent call's id. The value is read from that result, never from the
@@ -642,10 +644,13 @@ if mode == "subagent":
                 "expected exactly one of each" % (len(nested), len(plain), len(every), len(shown)))
         given_input = nested[0].get("input")
         command = given_input.get("command") if isinstance(given_input, dict) else None
-        if not isinstance(command, str) or "HARNESS_PROBE_OPTION" not in command:
-            out("NOBASH", "the subagent's Bash command does not name HARNESS_PROBE_OPTION")
         if needle in json.dumps(given_input):
             out("LEAK", "the subagent's Bash command carried the value")
+        # A command that merely mentions the option can have read the value from a
+        # file; only the prompted command reads the environment variable.
+        if not isinstance(command, str) or command.strip(" \t\r\n") != extra[3]:
+            cut = command.strip(" \t\r\n")[:120] if isinstance(command, str) else "(no command)"
+            out("NOBASH", "the subagent's Bash command is not the command it was given: %s" % cut, limit=400)
         reply = block_text(shown[0].get("content"))
     if pattern in reply:
         out("FOUND", seen_option(reply), reply)
@@ -819,7 +824,12 @@ for text in sys.argv[1:]:
 
 # --- load B: a plugin option reaches a subagent's commands ---------------------
 P_B1='[probe B1] Run exactly this command with the Bash tool and reply with its output only: echo "PROBE_OPT=[${HARNESS_PROBE_OPTION}]"'
-P_B2='[probe B2] Use the Agent tool exactly once, with subagent_type "general-purpose" and run_in_background false, to start one foreground subagent and wait for its reply. Tell the subagent: "Run exactly this command with the Bash tool and reply with its output only: echo \"PROBE_OPT=[${HARNESS_PROBE_OPTION}]\"". Do not run Bash yourself. When the subagent replies, reply with exactly what it replied and nothing else.'
+# The one command B2 hands the subagent: the prompt below and the analyzer's command
+# check both read it from here, so they cannot drift. (B1 is a diagnostic that reads
+# only the reply, not the command, and keeps its own literal.)
+P_B2_CMD='echo "PROBE_OPT=[${HARNESS_PROBE_OPTION}]"'
+P_B2_CMD_QUOTED=${P_B2_CMD//\"/\\\"}
+P_B2="[probe B2] Use the Agent tool exactly once, with subagent_type \"general-purpose\" and run_in_background false, to start one foreground subagent and wait for its reply. Tell the subagent: \"Run exactly this command with the Bash tool and reply with its output only: ${P_B2_CMD_QUOTED}\". Do not run Bash yourself. When the subagent replies, reply with exactly what it replied and nothing else."
 
 # A local marketplace with one plugin: a user option carrying the sentinel, and
 # a SessionStart hook that appends an export line to the session's env file,
@@ -908,7 +918,7 @@ group_b() {
   if session "$base_path" -p "$P_B2" --model "$MODEL" --max-turns 6 --no-session-persistence \
       --output-format stream-json --verbose --permission-mode dontAsk \
       --allowedTools=Agent,Bash --tools=Agent,Bash; then
-    analyze subagent "$out_file" "$value" "PROBE_OPT=[$value]" nested-bash
+    analyze subagent "$out_file" "$value" "PROBE_OPT=[$value]" nested-bash "$P_B2_CMD"
     case "$a_code" in
       FOUND) emit PASS B2 "a general-purpose subagent's Bash saw HARNESS_PROBE_OPTION=$a_one (expected $value)" ;;
       MISSING) emit FAIL B2 "a general-purpose subagent's Bash saw HARNESS_PROBE_OPTION=[$a_one], expected [$value]; Bash output: $a_two" ;;

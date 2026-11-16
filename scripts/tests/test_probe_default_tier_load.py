@@ -546,9 +546,17 @@ def main():
         # give it another's (resforeign) or none (resnoparent).
         result_parent = {"resforeign": "toolu_8", "resnoparent": None}.get(mode, owner)
         if mode != "nobash":
+            exact = 'echo "PROBE_OPT=[${HARNESS_PROBE_OPTION}]"'
             command = {"cmdnoname": "echo inner",
-                       "cmdvalue": 'echo "HARNESS_PROBE_OPTION=%s"' % option_value()}.get(
-                mode, 'echo "PROBE_OPT=[${HARNESS_PROBE_OPTION}]"')
+                       "cmdvalue": 'echo "HARNESS_PROBE_OPTION=%s"' % option_value(),
+                       # Sol's forgery: the value read from a file, the option's name only
+                       # in a no-op at the end.
+                       "cmdforge": 'echo "PROBE_OPT=[$(cat /etc/probe-option.conf)]" ; : HARNESS_PROBE_OPTION',
+                       "cmdbashc": "bash -c '%s'" % exact,
+                       "cmdcd": "cd /tmp && " + exact,
+                       "cmdtrue": exact + "; true",
+                       "cmdlong": "echo " + "a" * 300 + " HARNESS_PROBE_OPTION",
+                       "cmdspace": "\n  " + exact + " \t\n"}.get(mode, exact)
             tool_use("Bash", {"command": command}, "toolu_3", parent=owner)
             if mode == "twobash":
                 tool_use("Bash", {"command": "echo again"}, "toolu_6", parent=owner)
@@ -1806,14 +1814,48 @@ def test_b2_is_unverified_unless_the_agent_call_has_exactly_one_nested_bash_call
     assert result.rc == 2
 
 
-def test_b2_is_unverified_when_the_nested_bash_command_does_not_name_the_option(world):
-    # A command that never names HARNESS_PROBE_OPTION does not show the subagent's Bash reading
-    # the option. Mutation F17-l (drop the command-names check).
-    result = world.run("--only", "B", scenario={"B2": "cmdnoname"})
+# B2 takes the value only from the exact command the prompt hands the subagent. The old check
+# (the command names HARNESS_PROBE_OPTION) is dropped: it is a subset of the exact match.
+@pytest.mark.parametrize("mode", [
+    # Sol's forgery: the value read from a config file, then `: HARNESS_PROBE_OPTION`. Mutation
+    # R4-a (revert to the contains check).
+    pytest.param("cmdforge", id="config-file-read-plus-named-option"),
+    pytest.param("cmdbashc", id="bash-c-wrapper"),
+    pytest.param("cmdcd", id="cd-prefix"),
+    pytest.param("cmdtrue", id="true-suffix"),
+    pytest.param("cmdnoname", id="command-that-never-names-the-option"),
+])
+def test_b2_is_unverified_unless_the_nested_bash_command_is_exactly_the_prompted_one(world, mode):
+    result = world.run("--only", "B", scenario={"B2": mode})
     assert result.status("B2") == "UNVERIFIED", result.out
-    assert "does not name HARNESS_PROBE_OPTION" in result.evidence("B2")
+    assert "the subagent's Bash command is not the command it was given" in result.evidence("B2")
+    assert "the output of a subagent's own Bash is not shown" in result.evidence("B2")
     assert "saw HARNESS_PROBE_OPTION" not in result.evidence("B2")
     assert result.rc == 2
+
+
+def test_b2_passes_on_the_exact_prompted_command_even_with_whitespace_around_it(world):
+    # Only surrounding whitespace is stripped. Mutation R4-b (compare without stripping).
+    result = world.run("--only", "B", scenario={"B2": "cmdspace"})
+    assert result.status("B2") == "PASS", result.out
+    assert result.rc == 0
+
+
+def test_b2_shows_the_refused_command_cut_to_120_characters(world):
+    result = world.run("--only", "B", scenario={"B2": "cmdlong"})
+    assert result.status("B2") == "UNVERIFIED", result.out
+    evidence = result.evidence("B2")
+    assert "command it was given: echo " + "a" * 115 + "," in evidence
+    assert "a" * 116 not in evidence
+
+
+def test_the_b2_prompt_hands_the_subagent_the_command_the_check_requires(world):
+    # The prompt and the check read one constant. The stub's exact command is the one the
+    # PASS cases use, so a prompt that drifts from it is caught here. Mutation R4-c (change
+    # the prompt's command only).
+    argv = world.run("--only", "B").tagged("B2")[0]["argv"]
+    prompt = argv[argv.index("-p") + 1]
+    assert 'reply with its output only: echo \\"PROBE_OPT=[${HARNESS_PROBE_OPTION}]\\"". Do not run Bash' in prompt
 
 
 def test_b2_is_unverified_when_the_value_is_in_the_nested_bash_commands_own_input(world):
