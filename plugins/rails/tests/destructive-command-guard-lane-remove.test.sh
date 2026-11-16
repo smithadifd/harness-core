@@ -555,7 +555,7 @@ stubcase "G5 control: the same tree with a real birth time is accepted" accepted
 # a verbatim copy of these identity lines. Both pin the SHA-256 of the same
 # lines; changing them here fails this check until the pin, and the
 # launcher's copy and pin, are refreshed.
-PAIRED_IDENTITY_SHA256="605389beb13782cf6eb7aa42eaa2c7aea26a2b7871a241f915ab871cddba89df"
+PAIRED_IDENTITY_SHA256="4c144231d2a11f66c4e532b1bc565848d60e0b93ec0b470196f63f60d67d7658"
 got_digest="$(python3 -I -c "$IDENTITY_LINES_PY" "$GUARD_WITH_TEMP_ROOTS" digest)" || got_digest="(no digest)"
 if [ "$got_digest" = "$PAIRED_IDENTITY_SHA256" ]; then
   pass "G9 the guard's identity lines match the digest the launcher's copy pins"
