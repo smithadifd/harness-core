@@ -58,6 +58,7 @@ the text itself.
 | `.github/workflows/commit-identity.yml` | CI: the commit identity check on every pull request |
 | `.gitignore` | keeps the bytecode Python writes out of the tree |
 | `CHANGELOG.md` | the changes of each tag |
+| `KNOWN-LIMITS.md` | limits that are known and out of scope for the current stage, one per line |
 | `LICENSE` | the license: MIT, the same as the vendored ledger's |
 | `README.md` | what this repository is and how it is vendored |
 | `SECURITY.md` | how to report a vulnerability |
@@ -69,10 +70,12 @@ the text itself.
 | `scripts/ci/check-commit-identity.sh` | the commit identity check the workflow runs |
 | `scripts/ledger-vendor-bump.py` | moves the vendored ledger to a new tag |
 | `scripts/no-person-allowance.tsv` | the deny-list matches allowed in place, by path and hash |
+| `scripts/probe-default-tier-load.sh` | the read-only probe of where the default tier's rules file and plugin options reach a session |
 | `scripts/tests/test_check_core_manifest.py` | tests of the manifest check |
 | `scripts/tests/test_check_ledger_vendor.py` | tests of the ledger drift check |
 | `scripts/tests/test_check_no_person.py` | tests of the no-person check |
 | `scripts/tests/test_ci_workflow.py` | tests of the CI workflows' runners, triggers and gates |
+| `scripts/tests/test_probe_default_tier_load.py` | tests of the load probe, against a stubbed claude and git |
 
 ## Carve record
 

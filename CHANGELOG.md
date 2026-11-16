@@ -5,6 +5,14 @@ and any pin move of the vendored ledger.
 
 ## Unreleased
 
+- `scripts/probe-default-tier-load.sh`, a read-only probe of where a rules
+  file, a general-purpose subagent, a compaction and plugin options reach a
+  live session, with its test; no vendored file changed. The README says
+  how to run it. Load B's verdict reads the value from the subagent's own
+  Bash result, and load C's ledger-call log is created before the first
+  manifest and compared like any other file.
+- `KNOWN-LIMITS.md`, a list of known limits that are out of scope for the
+  current stage, one per line.
 - Alpha preparation, no vendored file changed: an MIT `LICENSE` at the root,
   the same license as the vendored ledger; the no-person check exempts
   exactly the MIT copyright line of that file from its deny list and nothing
