@@ -621,6 +621,168 @@ def test_git_runs_with_no_shell_a_fixed_argv_that_ends_its_options_and_no_prompt
     assert kwargs["env"]["GIT_TERMINAL_PROMPT"] == "0"
 
 
+# git runs from a fresh folder outside any repository, with an environment built from scratch.
+
+# What a runner or a person could have set, each of which rewrites a repository url or points git elsewhere.
+PARENT_GIT_VARIABLES = {
+    "GIT_CONFIG_COUNT": "1",
+    "GIT_CONFIG_KEY_0": "url.https://example.test/substitute/.insteadOf",
+    "GIT_CONFIG_VALUE_0": "https://example.test/real/",
+    "GIT_CONFIG_PARAMETERS": "'url.https://example.test/substitute/.insteadof=https://example.test/real/'",
+    "GIT_DIR": "/nonexistent-git-dir",
+}
+THE_THREE = {
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_GLOBAL": os.devnull,
+    "GIT_TERMINAL_PROMPT": "0",
+}
+
+
+def above_holds_git(folder: Path) -> bool:
+    return any((parent / ".git").exists() for parent in (folder, *folder.parents))
+
+
+class RunSpy:
+    """Stands in for subprocess.run: records what git would have been given and
+    looks at the two temporary folders while they still exist."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def __call__(self, *args, **kwargs):
+        self.calls += 1
+        self.given_cwd = kwargs.get("cwd")
+        self.cwd = Path(self.given_cwd if self.given_cwd is not None else os.getcwd())
+        self.env = kwargs.get("env")
+        self.cwd_existed = self.cwd.is_dir()
+        self.cwd_entries = sorted(os.listdir(self.cwd)) if self.cwd_existed else None
+        self.cwd_under_a_repository = above_holds_git(self.cwd.resolve())
+        home = Path(self.env["HOME"]) if self.env and "HOME" in self.env else None
+        self.child_home = home
+        self.child_home_existed = home is not None and home.is_dir()
+        self.child_home_entries = sorted(os.listdir(home)) if self.child_home_existed else None
+        return FakeDone()
+
+
+def spy_on_git(monkeypatch) -> RunSpy:
+    spy = RunSpy()
+    monkeypatch.setattr(cm.subprocess, "run", spy)
+    return spy
+
+
+def test_git_runs_in_a_fresh_folder_that_is_not_the_checkout_and_holds_no_repository(monkeypatch):
+    monkeypatch.chdir(ROOT)
+    spy = spy_on_git(monkeypatch)
+    assert cm.git_ls_remote("https://example.test/a.git", "v1.0.0") == (0, "")
+    assert spy.calls == 1
+    assert spy.cwd.resolve() != ROOT, "git ran in the checkout"
+    assert ROOT not in spy.cwd.resolve().parents, "git ran inside the checkout"
+    assert spy.cwd_existed, "git was given a folder that exists"
+    assert spy.cwd_entries == [], "the folder is fresh and empty (no .git, no file)"
+    assert not spy.cwd_under_a_repository, "no folder above it holds a .git"
+    assert not spy.cwd.exists(), "the folder is removed afterwards"
+
+
+def test_the_child_environment_is_built_from_scratch_with_no_other_git_variable(monkeypatch):
+    for key, value in PARENT_GIT_VARIABLES.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("GIT_EXEC_PATH", "/nonexistent-exec-path")
+    monkeypatch.setenv("RUNNER_SECRET_TOKEN", "not-for-git")
+    spy = spy_on_git(monkeypatch)
+    assert cm.git_ls_remote("https://example.test/a.git", "v1.0.0") == (0, "")
+    assert sorted(spy.env) == sorted(["PATH", "HOME", *THE_THREE]), "the child holds exactly these variables"
+    assert {key: value for key, value in spy.env.items() if key.startswith("GIT_")} == THE_THREE
+    assert spy.env["PATH"] == os.environ["PATH"], "PATH comes from the parent"
+
+
+def test_the_child_home_is_a_fresh_empty_folder_that_is_not_the_parents(tmp_path, monkeypatch):
+    parent_home = tmp_path / "parent-home"
+    parent_home.mkdir()
+    (parent_home / ".gitconfig").write_text("[url \"https://example.test/substitute/\"]\n"
+                                            "\tinsteadOf = https://example.test/real/\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(parent_home))
+    spy = spy_on_git(monkeypatch)
+    assert cm.git_ls_remote("https://example.test/a.git", "v1.0.0") == (0, "")
+    assert spy.env["HOME"] != str(parent_home), "HOME is not the parent's"
+    assert parent_home not in spy.child_home.parents
+    assert spy.child_home != spy.cwd, "HOME and the working folder are two folders"
+    assert spy.child_home_existed, "HOME is a folder that exists"
+    assert spy.child_home_entries == [], "HOME is empty"
+    assert not spy.child_home.exists(), "HOME is removed afterwards"
+
+
+def test_a_temporary_folder_inside_a_repository_is_refused_before_any_subprocess(tmp_path, monkeypatch):
+    inside = tmp_path / "checkout"
+    (inside / ".git").mkdir(parents=True)
+    (inside / "scratch").mkdir()
+    monkeypatch.setattr(cm.tempfile, "tempdir", str(inside / "scratch"))
+    forbid_subprocess(monkeypatch)
+    assert cm.git_ls_remote("https://example.test/a.git", "v1.0.0") == (255, "")
+    assert sorted(os.listdir(inside / "scratch")) == [], "both temporary folders are removed"
+
+
+def clean_git_env() -> dict:
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
+    return env
+
+
+def make_remote(path: Path, content: str) -> str:
+    """A repository at path with one commit tagged v1.0.0; its commit id."""
+    path.mkdir()
+    git(path, "init", "-q")
+    (path / "a").write_text(content, encoding="utf-8")
+    git(path, "add", "a")
+    git(path, "commit", "-q", "-m", content)
+    git(path, "tag", "v1.0.0")
+    return git(path, "rev-parse", "HEAD")
+
+
+def real_ls_remote_commit(url: str, cwd: Path, env: dict) -> str:
+    done = subprocess.run(["git", "ls-remote", "--tags", "--", url, "refs/tags/v1.0.0"],
+                          cwd=cwd, env=env, check=True, capture_output=True, text=True)
+    return done.stdout.split("\t")[0]
+
+
+def test_the_real_git_ignores_a_url_rewrite_the_parent_environment_sets(tmp_path, monkeypatch):
+    real = tmp_path / "real"
+    substitute = tmp_path / "substitute"
+    real_commit = make_remote(real, "real")
+    substitute_commit = make_remote(substitute, "substitute")
+    assert real_commit != substitute_commit
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    monkeypatch.chdir(plain)
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", f"url.{substitute}.insteadOf")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", str(real))
+    control = real_ls_remote_commit(str(real), plain, dict(os.environ, **THE_THREE))
+    assert control == substitute_commit, "the rewrite is live for a git that inherits it"
+    code, output = cm.run_ls_remote(str(real), "v1.0.0")
+    assert code == 0
+    assert cm.resolve_tag(output, "v1.0.0") == (real_commit, None), "the tag of the repository asked for"
+
+
+def test_the_real_git_ignores_a_url_rewrite_in_the_checkout_it_is_started_from(tmp_path, monkeypatch):
+    real = tmp_path / "real"
+    substitute = tmp_path / "substitute"
+    real_commit = make_remote(real, "real")
+    substitute_commit = make_remote(substitute, "substitute")
+    assert real_commit != substitute_commit
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    git(checkout, "init", "-q")
+    git(checkout, "config", f"url.{substitute}.insteadOf", str(real))
+    for key in [key for key in os.environ if key.startswith("GIT_")]:
+        monkeypatch.delenv(key)
+    monkeypatch.chdir(checkout)
+    control = real_ls_remote_commit(str(real), checkout, clean_git_env())
+    assert control == substitute_commit, "the rewrite is live for a git started in the checkout"
+    code, output = cm.run_ls_remote(str(real), "v1.0.0")
+    assert code == 0
+    assert cm.resolve_tag(output, "v1.0.0") == (real_commit, None), "the tag of the repository asked for"
+
+
 def test_source_mode_refusals_fail_the_run_and_are_printed(monkeypatch, capsys):
     refusal = "plugin sdlc: tag v1.3.0 is not in the source repository"
     monkeypatch.setattr(cm, "source_problems", lambda root: [refusal])

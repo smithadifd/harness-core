@@ -59,9 +59,15 @@ own commit. The commit must equal ``sha`` exactly. A tag that is not there, a
 other commit are each a refusal, never a pass. An entry that failed an offline check is not resolved at all
 and is reported as such. A url that starts with ``-``, holds whitespace or does
 not start with ``https://`` is refused before any subprocess. git runs with no
-shell, a fixed argv that ends its options with ``--`` before the url, and
-``GIT_TERMINAL_PROMPT=0``. CI runs it in the ``plugin-validate`` job of ci.yml,
-with no credential and none of the runner's git configuration.
+shell and a fixed argv that ends its options with ``--`` before the url. It
+runs from a fresh temporary folder that is not inside any repository (so no
+repository-local git configuration applies), with a child environment built
+from scratch: PATH from the parent, HOME a fresh empty temporary folder,
+``GIT_CONFIG_NOSYSTEM=1``, ``GIT_CONFIG_GLOBAL=/dev/null``,
+``GIT_TERMINAL_PROMPT=0``, and no other variable, so no inherited ``GIT_*``
+variable (``GIT_CONFIG_COUNT``, ``GIT_CONFIG_PARAMETERS``, ``GIT_DIR`` and the
+rest) can rewrite a repository url. Both folders are removed afterwards. CI runs
+it in the ``plugin-validate`` job of ci.yml, with no credential.
 
 Exit 0 clean; 1 on any refusal, one line per refusal; 2 on usage.
 """
@@ -73,6 +79,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Callable
 
@@ -298,18 +305,46 @@ def url_refusal(url) -> str | None:
     return None
 
 
+def child_env(home: str) -> dict[str, str]:
+    """The environment of the git child, built from scratch: PATH from the parent,
+    the fresh empty HOME, the three git settings, and nothing else (no other
+    GIT_* variable, no credential, nothing the runner set)."""
+    env = {
+        "HOME": home,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+    if "PATH" in os.environ:
+        env["PATH"] = os.environ["PATH"]
+    return env
+
+
+def inside_a_repository(folder: Path) -> bool:
+    """True when the folder or any folder above it holds a .git entry."""
+    return any((parent / ".git").exists() for parent in (folder, *folder.parents))
+
+
 def run_ls_remote(url: str, tag: str) -> tuple[int, str]:
     """``git ls-remote`` on the tag ref and its peeled form: (exit code, stdout).
-    No shell, a fixed argv whose options end at ``--`` before the repository,
-    no terminal prompt. A git that cannot run or times out is a non-zero code,
-    never a pass. Callers give it a url that ``url_refusal`` has passed."""
-    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
+    No shell, a fixed argv whose options end at ``--`` before the repository, no
+    terminal prompt. git runs from a fresh temporary folder that is not inside
+    any repository, with a child environment built from scratch (``child_env``),
+    so neither a repository-local git configuration nor an inherited GIT_*
+    variable can rewrite the url; both temporary folders are removed afterwards.
+    A git that cannot run, times out, or has no folder outside a repository to run
+    from is a non-zero code, never a pass. Callers give it a url that
+    ``url_refusal`` has passed."""
     try:
-        done = subprocess.run(
-            ["git", "ls-remote", "--tags", "--", url, f"refs/tags/{tag}", f"refs/tags/{tag}^{{}}"],
-            shell=False, stdin=subprocess.DEVNULL, capture_output=True, env=env, check=False,
-            timeout=LS_REMOTE_SECONDS,
-        )
+        with tempfile.TemporaryDirectory(prefix="marketplace-cwd.", ignore_cleanup_errors=True) as cwd, \
+                tempfile.TemporaryDirectory(prefix="marketplace-home.", ignore_cleanup_errors=True) as home:
+            if inside_a_repository(Path(cwd).resolve()):
+                return 255, ""
+            done = subprocess.run(
+                ["git", "ls-remote", "--tags", "--", url, f"refs/tags/{tag}", f"refs/tags/{tag}^{{}}"],
+                shell=False, stdin=subprocess.DEVNULL, capture_output=True, cwd=cwd, env=child_env(home),
+                check=False, timeout=LS_REMOTE_SECONDS,
+            )
     except (OSError, subprocess.SubprocessError):
         return 255, ""
     return done.returncode, done.stdout.decode("utf-8", "replace")
