@@ -224,13 +224,16 @@ guard, a `PreToolUse` hook on every Bash call.
 - **What it denies.** An explicit `rm` whose targets are not literal paths
   strictly below the current worktree (or a session scratchpad): `/`, `.`,
   home-folder spellings, `..`, `.git` paths, symlinks, globs, variables,
-  substitutions, `xargs`-fed targets, a plain `rm` with no option, and an
-  `rm -r` beside a `cd`, `mv`, `ln` or subshell on the same line. A
+  substitutions, `xargs`-fed targets, a plain `rm` with no option, an `rm`
+  that carries a redirection, and an `rm` beside a `cd`, `mv`, `ln` or
+  subshell on the same line. A
   `git worktree remove` with `--force`, or of a tree that no registry or
   authorization accepts; a linked tree below a temp folder is accepted. An
   output redirection into an existing path reached through a symlink. It
   looks through `sudo`, `env`, `bash -c`, `eval`, `find -exec` and similar
-  wrappers, to a depth of six.
+  wrappers, to a depth of six, and past redirections, control words (`if`,
+  `then`, `do`, `else`), groups, subshells, case arms, function bodies and
+  process substitutions, recursive `rm` or not.
 - **Deny only.** It never allows and never asks. For a command it judged and
   accepted, or one it has no opinion on, it exits 0 with no output, and
   Claude Code's own permission flow decides as it would without the plugin.

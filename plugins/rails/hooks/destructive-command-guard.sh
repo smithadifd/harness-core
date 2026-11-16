@@ -657,7 +657,7 @@ collect_heredocs() {
 }
 
 split_command_segments() {
-  local input="$1" length i=0 j k ch next state="plain" segment="" header="" line delimiter
+  local input="$1" length i=0 j k ch next state="plain" segment="" header="" line delimiter redirect_open=0 redirect_before=0
   SEGMENTS=()
   SEGMENT_DELIMITERS=()
   length=${#input}
@@ -694,6 +694,9 @@ split_command_segments() {
         fi
         ;;
       plain)
+        # redirect_open is 1 right after an unquoted, unescaped < or >.
+        redirect_before="$redirect_open"
+        redirect_open=0
         case "$ch" in
           '$')
             if [ "$next" = '(' ]; then
@@ -720,11 +723,22 @@ split_command_segments() {
             ;;
           ';') header="$header$segment;"; SEGMENT_DELIMITERS[${#SEGMENTS[@]}]=';'; SEGMENTS[${#SEGMENTS[@]}]="$segment"; segment=""; i=$((i + 1)) ;;
           '&')
+            if [ "$redirect_before" -eq 1 ] || [ "$next" = '>' ]; then
+              # `>&N`, `<&N`, `&>FILE` and `&>>FILE` are redirection
+              # operators, not a separator: the command they decorate goes on.
+              segment="$segment$ch"; i=$((i + 1))
+              continue
+            fi
             if [ "$next" = '&' ]; then header="$header$segment&&"; SEGMENT_DELIMITERS[${#SEGMENTS[@]}]='&&'; i=$((i + 2)); else header="$header$segment&"; SEGMENT_DELIMITERS[${#SEGMENTS[@]}]='&'; i=$((i + 1)); fi
             SEGMENTS[${#SEGMENTS[@]}]="$segment"
             segment=""
             ;;
           '|')
+            if [ "$redirect_before" -eq 1 ]; then
+              # `>|` is one redirection operator, not a pipe.
+              segment="$segment$ch"; i=$((i + 1))
+              continue
+            fi
             if [ "$next" = '|' ]; then header="$header$segment||"; SEGMENT_DELIMITERS[${#SEGMENTS[@]}]='||'; i=$((i + 2)); else header="$header$segment|"; SEGMENT_DELIMITERS[${#SEGMENTS[@]}]='|'; i=$((i + 1)); fi
             SEGMENTS[${#SEGMENTS[@]}]="$segment"
             segment=""
@@ -751,7 +765,10 @@ split_command_segments() {
               k=$((k + 1))
             done
             ;;
-          *) segment="$segment$ch"; i=$((i + 1)) ;;
+          *)
+            segment="$segment$ch"; i=$((i + 1))
+            case "$ch" in '<'|'>') redirect_open=1 ;; esac
+            ;;
         esac
         ;;
     esac
@@ -765,6 +782,174 @@ trim_horizontal() {
     TRIMMED="${TRIMMED# }"
     TRIMMED="${TRIMMED#$'\t'}"
   done
+}
+
+# Redirections are not words of the command they decorate. Bash performs a
+# redirection wherever it stands in a simple command, before, between or
+# after the words, so `2>/dev/null rm -rf /`, `FOO=1 2>/dev/null rm -rf /`
+# and `sudo 2>/dev/null rm -rf /` all run rm. Every check that finds a
+# command word (the rm scan, the worktree-removal patterns, the repointing
+# classes and the delegated-text walk) reads this copy of the segment: each
+# unquoted redirection operator (an optional descriptor number or {name},
+# then <, >, >>, >|, <>, <<, <<-, <<<, <&, >&, &> or &>>) is removed with its
+# target word. A process substitution, <(...) or >(...), is a word and stays.
+# The copy only finds the command: the rm and worktree validators still parse
+# the untouched segment, where a redirection is outside their grammar, so a
+# judged command that carries one denies. A redirection whose target cannot
+# be read (none follows, or its quote or substitution never closes) is
+# outside the grammar and denies unsupported_syntax. Text with a quote that
+# never closes before any redirection is copied unchanged from there on, as
+# the scanners after this one read it today. Sets REDIR_STRIPPED (trimmed)
+# and REDIR_FOUND (1 when an operator was removed).
+REDIR_STRIPPED=""
+REDIR_FOUND=0
+redirect_skip_token() { # STR INDEX: SKIP_END past the quote or $-form at INDEX
+  local s="$1" i="$2" n="${#1}" end
+  case "${s:i:1}" in
+    \')
+      end=$((i + 1))
+      while [ "$end" -lt "$n" ] && [ "${s:end:1}" != "'" ]; do end=$((end + 1)); done
+      [ "$end" -lt "$n" ] || return 1
+      SKIP_END=$((end + 1)) ;;
+    \") skip_dquote "$s" $((i + 1)) || return 1 ;;
+    \`) skip_backtick "$s" $((i + 1)) || return 1 ;;
+    '$')
+      case "${s:i+1:1}" in
+        '(') skip_paren "$s" $((i + 2)) || return 1 ;;
+        '{') skip_brace "$s" $((i + 2)) || return 1 ;;
+        '"') skip_dquote "$s" $((i + 2)) || return 1 ;;
+        "'")
+          end=$((i + 2))
+          while [ "$end" -lt "$n" ] && [ "${s:end:1}" != "'" ]; do
+            [ "${s:end:1}" != "\\" ] || end=$((end + 1))
+            end=$((end + 1))
+          done
+          [ "$end" -lt "$n" ] || return 1
+          SKIP_END=$((end + 1)) ;;
+        *) SKIP_END=$((i + 1)) ;;
+      esac ;;
+    *) return 1 ;;
+  esac
+}
+redirect_target_end() { # STR INDEX: SKIP_END past the target word at INDEX
+  local s="$1" i="$2" n="${#1}" c
+  while [ "$i" -lt "$n" ]; do
+    c="${s:i:1}"
+    case "$c" in
+      ' '|$'\t'|$'\n'|';'|'|'|'&') break ;;
+      \\) i=$((i + 2)) ;;
+      \'|\"|\`|'$') redirect_skip_token "$s" "$i" || return 1; i="$SKIP_END" ;;
+      '<'|'>')
+        [ "${s:i+1:1}" = '(' ] || break
+        skip_paren "$s" $((i + 2)) || return 1
+        i="$SKIP_END" ;;
+      *) i=$((i + 1)) ;;
+    esac
+  done
+  [ "$i" -le "$n" ] || i="$n"
+  SKIP_END="$i"
+}
+strip_command_redirections() {
+  local s="$1" n="${#1}" i=0 c next out="" word="" op_len start
+  REDIR_FOUND=0
+  case "$s" in
+    *'<'*|*'>'*) ;;
+    *) trim_horizontal "$s"; REDIR_STRIPPED="$TRIMMED"; return 0 ;;
+  esac
+  while [ "$i" -lt "$n" ]; do
+    c="${s:i:1}"
+    next="${s:i+1:1}"
+    case "$c" in
+      ' '|$'\t'|$'\n')
+        out="$out$c"; word=""; i=$((i + 1)); continue ;;
+      \\)
+        out="$out${s:i:2}"; word="$word${s:i:2}"; i=$((i + 2)); continue ;;
+      \'|\"|\`|'$')
+        if ! redirect_skip_token "$s" "$i"; then out="$out${s:i}"; break; fi
+        out="$out${s:i:SKIP_END-i}"; word="$word${s:i:SKIP_END-i}"; i="$SKIP_END"; continue ;;
+      '<'|'>')
+        if [ "$next" = '(' ]; then
+          if ! skip_paren "$s" $((i + 2)); then out="$out${s:i}"; break; fi
+          out="$out${s:i:SKIP_END-i}"; word="$word${s:i:SKIP_END-i}"; i="$SKIP_END"; continue
+        fi ;;
+      '&')
+        if [ "$next" != '>' ]; then out="$out$c"; word="$word$c"; i=$((i + 1)); continue; fi ;;
+      *)
+        out="$out$c"; word="$word$c"; i=$((i + 1)); continue ;;
+    esac
+    # A redirection operator starts at i.
+    case "${s:i:3}" in
+      '<<<'|'<<-'|'&>>') op_len=3 ;;
+      *)
+        case "${s:i:2}" in
+          '<<'|'<>'|'<&'|'>>'|'>|'|'>&'|'&>') op_len=2 ;;
+          *) op_len=1 ;;
+        esac ;;
+    esac
+    # A descriptor number or {name} written right before the operator belongs
+    # to it; any other text there is a word of its own that the operator ends.
+    if [[ "$word" =~ ^([0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})$ ]]; then
+      out="${out:0:${#out}-${#word}}"
+    fi
+    i=$((i + op_len))
+    while [ "${s:i:1}" = ' ' ] || [ "${s:i:1}" = $'\t' ]; do i=$((i + 1)); done
+    start="$i"
+    redirect_target_end "$s" "$i" || policy_deny unsupported_syntax
+    [ "$SKIP_END" -gt "$start" ] || policy_deny unsupported_syntax
+    i="$SKIP_END"
+    out="$out "
+    word=""
+    REDIR_FOUND=1
+  done
+  trim_horizontal "$out"
+  REDIR_STRIPPED="$TRIMMED"
+}
+
+# Control words and grouping openers are not command words: the command after
+# them still runs. Sets CONTROL_STRIPPED to the trimmed segment with every
+# leading opener removed: then, do, else, if, elif, while, until, coproc
+# (with the name of a named coprocess), time (with its -p), ! and { (each
+# followed by a blank), (, a case statement's head up to its first pattern, a
+# case arm's pattern (a first word that ends in an unquoted ")" and opens no
+# parenthesis, with a command after it), and a function definition's head
+# (NAME(), NAME (), function NAME).
+CONTROL_STRIPPED=""
+FUNCTION_HEAD_RE='^function[[:blank:]]+[^[:blank:](){}]+([[:blank:]]*\(\))?'
+NAME_PARENS_RE='^[A-Za-z_][A-Za-z0-9_.:-]*[[:blank:]]*\(\)'
+COPROC_NAME_RE='^[A-Za-z_][A-Za-z0-9_]*[[:blank:]]+[({]'
+strip_control_openers() {
+  local segment="$1" previous_segment="" keyword
+  trim_horizontal "$segment"; segment="$TRIMMED"
+  while [ -n "$segment" ] && [ "$segment" != "$previous_segment" ]; do
+    previous_segment="$segment"
+    for keyword in then do else if elif while until time coproc '!' '{'; do
+      case "$segment" in
+        "$keyword"[[:blank:]]*)
+          segment="${segment#"$keyword"}"
+          trim_horizontal "$segment"; segment="$TRIMMED"
+          case "$keyword:$segment" in
+            time:-p[[:blank:]]*) segment="${segment#-p}" ;;
+            coproc:*) if [[ "$segment" =~ $COPROC_NAME_RE ]]; then segment="${segment#*[[:blank:]]}"; fi ;;
+          esac
+          break ;;
+      esac
+    done
+    if [ "$segment" = "$previous_segment" ]; then
+      case "$segment" in
+        '('*) segment="${segment#?}" ;;
+        case\ *' in '*') '*) segment="${segment#*) }" ;;
+        *)
+          if [[ "$segment" =~ $FUNCTION_HEAD_RE ]] || [[ "$segment" =~ $NAME_PARENS_RE ]]; then
+            segment="${segment:${#BASH_REMATCH[0]}}"
+          elif split_shell_words "$segment" && [ "${#SPLIT_RAW[@]}" -gt 1 ] \
+            && [[ "${SPLIT_RAW[0]}" == *')' ]] && [[ "${SPLIT_RAW[0]}" != *'('* ]]; then
+            segment="${segment#"${SPLIT_RAW[0]}"}"
+          fi ;;
+      esac
+    fi
+    trim_horizontal "$segment"; segment="$TRIMMED"
+  done
+  CONTROL_STRIPPED="$segment"
 }
 
 SCAN_WORDS=()
@@ -963,15 +1148,21 @@ rm_is_recursive_after() {
 
 KNOWN_RM=0
 HAS_RECURSIVE_RM=0
-XARGS_RECURSIVE_RM=0
+XARGS_RM=0
 UNSUPPORTED_RM_PREFIX=0
+# The words are read with the segment's redirections removed
+# (strip_command_redirections), so a redirection before, between or after the
+# prefixes never hides the rm. Any rm fed by xargs sets XARGS_RM, and any rm
+# after a prefix that cannot be skipped sets UNSUPPORTED_RM_PREFIX, recursive
+# or not.
 analyze_rm_segment() {
   local index rm_index=-1 recursive_pattern
   KNOWN_RM=0
   HAS_RECURSIVE_RM=0
-  XARGS_RECURSIVE_RM=0
+  XARGS_RM=0
   UNSUPPORTED_RM_PREFIX=0
-  scan_shell_words "$1" || :
+  strip_command_redirections "$1"
+  scan_shell_words "$REDIR_STRIPPED" || :
   index=0
   while [ "$index" -lt "${#SCAN_WORDS[@]}" ]; do
     if is_rm_word "${SCAN_WORDS[$index]}" && rm_is_recursive_after "$index"; then
@@ -988,7 +1179,7 @@ analyze_rm_segment() {
       recursive_pattern='(^|[[:space:]])([^[:space:]]*/)?rm[[:space:]]+(-[^[:space:]]*[rR][^[:space:]]*|--recursive)([[:space:]]|$)'
       index="$PREFIX_INDEX"
       while [ "$index" -lt "${#SCAN_WORDS[@]}" ]; do
-        if [[ "${SCAN_WORDS[$index]}" =~ $recursive_pattern ]]; then
+        if is_rm_word "${SCAN_WORDS[$index]}" || [[ "${SCAN_WORDS[$index]}" =~ $recursive_pattern ]]; then
           UNSUPPORTED_RM_PREFIX=1
           break
         fi
@@ -998,10 +1189,9 @@ analyze_rm_segment() {
     return 0
   fi
   if is_rm_word "${SCAN_WORDS[$PREFIX_INDEX]:-}"; then
-    if [ "$PREFIX_XARGS" -eq 0 ]; then KNOWN_RM=1; fi
+    if [ "$PREFIX_XARGS" -eq 0 ]; then KNOWN_RM=1; else XARGS_RM=1; fi
     if rm_is_recursive_after "$PREFIX_INDEX"; then
       HAS_RECURSIVE_RM=1
-      [ "$PREFIX_XARGS" -eq 0 ] || XARGS_RECURSIVE_RM=1
     fi
   fi
   return 0
@@ -1075,7 +1265,12 @@ classify_repointing_segment() {
   segment="$TRIMMED"
   case "$segment" in '('*) REPOINT_CLASS=subshell; return 0 ;; esac
   if has_unquoted_substitution "$segment"; then REPOINT_CLASS=substitution; return 0; fi
-  scan_shell_words "$segment" || :
+  # The command word comes after any control word or grouping opener, with the
+  # segment's redirections removed: `then cd /` and `2>/dev/null cd /` both
+  # change the folder.
+  strip_control_openers "$segment"
+  strip_command_redirections "$CONTROL_STRIPPED"
+  scan_shell_words "$REDIR_STRIPPED" || :
   [ "${#SCAN_WORDS[@]}" -gt 0 ] || return 1
   skip_command_prefixes || return 1
   if [ "$PREFIX_ASSIGNMENT" -eq 1 ]; then REPOINT_CLASS=assignment; return 0; fi
@@ -2674,23 +2869,16 @@ REDIRECT_TARGETS=()
 # own writes; `>>` follows a symlink to its target the same way, so all
 # three are collected identically here and left for the caller to decide
 # on. `>&N` duplicates a descriptor and names no path, so an `&` directly
-# after the operator ends the match with no target. `&>target` does name
-# a path and is classified, but not by anything in this function:
-# split_command_segments() has already split on the bare `&`, so
-# `cmd &> target` reaches this scanner as two segments, the second of
-# which begins `> target` and is read exactly like a plain `>`. The
-# `prev` check below therefore cannot match on any input that reaches
-# this function today: it is dead code. It is not a safeguard in waiting
-# either, because a splitter that preserved `&>` intact would make this
-# check skip classification of an operator that truncates its target. It
-# is left in place unchanged because this revision corrects the
-# description, not the scanner. Any operand this cannot read as a plain
+# after the operator ends the match with no target. `&>target` and
+# `&>>target` name a path: split_command_segments() keeps them inside the
+# segment, and the `>` after the `&` is read exactly like a plain `>`, so
+# their target is classified the same way. Any operand this cannot read as a plain
 # quoted-or-bare literal (an unquoted substitution, variable, or glob) is
 # skipped: this pass only ever adds a new denial, so an operand it cannot
 # read literally is left exactly as unclassified as it was before this
 # pass existed, never turned into a denial by default.
 scan_redirect_targets() {
-  local input="$1" length i=0 j ch next state="plain" prev=""
+  local input="$1" length i=0 j ch next state="plain"
   REDIRECT_TARGETS=()
   length=${#input}
   while [ "$i" -lt "$length" ]; do
@@ -2713,28 +2901,24 @@ scan_redirect_targets() {
           '"') state="double" ;;
           "\\") i=$((i + 1)) ;;
           '>')
-            if [ "$prev" != "&" ]; then
-              j=$((i + 1))
-              case "$next" in
-                '>'|'|') j=$((j + 1)) ;;
-              esac
-              if [ "${input:$j:1}" != '&' ]; then
-                while [ "${input:$j:1}" = ' ' ] || [ "${input:$j:1}" = $'\t' ]; do j=$((j + 1)); done
-                read_redirect_word "$input" "$j"
-                j="$READ_WORD_NEXT_INDEX"
-                if [ "$READ_WORD_LITERAL" -eq 1 ] && [ -n "$READ_WORD_VALUE" ]; then
-                  REDIRECT_TARGETS[${#REDIRECT_TARGETS[@]}]="$READ_WORD_VALUE"
-                fi
+            j=$((i + 1))
+            case "$next" in
+              '>'|'|') j=$((j + 1)) ;;
+            esac
+            if [ "${input:$j:1}" != '&' ]; then
+              while [ "${input:$j:1}" = ' ' ] || [ "${input:$j:1}" = $'\t' ]; do j=$((j + 1)); done
+              read_redirect_word "$input" "$j"
+              j="$READ_WORD_NEXT_INDEX"
+              if [ "$READ_WORD_LITERAL" -eq 1 ] && [ -n "$READ_WORD_VALUE" ]; then
+                REDIRECT_TARGETS[${#REDIRECT_TARGETS[@]}]="$READ_WORD_VALUE"
               fi
-              i="$j"
-              prev=""
-              continue
             fi
+            i="$j"
+            continue
             ;;
         esac
         ;;
     esac
-    prev="$ch"
     i=$((i + 1))
   done
 }
@@ -2840,8 +3024,14 @@ initialize_context() {
 # an explicit removal that was validated (a deny exits here), 1 when the
 # segment is not a worktree removal.
 judge_worktree_segment() {
-  local segment="$1" raw_segment="${2:-$1}"
+  local segment="$1" raw_segment="${2:-$1}" detect
   TEMP_ONLY_REMOVE=0
+  # The two patterns below find the git word on the segment with its
+  # redirections removed; the validators parse the untouched segment, so a
+  # removal that carries a redirection is denied by the patterns.
+  strip_command_redirections "$segment"
+  rewrite_git_head "$REDIR_STRIPPED"
+  detect="$GIT_HEAD_REWRITTEN"
   if parse_simple_command "$segment" \
     && [ "${WORDS[0]}" = "git" ] \
     && [ "${WORDS[1]:-}" = "worktree" ] \
@@ -2865,11 +3055,11 @@ judge_worktree_segment() {
     initialize_context
     validate_git_worktree_remove "$raw_segment" || policy_deny unsafe_worktree_remove
     return 0
-  elif [[ "$segment" =~ $GIT_WORKTREE_REMOVE_RE ]]; then
+  elif [[ "$detect" =~ $GIT_WORKTREE_REMOVE_RE ]]; then
     # A worktree removal that cannot be parsed as a simple command (globs,
     # substitutions, repeated -C) is never left without a decision.
     policy_deny unsafe_worktree_remove
-  elif ! parse_simple_command "$segment" && is_forced_remove_when_stripped "$segment" any; then
+  elif ! parse_simple_command "$segment" && is_forced_remove_when_stripped "$detect" any; then
     # Quoting or escapes hide the words, but with them removed this is a
     # worktree removal that no validator could read: deny rather than leave it
     # without a decision.
@@ -2878,17 +3068,50 @@ judge_worktree_segment() {
   return 1
 }
 
+# Called by inspect_delegated_text (whose locals it sets) after a piece that is
+# not an rm: the first piece with a repointing class other than cd or pushd
+# becomes repoint_piece.
+note_repointing_piece() { # PIECE
+  [ -z "$repoint_piece" ] || return 0
+  classify_repointing_segment "$1" || return 0
+  case "$REPOINT_CLASS" in cd|pushd) ;; *) repoint_piece="$1" ;; esac
+}
+
+# Sets HERE_STRING_PAYLOAD to the text a here-string (<<< WORD or <<<WORD)
+# feeds the piece's command, read from the untouched piece because the
+# redirection-free copy drops it. Returns 1 when the piece has none.
+HERE_STRING_PAYLOAD=""
+here_string_payload() { # PIECE
+  local k
+  HERE_STRING_PAYLOAD=""
+  split_shell_words "$1" || return 1
+  for ((k = 0; k < ${#SPLIT_WORDS[@]}; k++)); do
+    case "${SPLIT_RAW[$k]}" in
+      '<<<') HERE_STRING_PAYLOAD="${SPLIT_WORDS[$((k + 1))]:-}"; return 0 ;;
+      '<<<'*) HERE_STRING_PAYLOAD="${SPLIT_WORDS[$k]#<<<}"; return 0 ;;
+    esac
+  done
+  return 1
+}
+
 # Inspect executable words, rather than looking for removal words anywhere in
 # a shell string: `echo rm -rf ...` passes those words as data. Each recursive
 # call consumes a wrapper, substitution, or shell string; the bound also keeps
 # malformed nested input from consuming unbounded parser work.
 inspect_delegated_text() {
-  local source="$1" depth="$2" segment previous="" word i j piece_index payload inner c state n cwd_repointed="${3:-0}" outer_end
+  local source="$1" depth="$2" segment previous="" word i j piece_index payload inner c state n cwd_repointed="${3:-0}" outer_end repoint_piece="${4:-}" words_text
   local -a pieces separators words raw
   [ "$depth" -le 6 ] || policy_deny unsupported_syntax
   split_command_segments "$source"
   pieces=("${SEGMENTS[@]}")
   separators=(${SEGMENT_DELIMITERS[@]+"${SEGMENT_DELIMITERS[@]}"})
+  # The top-level repointing classes, applied in order: once a piece that is
+  # not an rm changes what a later path names (ln, mv, mkdir, mount, cp -s,
+  # eval, an assignment, a subshell or a substitution), every rm after it in
+  # this text, and in any text it delegates to, denies with that class. A cd
+  # or pushd sets cwd_repointed instead, so a later relative target denies.
+  # repoint_piece holds the first such piece; a piece's class never applies to
+  # the rm inside its own delegation, which runs before the piece is done.
   for ((piece_index = 0; piece_index < ${#pieces[@]}; piece_index++)); do
     segment="${pieces[$piece_index]}"
     if [ "$piece_index" -gt 0 ] && [ "${separators[$((piece_index - 1))]:-}" != '|' ]; then previous=""; fi
@@ -2896,20 +3119,8 @@ inspect_delegated_text() {
     [ -n "$segment" ] || continue
     # Control words and grouping delimiters are not command words. A removal
     # following them still executes, including inside a delegated shell.
-    while :; do
-      case "$segment" in
-        then\ *|do\ *|else\ *|'{ '*|'('*|'!'\ *|time\ *|case\ *' in '*') '*)
-          case "$segment" in
-            then\ *|else\ *|time\ *) segment="${segment#* }" ;;
-            do\ *) segment="${segment#do }" ;;
-            '{ '*|'('*) segment="${segment#?}" ;;
-            '!'\ *) segment="${segment#!}" ;;
-            case\ *' in '*') '*) segment="${segment#*) }" ;;
-          esac
-          trim_horizontal "$segment"; segment="$TRIMMED" ;;
-        *) break ;;
-      esac
-    done
+    strip_control_openers "$segment"
+    segment="$CONTROL_STRIPPED"
     [ -n "$segment" ] || continue
     # Shell substitutions execute even inside double quotes and echo's data.
     n=${#segment}; i=0; state=plain
@@ -2927,22 +3138,31 @@ inspect_delegated_text() {
         plain:\`|double:\`)
           skip_backtick "$segment" $((i + 1)) || break
           inner="${segment:i+1:SKIP_END-i-2}"; outer_end="$SKIP_END"
-          inspect_delegated_text "$inner" $((depth + 1)) "$cwd_repointed"
+          inspect_delegated_text "$inner" $((depth + 1)) "$cwd_repointed" "$repoint_piece"
           i="$outer_end"; continue ;;
-        plain:\$|double:\$)
+        # A process substitution, <(...) or >(...), runs its command too; in
+        # double quotes it is plain text.
+        plain:\$|double:\$|plain:\<|plain:\>)
           if [ "${segment:i+1:1}" = '(' ]; then
             skip_paren "$segment" $((i + 2)) || break
             inner="${segment:i+2:SKIP_END-i-3}"; outer_end="$SKIP_END"
-            inspect_delegated_text "$inner" $((depth + 1)) "$cwd_repointed"
+            inspect_delegated_text "$inner" $((depth + 1)) "$cwd_repointed" "$repoint_piece"
             i="$outer_end"; continue
           fi ;;
       esac
       i=$((i + 1))
     done
-    if extract_env_split_inner "$segment"; then
-      inspect_delegated_text "$ENV_S_INNER" $((depth + 1)) "$cwd_repointed"
+    # The command word is found with the piece's redirections removed.
+    strip_command_redirections "$segment"
+    words_text="$REDIR_STRIPPED"
+    if extract_env_split_inner "$words_text"; then
+      inspect_delegated_text "$ENV_S_INNER" $((depth + 1)) "$cwd_repointed" "$repoint_piece"
     fi
-    split_shell_words "$segment" || { previous="$segment"; continue; }
+    if ! split_shell_words "$words_text"; then
+      previous="$words_text"
+      note_repointing_piece "$segment"
+      continue
+    fi
     words=("${SPLIT_WORDS[@]}"); raw=("${SPLIT_RAW[@]}")
     i=0
     # Prefix programs only dispatch the command after their arguments.
@@ -2992,7 +3212,7 @@ inspect_delegated_text() {
     done
     word="${words[$i]:-}"
     case "$word" in
-      cd) cwd_repointed=1 ;;
+      cd|pushd) cwd_repointed=1 ;;
       sh|bash|zsh|dash|ksh|/bin/sh|/bin/bash|/bin/zsh|/bin/dash|/bin/ksh)
         j=$((i + 1)); payload=""
         while [[ "${words[$j]:-}" == -* ]]; do
@@ -3014,9 +3234,9 @@ inspect_delegated_text() {
             inner="${payload:2:${#payload}-3}"
             payload="${inner#echo }"
           fi
-          inspect_delegated_text "$payload" $((depth + 1)) "$cwd_repointed"
-        elif [ "${words[$((i + 1))]:-}" = '<<<' ]; then
-          inspect_delegated_text "${words[$((i + 2))]:-}" $((depth + 1)) "$cwd_repointed"
+          inspect_delegated_text "$payload" $((depth + 1)) "$cwd_repointed" "$repoint_piece"
+        elif here_string_payload "$segment"; then
+          inspect_delegated_text "$HERE_STRING_PAYLOAD" $((depth + 1)) "$cwd_repointed" "$repoint_piece"
         elif [ -n "$previous" ]; then
           split_shell_words "$previous" || :
           case "${SPLIT_WORDS[0]:-}" in
@@ -3027,14 +3247,14 @@ inspect_delegated_text() {
               while [ "$j" -lt "${#SPLIT_WORDS[@]}" ]; do
                 payload="$payload ${SPLIT_WORDS[$j]}"; j=$((j + 1))
               done
-              [ -z "$payload" ] || inspect_delegated_text "$payload" $((depth + 1)) "$cwd_repointed" ;;
+              [ -z "$payload" ] || inspect_delegated_text "$payload" $((depth + 1)) "$cwd_repointed" "$repoint_piece" ;;
           esac
         fi
         ;;
       eval)
         payload="${words[$((i + 1))]:-}"
         for ((j = i + 2; j < ${#words[@]}; j++)); do payload="$payload ${words[$j]}"; done
-        [ -z "$payload" ] || inspect_delegated_text "$payload" $((depth + 1)) "$cwd_repointed" ;;
+        [ -z "$payload" ] || inspect_delegated_text "$payload" $((depth + 1)) "$cwd_repointed" "$repoint_piece" ;;
       find)
         for ((j = i + 1; j < ${#words[@]}; j++)); do
           if [ "${words[$j]}" = -exec ] || [ "${words[$j]}" = -execdir ] || [ "${words[$j]}" = -ok ]; then
@@ -3042,25 +3262,32 @@ inspect_delegated_text() {
             while [ "$j" -lt "${#words[@]}" ] && [ "${words[$j]}" != ';' ] && [ "${words[$j]}" != + ]; do
               payload="$payload ${raw[$j]}"; j=$((j + 1))
             done
-            [ -z "$payload" ] || inspect_delegated_text "$payload" $((depth + 1)) "$cwd_repointed"
+            [ -z "$payload" ] || inspect_delegated_text "$payload" $((depth + 1)) "$cwd_repointed" "$repoint_piece"
           fi
         done ;;
       git|*/git)
-        if is_forced_remove_when_stripped "$segment"; then policy_deny unsafe_worktree_remove; fi ;;
+        if is_forced_remove_when_stripped "$words_text"; then policy_deny unsafe_worktree_remove; fi ;;
       rm|*/rm)
-        analyze_rm_segment "$segment"
-        if [ "$KNOWN_RM" -eq 1 ] && [ "$HAS_RECURSIVE_RM" -eq 1 ]; then
-          if ! parse_simple_command "$segment" || ! normalize_explicit_rm_words; then policy_deny unsafe_rm; fi
-          if [ "$cwd_repointed" -eq 1 ]; then
-            for word in "${WORDS[@]:1}"; do
-              case "$word" in -*) ;; /*) ;; *) policy_deny unsafe_rm ;; esac
-            done
-          fi
-          initialize_context
-          validate_rm || policy_deny unsafe_rm
-        fi ;;
+        # Every rm this walk reaches (after a control word or grouping opener,
+        # in a case arm, a substitution or a delegated shell) is judged the way
+        # a top-level rm is, recursive or not. The untouched piece must parse
+        # as a simple command with known prefixes; a redirection, a closing
+        # parenthesis or any other text outside that grammar denies.
+        if [ -n "$repoint_piece" ]; then
+          classify_repointing_segment "$repoint_piece"
+          policy_deny "path_repointing_$REPOINT_CLASS"
+        fi
+        if ! parse_simple_command "$segment" || ! normalize_explicit_rm_words; then policy_deny unsafe_rm; fi
+        if [ "$cwd_repointed" -eq 1 ]; then
+          for word in "${WORDS[@]:1}"; do
+            case "$word" in -*) ;; /*) ;; *) policy_deny unsafe_rm ;; esac
+          done
+        fi
+        initialize_context
+        validate_rm || policy_deny unsafe_rm ;;
     esac
-    previous="$segment"
+    case "$word" in rm|*/rm) ;; *) note_repointing_piece "$segment" ;; esac
+    previous="$words_text"
   done
 }
 
@@ -3141,7 +3368,7 @@ enqueue_wrapped_fragments() {
 MAX_COMMAND_CHARS=6000
 
 run_policy() {
-  local normalized command_raw command_len segment raw_segment saw_explicit=0 saw_worktree=0 saw_rm=0 saw_temp_only=0 all_accepted=1 transparent=0 command_has_recursive_rm=0 index
+  local normalized command_raw command_len segment raw_segment saw_explicit=0 saw_worktree=0 saw_rm=0 saw_temp_only=0 all_accepted=1 transparent=0 command_has_rm=0 index detect_segment
   local rm_segments=()
   [ "$ARG_ERROR" -eq 0 ] || policy_deny invalid_configuration
   # The engine tier: jq, wc and tr, from the trusted roots.
@@ -3184,16 +3411,27 @@ run_policy() {
     if [ -n "$segment" ]; then
       analyze_rm_segment "$segment" || :
       [ "$UNSUPPORTED_RM_PREFIX" -eq 0 ] || policy_deny unsupported_rm_prefix
-      [ "$XARGS_RECURSIVE_RM" -eq 0 ] || policy_deny non_literal_rm_targets
-      if [ "$HAS_RECURSIVE_RM" -eq 1 ]; then
+      [ "$XARGS_RM" -eq 0 ] || policy_deny non_literal_rm_targets
+      if [ "$HAS_RECURSIVE_RM" -eq 0 ] && [ "$KNOWN_RM" -eq 0 ]; then
+        # An rm after a control word or grouping opener (then rm, { rm, (rm,
+        # a case arm) runs all the same: its prefixes are judged the same way.
+        strip_control_openers "$segment"
+        if [ "$CONTROL_STRIPPED" != "$segment" ]; then
+          analyze_rm_segment "$CONTROL_STRIPPED" || :
+          [ "$UNSUPPORTED_RM_PREFIX" -eq 0 ] || policy_deny unsupported_rm_prefix
+          [ "$XARGS_RM" -eq 0 ] || policy_deny non_literal_rm_targets
+        fi
+      fi
+      # Every rm, recursive or not, gets the repointing checks below.
+      if [ "$HAS_RECURSIVE_RM" -eq 1 ] || [ "$KNOWN_RM" -eq 1 ]; then
         rm_segments[index]=1
-        command_has_recursive_rm=1
+        command_has_rm=1
       fi
     fi
     index=$((index + 1))
   done
 
-  if [ "$command_has_recursive_rm" -eq 1 ]; then
+  if [ "$command_has_rm" -eq 1 ]; then
     index=0
     while [ "$index" -lt "${#SEGMENTS[@]}" ]; do
       segment="${SEGMENTS[$index]}"
@@ -3283,14 +3521,20 @@ run_policy() {
     if [ "${#SEGMENTS[@]}" -eq 1 ] && [ "$command_raw" = "$raw_segment" ]; then
       CLEANUP_COMMAND_IS_WHOLE=1
     fi
+    # The command word is found with the segment's redirections removed; the
+    # rm and worktree validators still parse the untouched segment.
+    strip_command_redirections "$segment"
+    detect_segment="$REDIR_STRIPPED"
     rewrite_git_head "$segment"
     segment="$GIT_HEAD_REWRITTEN"
+    rewrite_git_head "$detect_segment"
+    detect_segment="$GIT_HEAD_REWRITTEN"
     transparent=0
-    if extract_env_split_inner "$segment"; then
+    if extract_env_split_inner "$detect_segment"; then
       SEGMENTS+=("$ENV_S_INNER")
       transparent=1
     fi
-    if looks_explicit_rm "$segment"; then
+    if looks_explicit_rm "$detect_segment"; then
       strip_leading_negation "$segment"
       parse_simple_command "$RM_PARSE_INPUT" || policy_deny unsupported_syntax
       normalize_explicit_rm_words || policy_deny unsupported_syntax
@@ -3323,7 +3567,8 @@ run_policy() {
     [ -n "$segment" ] || continue
     rewrite_git_head "$segment"
     segment="$GIT_HEAD_REWRITTEN"
-    if extract_env_split_inner "$segment"; then
+    strip_command_redirections "$segment"
+    if extract_env_split_inner "$REDIR_STRIPPED"; then
       queue_fragment "$ENV_S_INNER"
     fi
     enqueue_wrapped_fragments "$segment"

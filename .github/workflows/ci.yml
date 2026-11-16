@@ -239,7 +239,7 @@ jobs:
       - name: Install Claude Code at the pinned version into a folder of this job
         run: |
           npm install --prefix "$RUNNER_TEMP/claude-code" --no-audit --no-fund "@anthropic-ai/claude-code@2.1.325"
-      - name: Validate the marketplace and the harness plugin, strict, in a fresh home
+      - name: Validate the marketplace and the harness and rails plugins, strict, in a fresh home
         run: |
           set -euo pipefail
           home="$(mktemp -d "$RUNNER_TEMP/validate-home.XXXXXX")"
@@ -247,3 +247,4 @@ jobs:
           HOME="$home" "$claude" --version
           HOME="$home" "$claude" plugin validate --strict .
           HOME="$home" "$claude" plugin validate --strict plugins/harness
+          HOME="$home" "$claude" plugin validate --strict plugins/rails

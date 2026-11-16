@@ -28,6 +28,7 @@ PLUGIN = TESTS.parent
 SUITES = [
     "destructive-command-guard.test.sh",
     "destructive-command-guard-cleanup-worktree.test.sh",
+    "destructive-command-guard-compound.test.sh",
     "destructive-command-guard-dependencies.test.sh",
     "destructive-command-guard-dormant.test.sh",
     "destructive-command-guard-git-forms.test.sh",

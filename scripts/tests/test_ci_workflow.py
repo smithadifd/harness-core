@@ -433,6 +433,59 @@ def test_a_rails_step_near_miss_is_refused_by_name(change, expected):
     assert expected in rails_problems(changed)
 
 
+# The plugin-validate job validates the marketplace and every plugin under
+# plugins/, each strict, in the job's fresh HOME, each exactly once.
+
+VALIDATE_TARGETS = [".", "plugins/harness", "plugins/rails"]
+VALIDATE_LINE = 'HOME="$home" "$claude" plugin validate --strict {0}'
+
+
+def validate_problems(text: str) -> list[str]:
+    """Each validate target that is not validated strict in the fresh HOME exactly once, by name."""
+    job = jobs(text).get("plugin-validate")
+    if job is None:
+        return ["plugin-validate: the job is missing"]
+    lines = [line.strip() for line in job if '"$claude" plugin validate' in line]
+    found = [f"plugin-validate: {target} is not validated strict in the fresh HOME"
+             for target in VALIDATE_TARGETS if lines.count(VALIDATE_LINE.format(target)) != 1]
+    if sorted(lines) != sorted(VALIDATE_LINE.format(target) for target in VALIDATE_TARGETS):
+        found.append(f"plugin-validate: the validate lines are {lines}")
+    return found
+
+
+def test_the_plugin_validate_job_validates_the_marketplace_and_every_plugin_strict():
+    plugins = sorted(f"plugins/{path.parent.parent.name}"
+                     for path in (ROOT / "plugins").glob("*/.claude-plugin/plugin.json"))
+    assert plugins == sorted(VALIDATE_TARGETS[1:])
+    assert validate_problems(workflow()) == []
+
+
+RAILS_VALIDATE = 'HOME="$home" "$claude" plugin validate --strict plugins/rails'
+VALIDATE_NEAR_MISSES = [
+    ("rails-not-validated", lambda t: t.replace("          " + RAILS_VALIDATE + "\n", ""),
+     "plugin-validate: plugins/rails is not validated strict in the fresh HOME"),
+    ("rails-not-strict", lambda t: t.replace(RAILS_VALIDATE, RAILS_VALIDATE.replace("--strict ", "")),
+     "plugin-validate: plugins/rails is not validated strict in the fresh HOME"),
+    ("rails-without-fresh-home", lambda t: t.replace(RAILS_VALIDATE, RAILS_VALIDATE.replace('HOME="$home" ', "")),
+     "plugin-validate: plugins/rails is not validated strict in the fresh HOME"),
+    ("rails-failure-allowed", lambda t: t.replace(RAILS_VALIDATE, RAILS_VALIDATE + " || true"),
+     "plugin-validate: plugins/rails is not validated strict in the fresh HOME"),
+    ("rails-twice", lambda t: t.replace("          " + RAILS_VALIDATE + "\n", ("          " + RAILS_VALIDATE + "\n") * 2),
+     "plugin-validate: plugins/rails is not validated strict in the fresh HOME"),
+    ("an-extra-target", lambda t: t.replace("          " + RAILS_VALIDATE + "\n",
+                                            "          " + RAILS_VALIDATE + "\n" + "          " + VALIDATE_LINE.format("plugins/other") + "\n"),
+     "plugin-validate: the validate lines are"),
+]
+
+
+@pytest.mark.parametrize("change,expected", [(case[1], case[2]) for case in VALIDATE_NEAR_MISSES],
+                         ids=[case[0] for case in VALIDATE_NEAR_MISSES])
+def test_a_plugin_validate_near_miss_is_refused_by_name(change, expected):
+    changed = change(workflow())
+    assert changed != workflow(), "the change did something"
+    assert any(problem.startswith(expected) for problem in validate_problems(changed)), validate_problems(changed)
+
+
 # J7 and J8: the ledger drift job runs both checks.
 
 def test_j7_the_ledger_drift_job_runs_the_offline_check():

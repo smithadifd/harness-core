@@ -233,7 +233,7 @@ done
 run_case "rm words passed to echo are data" no_opinion "$PRIMARY" "echo hi; sh -c 'echo rm -rf is dangerous'" not_explicit_operation
 run_case "rm words passed to grep are data" no_opinion "$PRIMARY" "bash -c 'grep -r rm foo'" not_explicit_operation
 run_case "safe recursive removal in delegated shell" no_opinion "$PRIMARY" "sh -c 'rm -rf $SCRATCH/cache'" not_explicit_operation
-run_case "nonrecursive rm in delegated shell" no_opinion "$PRIMARY" "echo hi; sh -c 'rm file.txt'" not_explicit_operation
+run_case "nonrecursive rm in delegated shell is judged like a top-level rm" deny "$PRIMARY" "echo hi; sh -c 'rm file.txt'" unsafe_rm
 run_case "nonforced worktree remove in delegated shell" no_opinion "$PRIMARY" "echo hi; sh -c 'git worktree remove /x/wt'" not_explicit_operation
 run_case "find exec harmless shell" no_opinion "$PRIMARY" "find . -exec sh -c 'echo {}' \\;" not_explicit_operation
 run_case "empty pipe to shell" no_opinion "$PRIMARY" "echo hi | sh" not_explicit_operation

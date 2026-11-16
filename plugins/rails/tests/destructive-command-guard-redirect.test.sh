@@ -126,23 +126,18 @@ run_policy_command "a quoted literal > used as grep data is not a redirect" no_o
 run_policy_command "fd duplication carries no path target" no_opinion not_explicit_operation \
   'echo hi 2>&1'
 
-# `&>` is classified, but by the segment splitter rather than by the redirect
-# scanner: split_command_segments() splits on the bare `&`, so the scanner
-# sees `> target` as its own segment and reads it like a plain `>`. These two
-# pin that reality rather than a model in which `&>` is left unclassified.
-run_policy_command "&> into the pre-existing symlink is denied (split on & before the scanner)" deny unsafe_redirect \
+# `&>` and `>|` are redirection operators: split_command_segments() keeps
+# them inside the segment, and the scanner reads the `>` in each like a plain
+# `>`, so their target is classified.
+run_policy_command "&> into the pre-existing symlink is denied" deny unsafe_redirect \
   'echo hi &> existing-symlink.txt'
 run_policy_command "&> to a fresh name stays allowed" no_opinion not_explicit_operation \
   'echo hi &> fresh-both-streams.txt'
 
-# Known, disclosed gap: >| is lexically a single token in real bash, but the
-# existing segment splitter (split_command_segments, unmodified by this
-# change) treats a bare `|` as an unconditional pipe boundary and splits
-# "cat >|existing-symlink.txt" into "cat >" and "existing-symlink.txt" before
-# this pass ever sees a `>|` token. This case documents the observed gap
-# rather than hiding it; it is not a claim that >| is classified.
-run_policy_command "KNOWN GAP: >| is split by the pipe tokenizer before this pass sees it" \
-  no_opinion not_explicit_operation 'cat >|existing-symlink.txt'
+run_policy_command ">| into the pre-existing symlink is denied" deny unsafe_redirect \
+  'cat >|existing-symlink.txt'
+run_policy_command ">| to a fresh name stays allowed" no_opinion not_explicit_operation \
+  'cat >|fresh-clobber.txt'
 
 # 5: the same file, every spelling, through the default mktemp root. The
 # absolute literal below is exactly what a caller pastes after reading the
