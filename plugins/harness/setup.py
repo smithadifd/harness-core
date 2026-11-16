@@ -1,41 +1,48 @@
 #!/usr/bin/env python3
 """Plan, apply and remove the default-tier files and settings proposals.
 
-The setup skill drives this script. Plan writes nothing. Apply adds only
-absent keys and appends deny rules that are not already present, never
-changing, removing or reordering an existing entry, and records each
-addition with its position and neighbours. Remove takes out exactly what
-apply recorded. A rule the person has since moved or duplicated is kept
-and named. Nothing that grants is ever proposed. Apply is all-or-nothing:
-every precondition is checked before the first write, and a later failure
-rolls back every change this run made: the files, the settings and the setup
-record. The record is written before `claude plugin configure` runs, so a
-record that cannot be written fails before configure and leaves the home as it
-was. A configure that has succeeded is not undone, and does not need to be,
-because nothing that can fail runs after it. Apply refuses to overwrite a
-settings.json that changed since it was read. Apply keeps the exact bytes it
-wrote to each file; rollback leaves a file whose bytes have changed since,
-naming it for a manual check, and remove does the same with the record.
-Settings are written to a temp file in the same folder and moved into place
-with os.replace. Apply and remove each hold an exclusive lock in the home's
-.claude folder from their first read to their last write, rollback included;
-a run that finds the lock held refuses by name.
+The setup skill drives this script. Plan writes nothing and takes no lock.
+Apply places the rules default, places the override starter when the person
+has none, and adds each approved settings item that is absent: a missing key,
+or a deny rule appended after the existing ones. It never changes, removes or
+reorders an existing entry, and nothing it proposes grants anything. Remove
+takes out exactly what a complete setup record lists, and keeps and names
+anything the person has changed since.
+
+The promise, in full, is in KNOWN-LIMITS.md ("Harness setup"). In short:
+
+- a run that completes leaves exactly the documented result;
+- an apply that fails in-process rolls back all of its own changes from
+  memory, and never deletes or overwrites bytes it did not write;
+- an apply that hard-stops (a signal, a crash, power loss) leaves settings.json
+  whole and a 0600 backup of it, and the next run refuses by name: setup never
+  acts on an unfinished record, and recovery after a hard stop is by hand;
+- a remove that stops, for any reason, keeps the complete record, and running
+  remove again finishes the job.
+
+Setup installs no signal handler: Ctrl-C, SIGTERM and SIGHUP are hard stops.
+Apply and remove each hold one exclusive, non-blocking flock on
+.claude/harness-setup.lock, a file that is never unlinked, and the
+`claude plugin configure` child that apply starts holds it with them. Below the
+home folder, every path is opened relative to its parent's descriptor without
+following a symlink.
 """
 from __future__ import annotations
 
 import argparse
-import contextlib
+import errno
 import fcntl
 import hashlib
 import json
 import os
+import secrets
 import shutil
+import signal
 import stat
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 PLUGIN_ROOT = Path(__file__).resolve().parent
@@ -43,14 +50,23 @@ FILES_DIR = PLUGIN_ROOT / "files"
 RULES_SOURCE = FILES_DIR / "harness.md"
 OVERRIDE_SOURCE = FILES_DIR / "harness-local.md"
 
+CLAUDE_REL = ".claude"
+RULES_DIR_REL = ".claude/rules"
 RULES_REL = ".claude/rules/harness.md"
 OVERRIDE_REL = ".claude/rules/harness-local.md"
-RECORD_REL = ".claude/plugins/harness-core/harness/setup-record.json"
 SETTINGS_REL = ".claude/settings.json"
 LOCK_REL = ".claude/harness-setup.lock"
-LOCKED = f"another harness setup run holds the lock {LOCK_REL}"
-RECORD_DIGEST_KEY = "record_sha256"
-RECORD_DIGEST_DRAFT = "0" * 64
+RECORD_DIRS = (
+    ".claude/plugins",
+    ".claude/plugins/harness-core",
+    ".claude/plugins/harness-core/harness",
+)
+SETUP_DIR_REL = RECORD_DIRS[-1]
+RECORD_REL = ".claude/plugins/harness-core/harness/setup-record.jsonl"
+BACKUP_REL = ".claude/plugins/harness-core/harness/settings-backup.json"
+CREATABLE_DIRS = (RULES_DIR_REL,) + RECORD_DIRS
+RECORD_KIND = "harness-setup"
+RECORD_VERSION = 1
 
 LEDGER_PLUGIN = "ledger-hooks@harness-core"
 DEFAULT_HARNESS = "claude-code"
@@ -77,24 +93,31 @@ GRANTING_KEYS = frozenset({
 })
 
 PREFIX = "setup:"
+HEX = frozenset("0123456789abcdef")
+
+DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+TEMP_FLAGS = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+LOCK_FLAGS = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC
+APPEND_FLAGS = os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC
 
 
 class SetupError(RuntimeError):
-    """A named failure of plan, apply or remove (exit 1)."""
+    """A named refusal of plan, apply or remove (exit 1)."""
 
 
-def database_path(home: Path) -> Path:
-    return home / ".local" / "share" / "ledger" / "ledger.db"
+# ---------------------------------------------------------------------------
+# Small helpers
 
 
 def digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def load_source(path: Path) -> str:
+def load_source(path: Path) -> bytes:
     if not path.is_file():
         raise SetupError(f"{path.name} is missing from the plugin files folder")
-    return path.read_text(encoding="utf-8")
+    return path.read_bytes()
 
 
 def pairs(items):
@@ -106,38 +129,18 @@ def pairs(items):
     return seen
 
 
-def read_named(path: Path) -> bytes:
+def parse_json_object(raw: bytes, shown: str) -> dict[str, Any]:
     try:
-        return path.read_bytes()
-    except OSError as exc:
-        raise SetupError(f"cannot read {path}: {exc}") from exc
-
-
-def decode_text(raw: bytes, path: Path) -> str:
-    try:
-        return raw.decode("utf-8")
+        text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise SetupError(f"{path} is not valid UTF-8 ({exc})") from exc
-
-
-def load_json_object(path: Path) -> dict[str, Any]:
-    return parse_json_object(read_named(path), path)
-
-
-def parse_json_object(raw: bytes, path: Path) -> dict[str, Any]:
-    text = decode_text(raw, path)
+        raise SetupError(f"{shown} is not valid UTF-8 ({exc})") from exc
     try:
         data = json.loads(text, object_pairs_hook=pairs)
     except ValueError as exc:
-        raise SetupError(f"{path} is not valid JSON ({exc})") from exc
+        raise SetupError(f"{shown} is not valid JSON ({exc})") from exc
     if not isinstance(data, dict):
-        raise SetupError(f"{path} is not a JSON object")
+        raise SetupError(f"{shown} is not a JSON object")
     return data
-
-
-def dump_json(data: dict[str, Any], *, indent: int | str = 2,
-              ensure_ascii: bool = False) -> str:
-    return json.dumps(data, indent=indent, ensure_ascii=ensure_ascii) + "\n"
 
 
 def detect_indent(text: str) -> int | str:
@@ -154,14 +157,47 @@ def detect_indent(text: str) -> int | str:
     return 2
 
 
-def lexists(path: Path) -> bool:
-    try:
-        os.lstat(path)
-    except FileNotFoundError:
-        return False
-    except OSError:
-        return True
-    return True
+def dump_settings(data: dict[str, Any], indent: int | str) -> bytes:
+    return (json.dumps(data, indent=indent, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def json_line(data: dict[str, Any]) -> bytes:
+    return (json.dumps(data, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def write_all(fd: int, data: bytes) -> None:
+    """Write every byte of data, or raise. A write that reports 0 bytes, or
+    fails, is an error: a short write never passes as a success."""
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise OSError(errno.EIO, "os.write wrote nothing (disk full?)")
+        view = view[written:]
+
+
+def sync(fd: int) -> None:
+    """fsync, then F_FULLFSYNC where the platform defines it."""
+    os.fsync(fd)
+    full = getattr(fcntl, "F_FULLFSYNC", None)
+    if full is not None:
+        fcntl.fcntl(fd, full)
+
+
+def temp_name(base: str) -> str:
+    return f".{base}.harness-{secrets.token_hex(8)}.tmp"
+
+
+def one_line(text: str) -> str:
+    return " / ".join(part.strip() for part in str(text).splitlines() if part.strip())
+
+
+# ---------------------------------------------------------------------------
+# Proposals and plan
+
+
+def database_path(home: Path) -> Path:
+    return home / ".local" / "share" / "ledger" / "ledger.db"
 
 
 def ledger_values(home: Path, operator: str, harness: str | None) -> dict[str, str]:
@@ -176,7 +212,7 @@ def ledger_values(home: Path, operator: str, harness: str | None) -> dict[str, s
 
 def optional_items() -> list[tuple[str, str]]:
     """(id, exact text to be added) for each optional settings proposal."""
-    items = [("sandbox", dump_json({"sandbox": dict(SANDBOX_VALUE)}).rstrip("\n"))]
+    items = [("sandbox", json.dumps({"sandbox": dict(SANDBOX_VALUE)}, indent=2))]
     for rule in DENY_RULES:
         items.append((f"deny:{rule}", rule))
     return items
@@ -230,236 +266,16 @@ def comment_only(text: str) -> bool:
     return True
 
 
-def resolve_home(value: str) -> Path:
-    home = Path(value)
-    if not home.is_absolute():
-        raise SetupError("home must be an absolute path")
-    try:
-        home = home.resolve()
-    except OSError as exc:
-        raise SetupError(f"home cannot be resolved: {exc}") from exc
-    if not home.is_dir():
-        raise SetupError("home is not a directory")
-    return home
-
-
-def rel_path(home: Path, relative: str) -> Path:
-    return home.joinpath(*relative.split("/"))
-
-
-def format_plan(home: Path, operator: str, harness: str | None) -> str:
-    rules = load_source(RULES_SOURCE)
+def check_proposals() -> tuple[bytes, bytes]:
+    """The fixed proposal table grants nothing and the override starter is
+    comments only. Returns the rules and override bytes."""
+    grants = granting_proposals()
+    if grants:
+        raise SetupError("proposals grant: " + ", ".join(grants))
     override = load_source(OVERRIDE_SOURCE)
-    values = ledger_values(home, operator, harness)
-    lines = [
-        f"FILE {RULES_REL}",
-        "----",
-        rules.rstrip("\n"),
-        "----",
-        f"FILE {OVERRIDE_REL}",
-        "----",
-        override.rstrip("\n"),
-        "----",
-        f"FILE {RECORD_REL}",
-        "record of this apply",
-        "LEDGER",
-        f"claude plugin configure {LEDGER_PLUGIN} --values-stdin",
-        "----",
-        json.dumps(values, indent=2),
-        "----",
-    ]
-    for ident, text in optional_items():
-        lines.extend([f"OPTIONAL {ident}", "----", text, "----"])
-    return "\n".join(lines) + "\n"
-
-
-def write_new_file(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
-
-
-def prune_empty(start: Path, stop: Path) -> None:
-    parent = start
-    while parent != stop:
-        if not parent.is_dir():
-            break
-        try:
-            next(parent.iterdir())
-            break
-        except StopIteration:
-            try:
-                parent.rmdir()
-            except OSError:
-                break
-            parent = parent.parent
-        except OSError:
-            break
-
-
-def unlink_and_prune(path: Path, stop: Path) -> None:
-    path.unlink()
-    prune_empty(path.parent, stop)
-
-
-def missing_parents(path: Path, stop: Path) -> list[Path]:
-    missing: list[Path] = []
-    parent = path.parent
-    while parent != stop:
-        if lexists(parent):
-            break
-        missing.append(parent)
-        nxt = parent.parent
-        if nxt == parent:
-            break
-        parent = nxt
-    missing.reverse()
-    return missing
-
-
-def note_created_dirs(path: Path, home: Path, created_dirs: list[str]) -> None:
-    for parent in missing_parents(path, home):
-        rel = parent.relative_to(home).as_posix()
-        if rel not in created_dirs:
-            created_dirs.append(rel)
-
-
-def current_bytes(path: Path) -> bytes | None:
-    try:
-        return path.read_bytes()
-    except OSError:
-        return None
-
-
-def restore_apply(home: Path, originals: dict[Path, bytes | None],
-                  created_dirs: list[str],
-                  written: dict[Path, bytes]) -> list[Path]:
-    """Undo this run's changes. Each file apply wrote is compared against the
-    exact bytes apply wrote to it: one that no longer holds those bytes was
-    changed by someone else since, so it is left as it is and returned for
-    the caller to name. A file that held bytes before this run and that this
-    run never replaced is not touched."""
-    kept: list[Path] = []
-    for path, prior in reversed(list(originals.items())):
-        expected = written.get(path)
-        if expected is None and prior is not None:
-            continue
-        if expected is not None and current_bytes(path) != expected:
-            kept.append(path)
-            continue
-        if prior is None:
-            if lexists(path):
-                try:
-                    path.unlink()
-                except OSError:
-                    pass
-        else:
-            try:
-                write_settings_bytes(path, prior)
-            except (OSError, SetupError):
-                pass
-    prune_created(home, created_dirs)
-    return kept
-
-
-def with_kept(exc: SetupError, home: Path, kept: list[Path]) -> SetupError:
-    if not kept:
-        return exc
-    names = ", ".join(path.relative_to(home).as_posix() for path in kept)
-    return SetupError(
-        f"{exc}; changed after apply wrote it, left as it is, "
-        f"needs a manual check: {names}")
-
-
-def prune_created(home: Path, created_dirs: list) -> None:
-    rels = [item for item in created_dirs if isinstance(item, str)]
-    for rel in sorted(rels, key=lambda item: item.count("/"), reverse=True):
-        directory = rel_path(home, rel)
-        try:
-            directory.rmdir()
-        except OSError:
-            pass
-
-
-def which_claude() -> str:
-    found = shutil.which("claude")
-    if not found:
-        raise SetupError("claude is not on PATH")
-    return found
-
-
-def configure_ledger(claude: str, values: dict[str, str]) -> None:
-    payload = json.dumps(values)
-    done = subprocess.run(
-        [claude, "plugin", "configure", LEDGER_PLUGIN, "--values-stdin"],
-        input=payload,
-        capture_output=True,
-        text=True,
-    )
-    if done.returncode != 0:
-        detail = (done.stderr or done.stdout or f"exit {done.returncode}").strip()
-        raise SetupError(f"claude plugin configure failed: {detail}")
-
-
-def read_current(path: Path) -> bytes | None:
-    """The bytes at path, or None when nothing is there."""
-    if not lexists(path):
-        return None
-    return read_named(path)
-
-
-def load_settings(path: Path) -> tuple[dict[str, Any], bool, int | str, bytes | None]:
-    raw = read_current(path)
-    if raw is None:
-        return {}, False, 2, None
-    data = parse_json_object(raw, path)
-    return data, True, detect_indent(raw.decode("utf-8")), raw
-
-
-def refuse_settings_link(path: Path) -> None:
-    """os.replace would put a file where the link is: refuse instead."""
-    if path.is_symlink():
-        raise SetupError(
-            f"{SETTINGS_REL} is a symbolic link; it is not written through")
-
-
-def new_file_mode() -> int:
-    mask = os.umask(0)
-    os.umask(mask)
-    return 0o666 & ~mask
-
-
-def write_settings_bytes(path: Path, data: bytes) -> None:
-    """Write data to a temp file in path's folder, then os.replace it into
-    place, so a failure before the replace leaves the old bytes whole. The
-    file keeps its mode."""
-    refuse_settings_link(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        mode = stat.S_IMODE(os.lstat(path).st_mode)
-    except FileNotFoundError:
-        mode = new_file_mode()
-    fd, temp = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(temp, mode)
-        os.replace(temp, path)
-    except BaseException:
-        try:
-            os.unlink(temp)
-        except OSError:
-            pass
-        raise
-
-
-def save_settings(path: Path, data: dict[str, Any],
-                  indent: int | str = 2) -> bytes:
-    payload = dump_json(data, indent=indent).encode("utf-8")
-    write_settings_bytes(path, payload)
-    return payload
+    if not comment_only(override.decode("utf-8")):
+        raise SetupError("override starter has a line that is not a comment")
+    return load_source(RULES_SOURCE), override
 
 
 def approved_ids(approve: list[str], approve_all: bool) -> set[str]:
@@ -474,31 +290,443 @@ def approved_ids(approve: list[str], approve_all: bool) -> set[str]:
     return found
 
 
-def apply_sandbox(settings: dict[str, Any]) -> dict[str, Any] | None:
-    if "sandbox" in settings:
+def format_plan(home: Path, operator: str, harness: str | None) -> str:
+    rules, override = check_proposals()
+    values = ledger_values(home, operator, harness)
+    lines = [
+        f"FILE {RULES_REL}",
+        "----",
+        rules.decode("utf-8").rstrip("\n"),
+        "----",
+        f"FILE {OVERRIDE_REL}",
+        "----",
+        override.decode("utf-8").rstrip("\n"),
+        "----",
+        f"FILE {RECORD_REL}",
+        "record of this apply",
+        "LEDGER",
+        f"claude plugin configure {LEDGER_PLUGIN} --values-stdin",
+        "----",
+        json.dumps(values, indent=2),
+        "----",
+    ]
+    for ident, text in optional_items():
+        lines.extend([f"OPTIONAL {ident}", "----", text, "----"])
+    return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# The home tree: every folder below the home is opened relative to its
+# parent's descriptor, and nothing below the home follows a symlink.
+
+
+class Tree:
+    def __init__(self, home: Path) -> None:
+        self.home = home
+        self.fds: dict[str, int] = {}
+        self.temps: set[str] = set()
+        self.fds[""] = os.open(str(home), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+
+    def close(self) -> None:
+        for fd in self.fds.values():
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        self.fds.clear()
+
+    def show(self, rel: str) -> str:
+        return str(self.home.joinpath(*rel.split("/"))) if rel else str(self.home)
+
+    def refuse_entry(self, parent: int, name: str, rel: str, exc: OSError) -> None:
+        try:
+            info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        except OSError:
+            raise exc
+        if stat.S_ISLNK(info.st_mode):
+            raise SetupError(f"{self.show(rel)} is a symlink") from exc
+        raise exc
+
+    def dir(self, rel: str, *, create: bool = False,
+            made: Callable[[str], None] | None = None) -> int | None:
+        """The descriptor of the folder rel, or None when it is absent and
+        create is false. A folder setup makes is reported through made the
+        moment it exists, and its parent is fsynced."""
+        if rel in self.fds:
+            return self.fds[rel]
+        parent_rel, _, name = rel.rpartition("/")
+        parent = self.dir(parent_rel, create=create, made=made)
+        if parent is None:
+            return None
+        try:
+            fd = os.open(name, DIR_FLAGS, dir_fd=parent)
+        except FileNotFoundError:
+            if not create:
+                return None
+            os.mkdir(name, 0o700, dir_fd=parent)
+            if made is not None:
+                made(rel)
+            sync(parent)
+            try:
+                fd = os.open(name, DIR_FLAGS, dir_fd=parent)
+            except OSError as exc:
+                self.refuse_entry(parent, name, rel, exc)
+                raise
+        except OSError as exc:
+            self.refuse_entry(parent, name, rel, exc)
+            raise
+        self.fds[rel] = fd
+        return fd
+
+    def parent_of(self, rel: str) -> tuple[int | None, str]:
+        parent_rel, _, name = rel.rpartition("/")
+        return self.dir(parent_rel), name
+
+    def entry(self, rel: str) -> os.stat_result | None:
+        """lstat of rel, or None when it or its folder is absent. A symlink
+        refuses by name."""
+        parent, name = self.parent_of(rel)
+        if parent is None:
+            return None
+        try:
+            info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        if stat.S_ISLNK(info.st_mode):
+            raise SetupError(f"{self.show(rel)} is a symlink")
+        return info
+
+    def read(self, rel: str) -> tuple[bytes, int] | None:
+        """(bytes, mode) of the regular file rel, or None when absent."""
+        parent, name = self.parent_of(rel)
+        if parent is None:
+            return None
+        try:
+            fd = os.open(name, READ_FLAGS, dir_fd=parent)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            self.refuse_entry(parent, name, rel, exc)
+            raise
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise SetupError(f"{self.show(rel)} is not a regular file")
+            chunks = []
+            while True:
+                chunk = os.read(fd, 1 << 16)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            return b"".join(chunks), stat.S_IMODE(info.st_mode)
+        finally:
+            os.close(fd)
+
+    def make_temp(self, parent: int, parent_rel: str, base: str) -> tuple[str, int]:
+        """A new 0600 temp file beside base, created with O_EXCL and never
+        through a symlink."""
+        for _attempt in range(100):
+            name = temp_name(base)
+            try:
+                fd = os.open(name, TEMP_FLAGS, 0o600, dir_fd=parent)
+                self.temps.add(f"{parent_rel}/{name}")
+                return name, fd
+            except FileExistsError:
+                info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+                if stat.S_ISLNK(info.st_mode):
+                    raise SetupError(f"{self.show(parent_rel + '/' + name)} is a symlink")
+                continue
+        raise SetupError(f"cannot make a temp file in {self.show(parent_rel)}")
+
+    def unlink(self, rel: str) -> None:
+        parent, name = self.parent_of(rel)
+        os.unlink(name, dir_fd=parent)
+        self.temps.discard(rel)
+        sync(parent)
+
+    def drop_temps(self) -> list[str]:
+        """Delete the temp files this run made and has not yet deleted.
+        Returns the ones it could not delete."""
+        left = []
+        for rel in sorted(self.temps):
+            try:
+                self.unlink(rel)
+            except FileNotFoundError:
+                self.temps.discard(rel)
+            except Exception:
+                left.append(self.show(rel))
+        return left
+
+    def publish(self, rel: str, data: bytes, landed: Callable[[], None]) -> None:
+        """Write data as the new file rel: a temp in the same folder, written
+        and fsynced in full, then linked into place (which fails if rel
+        exists). The target is never partial and never overwritten."""
+        parent, name = self.parent_of(rel)
+        parent_rel = rel.rpartition("/")[0]
+        temp, fd = self.make_temp(parent, parent_rel, name)
+        try:
+            try:
+                write_all(fd, data)
+                sync(fd)
+            finally:
+                os.close(fd)
+            os.link(temp, name, src_dir_fd=parent, dst_dir_fd=parent)
+            landed()
+            sync(parent)
+        finally:
+            self.unlink(f"{parent_rel}/{temp}")
+
+    def replace_settings(self, data: bytes, base: bytes | None, mode: int,
+                         verb: str, landed: Callable[[], None]) -> None:
+        """Replace settings.json with data through a temp file that already
+        has the given mode, only if settings.json still holds base."""
+        parent, name = self.parent_of(SETTINGS_REL)
+        temp, fd = self.make_temp(parent, CLAUDE_REL, name)
+        placed = False
+        try:
+            try:
+                os.fchmod(fd, mode)
+                write_all(fd, data)
+                sync(fd)
+            finally:
+                os.close(fd)
+            current = self.read(SETTINGS_REL)
+            if (current[0] if current else None) != base:
+                raise SetupError(
+                    f"{SETTINGS_REL} changed while {verb} was running; "
+                    "it was not written")
+            os.replace(temp, name, src_dir_fd=parent, dst_dir_fd=parent)
+            placed = True
+            landed()
+            sync(parent)
+        finally:
+            if placed:
+                self.temps.discard(f"{CLAUDE_REL}/{temp}")
+            else:
+                self.unlink(f"{CLAUDE_REL}/{temp}")
+
+    def rmdir(self, rel: str) -> bool:
+        """Remove the folder rel if it is empty. False when it stays."""
+        parent, name = self.parent_of(rel)
+        if parent is None:
+            return True
+        try:
+            os.rmdir(name, dir_fd=parent)
+        except FileNotFoundError:
+            return True
+        except OSError as exc:
+            if exc.errno in (errno.ENOTEMPTY, errno.EEXIST):
+                return False
+            raise
+        fd = self.fds.pop(rel, None)
+        if fd is not None:
+            os.close(fd)
+        sync(parent)
+        return True
+
+
+# ---------------------------------------------------------------------------
+# The lock
+
+
+def take_lock(tree: Tree) -> int:
+    """Open .claude/harness-setup.lock without following a symlink, make it
+    0600 and take an exclusive flock without waiting. The file is never
+    unlinked: release is closing the descriptor."""
+    shown = tree.show(LOCK_REL)
+    try:
+        claude = tree.dir(CLAUDE_REL, create=True)
+        try:
+            fd = os.open("harness-setup.lock", LOCK_FLAGS, 0o600, dir_fd=claude)
+        except OSError as exc:
+            tree.refuse_entry(claude, "harness-setup.lock", LOCK_REL, exc)
+            raise
+    except SetupError:
+        raise
+    except OSError as exc:
+        raise SetupError(f"cannot take the setup lock: {exc}") from exc
+    try:
+        sync(claude)
+        os.fchmod(fd, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise SetupError(
+                f"another harness setup run holds the lock {shown}; "
+                "nothing was changed") from exc
+        held = os.fstat(fd)
+        try:
+            now = os.stat("harness-setup.lock", dir_fd=claude, follow_symlinks=False)
+        except FileNotFoundError:
+            now = None
+        if now is None or (now.st_dev, now.st_ino) != (held.st_dev, held.st_ino):
+            raise SetupError(
+                f"cannot take the setup lock: {shown} was replaced while it was taken")
+    except SetupError:
+        os.close(fd)
+        raise
+    except OSError as exc:
+        os.close(fd)
+        raise SetupError(f"cannot take the setup lock: {exc}") from exc
+    return fd
+
+
+# ---------------------------------------------------------------------------
+# The record
+
+
+def is_hex64(value: Any) -> bool:
+    return isinstance(value, str) and len(value) == 64 and set(value) <= HEX
+
+
+def header_line(backup: str | None) -> bytes:
+    return json_line({"record": RECORD_KIND, "version": RECORD_VERSION, "backup": backup})
+
+
+def parse_line(raw: bytes) -> dict[str, Any] | None:
+    try:
+        data = json.loads(raw.decode("utf-8"), object_pairs_hook=pairs)
+    except (UnicodeDecodeError, ValueError):
         return None
-    settings["sandbox"] = dict(SANDBOX_VALUE)
-    return {"kind": "key", "name": "sandbox", "value": dict(SANDBOX_VALUE)}
+    return data if isinstance(data, dict) else None
 
 
-def apply_deny_rules(settings: dict[str, Any], rules: list[str]) -> list[dict[str, Any]]:
-    recorded: list[dict[str, Any]] = []
-    if not rules:
-        return recorded
-    permissions = settings.get("permissions")
-    if permissions is not None and not isinstance(permissions, dict):
-        return recorded
-    deny: list[Any] | None
-    if permissions is None:
-        deny = None
+def valid_header(head: dict[str, Any] | None) -> bool:
+    return (head is not None
+            and set(head) == {"record", "version", "backup"}
+            and head["record"] == RECORD_KIND
+            and type(head["version"]) is int and head["version"] == RECORD_VERSION
+            and head["backup"] in (None, BACKUP_REL))
+
+
+def valid_item(item: Any) -> bool:
+    if not isinstance(item, dict):
+        return False
+    index = item.get("index")
+    if type(index) is not int or index < 0:
+        return False
+    if item.get("kind") == "key":
+        return (set(item) == {"kind", "name", "value", "index", "before", "after"}
+                and item["name"] == "sandbox" and item["value"] == SANDBOX_VALUE)
+    if item.get("kind") == "deny":
+        return (set(item) == {"kind", "value", "index", "before", "after"}
+                and item["value"] in DENY_RULES)
+    return False
+
+
+def valid_body(body: dict[str, Any] | None, head: dict[str, Any]) -> bool:
+    if body is None or set(body) != {"complete", "files", "settings", "dirs", "backup_sha256"}:
+        return False
+    if body["complete"] is not True:
+        return False
+    files = body["files"]
+    if not isinstance(files, list):
+        return False
+    paths = []
+    for item in files:
+        if (not isinstance(item, dict) or set(item) != {"path", "sha256"}
+                or item["path"] not in (RULES_REL, OVERRIDE_REL)
+                or not is_hex64(item["sha256"])):
+            return False
+        paths.append(item["path"])
+    if len(set(paths)) != len(paths) or RULES_REL not in paths:
+        return False
+    dirs = body["dirs"]
+    if (not isinstance(dirs, list) or any(d not in CREATABLE_DIRS for d in dirs)
+            or len(set(dirs)) != len(dirs)):
+        return False
+    settings = body["settings"]
+    if (not isinstance(settings, dict)
+            or set(settings) != {"created", "sha256", "items",
+                                 "created_permissions", "created_deny"}
+            or type(settings["created"]) is not bool
+            or type(settings["created_permissions"]) is not bool
+            or type(settings["created_deny"]) is not bool
+            or not isinstance(settings["items"], list)
+            or not all(valid_item(item) for item in settings["items"])):
+        return False
+    if settings["items"]:
+        if not is_hex64(settings["sha256"]):
+            return False
+    elif settings["sha256"] is not None or settings["created"]:
+        return False
+    if head["backup"] is None:
+        return body["backup_sha256"] is None
+    return is_hex64(body["backup_sha256"])
+
+
+def parse_record(raw: bytes) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """(header, body). body is None unless the record is complete: exactly
+    a valid header line and a valid complete line, each ending in a newline,
+    and nothing else. header is None when line 1 is not a valid header."""
+    first, newline, rest = raw.partition(b"\n")
+    head = parse_line(first) if newline else None
+    if not valid_header(head):
+        return None, None
+    second, newline, tail = rest.partition(b"\n")
+    if not newline or tail:
+        return head, None
+    body = parse_line(second)
+    if not valid_body(body, head):
+        return head, None
+    return head, body
+
+
+def hard_stop_refusal(tree: Tree, head: dict[str, Any] | None) -> SetupError:
+    backup = tree.entry(BACKUP_REL)
+    if backup is not None:
+        state = f"{tree.show(BACKUP_REL)} (present)"
+    elif head is not None and head["backup"] is None:
+        state = "none (settings.json did not exist)"
     else:
-        deny = permissions.get("deny")
-        if deny is not None and not isinstance(deny, list):
-            return recorded
-    created_permissions = False
-    created_deny = False
-    for rule in rules:
-        if deny is not None and rule in deny:
+        state = f"{tree.show(BACKUP_REL)} (absent: settings.json was not changed)"
+    return SetupError(
+        "an earlier setup run stopped before it finished; "
+        f"record: {tree.show(RECORD_REL)}; settings backup: {state}; "
+        'see KNOWN-LIMITS "After a hard stop" to recover by hand')
+
+
+def read_record(tree: Tree) -> tuple[bytes | None, dict[str, Any] | None, dict[str, Any] | None]:
+    """Check the record's folders, the record and the backup for symlinks,
+    and read the record."""
+    for rel in RECORD_DIRS:
+        tree.dir(rel)
+    tree.entry(BACKUP_REL)
+    found = tree.read(RECORD_REL)
+    if found is None:
+        return None, None, None
+    head, body = parse_record(found[0])
+    return found[0], head, body
+
+
+# ---------------------------------------------------------------------------
+# Settings items
+
+
+def add_items(settings: dict[str, Any], ids: set[str],
+              notes: list[str]) -> tuple[list[dict[str, Any]], bool, bool]:
+    """Add each approved item that is absent. Returns the items with their
+    recorded places, and whether permissions and permissions.deny were made."""
+    items: list[dict[str, Any]] = []
+    if "sandbox" in ids and "sandbox" not in settings:
+        keys = list(settings)
+        settings["sandbox"] = dict(SANDBOX_VALUE)
+        items.append({"kind": "key", "name": "sandbox", "value": dict(SANDBOX_VALUE),
+                      "index": len(keys), "before": keys[-1] if keys else None,
+                      "after": None})
+    wanted = [rule for rule in DENY_RULES if f"deny:{rule}" in ids]
+    created_permissions = created_deny = False
+    permissions = settings.get("permissions")
+    deny = permissions.get("deny") if isinstance(permissions, dict) else None
+    if wanted and permissions is not None and not isinstance(permissions, dict):
+        notes.append(f"not added: deny rules ({SETTINGS_REL} permissions is not an object)")
+        return items, False, False
+    if wanted and deny is not None and not isinstance(deny, list):
+        notes.append(f"not added: deny rules ({SETTINGS_REL} permissions.deny is not a list)")
+        return items, False, False
+    added: list[int] = []
+    for rule in wanted:
+        if isinstance(deny, list) and rule in deny:
             continue
         if permissions is None:
             permissions = {}
@@ -508,402 +736,517 @@ def apply_deny_rules(settings: dict[str, Any], rules: list[str]) -> list[dict[st
             deny = []
             permissions["deny"] = deny
             created_deny = True
-        before = deny[-1] if deny else None
         deny.append(rule)
-        recorded.append({
-            "kind": "deny",
-            "value": rule,
-            "index": len(deny) - 1,
-            "before": before,
-            "after": None,
-            "created_permissions": created_permissions,
-            "created_deny": created_deny,
-        })
-        created_permissions = False
-        created_deny = False
-    return recorded
+        added.append(len(deny) - 1)
+    for index in added:
+        items.append({"kind": "deny", "value": deny[index], "index": index,
+                      "before": deny[index - 1] if index > 0 else None,
+                      "after": deny[index + 1] if index + 1 < len(deny) else None})
+    return items, created_permissions, created_deny
 
 
-class SetupLock:
-    """The exclusive lock one apply or remove run holds from its first read
-    to its last write, rollback included."""
+def take_out(settings: dict[str, Any], info: dict[str, Any], shown: str,
+             kept: list[str], gone: list[str]) -> None:
+    """Take out each recorded item that is still at its recorded place with
+    its recorded neighbours, judged on settings as it is now. Anything else
+    is kept and named; nothing else in settings is touched."""
+    permissions = settings.get("permissions")
+    deny = permissions.get("deny") if isinstance(permissions, dict) else None
+    matched: list[int] = []
+    for item in info["items"]:
+        if item["kind"] != "deny":
+            continue
+        value, index = item["value"], item["index"]
+        if not isinstance(deny, list) or value not in deny:
+            gone.append(f"{shown}: permissions.deny rule {value!r}")
+            continue
+        before = deny[index - 1] if 0 < index <= len(deny) else None
+        after = deny[index + 1] if index + 1 < len(deny) else None
+        if (index < len(deny) and deny[index] == value and deny.count(value) == 1
+                and before == item["before"] and after == item["after"]):
+            matched.append(index)
+        else:
+            kept.append(f"{shown}: permissions.deny rule {value!r} (moved or duplicated)")
+    for index in sorted(matched, reverse=True):
+        del deny[index]
+    if isinstance(deny, list) and not deny and info["created_deny"]:
+        del permissions["deny"]
+    if isinstance(permissions, dict) and not permissions and info["created_permissions"]:
+        del settings["permissions"]
+    for item in info["items"]:
+        if item["kind"] != "key":
+            continue
+        name = item["name"]
+        if name not in settings:
+            gone.append(f"{shown}: {name}")
+        elif settings[name] == item["value"]:
+            del settings[name]
+        else:
+            kept.append(f"{shown}: {name} (value changed)")
 
-    def __init__(self, path: Path, fd: int, made_dir: bool) -> None:
-        self.path = path
-        self.fd = fd
-        self.made_dir = made_dir
-        self.prune_dir = made_dir
 
-    def release(self) -> None:
-        # Unlink while still holding the lock, so a run that opened this
-        # file meanwhile finds it gone once it gets the lock, and refuses.
-        try:
-            os.unlink(self.path)
-        except OSError:
-            pass
-        os.close(self.fd)
-        if self.prune_dir:
-            try:
-                self.path.parent.rmdir()
-            except OSError:
-                pass
+# ---------------------------------------------------------------------------
+# Apply
 
 
-def claim_lock(fd: int, path: Path) -> None:
-    """Take the lock on fd without waiting, or refuse by name. The file
-    locked must still be the one at path: a run that opened a lock file
-    another run has since released and unlinked does not hold the lock."""
+def which_claude() -> str:
+    found = shutil.which("claude")
+    if not found:
+        raise SetupError("claude is not on PATH")
+    return found
+
+
+def configure_ledger(claude: str, values: dict[str, str], lock_fd: int) -> None:
+    """Run `claude plugin configure`. The child shares the lock descriptor,
+    so the lock stays held while it runs even if setup is killed."""
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError as exc:
-        raise SetupError(LOCKED) from exc
+        done = subprocess.run(
+            [claude, "plugin", "configure", LEDGER_PLUGIN, "--values-stdin"],
+            input=json.dumps(values), capture_output=True, text=True,
+            pass_fds=(lock_fd,))
     except OSError as exc:
-        raise SetupError(f"cannot take the setup lock: {exc}") from exc
-    held = os.fstat(fd)
-    try:
-        now = os.lstat(path)
-    except OSError:
-        now = None
-    if now is None or (now.st_dev, now.st_ino) != (held.st_dev, held.st_ino):
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        raise SetupError(LOCKED)
+        raise SetupError(f"claude plugin configure failed: {exc}") from exc
+    if done.returncode != 0:
+        detail = one_line(done.stderr or done.stdout or f"exit {done.returncode}")
+        raise SetupError(f"claude plugin configure failed: {detail}")
 
 
-def take_lock(home: Path) -> SetupLock:
-    path = rel_path(home, LOCK_REL)
-    made_dir = False
-    if not lexists(path.parent):
-        try:
-            path.parent.mkdir()
-            made_dir = True
-        except FileExistsError:
-            pass
-        except OSError as exc:
-            raise SetupError(f"cannot take the setup lock: {exc}") from exc
-    flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
-    try:
-        fd = os.open(path, flags, 0o600)
-    except OSError as exc:
-        if made_dir:
-            try:
-                path.parent.rmdir()
-            except OSError:
-                pass
-        raise SetupError(f"cannot take the setup lock: {exc}") from exc
-    try:
-        claim_lock(fd, path)
-    except SetupError:
-        os.close(fd)
-        raise
-    return SetupLock(path, fd, made_dir)
+def read_settings(tree: Tree) -> tuple[bytes, int, dict[str, Any]] | None:
+    found = tree.read(SETTINGS_REL)
+    if found is None:
+        return None
+    raw, mode = found
+    return raw, mode, parse_json_object(raw, tree.show(SETTINGS_REL))
 
 
-@contextlib.contextmanager
-def setup_lock(home: Path):
-    lock = take_lock(home)
-    try:
-        yield lock
-    finally:
-        lock.release()
+class Changes:
+    """What apply has changed, in memory, each added the moment it lands."""
 
-
-def record_bytes(record: dict[str, Any]) -> bytes:
-    """The record's exact bytes. It carries the digest of those same bytes
-    taken with the digest field set to a fixed draft value."""
-    body = dict(record)
-    body[RECORD_DIGEST_KEY] = RECORD_DIGEST_DRAFT
-    body[RECORD_DIGEST_KEY] = digest(dump_json(body).encode("utf-8"))
-    return dump_json(body).encode("utf-8")
-
-
-def record_intact(raw: bytes) -> bool:
-    """True when raw is byte for byte what apply wrote."""
-    try:
-        data = json.loads(raw.decode("utf-8"), object_pairs_hook=pairs)
-    except (UnicodeDecodeError, ValueError):
-        return False
-    if not isinstance(data, dict) or RECORD_DIGEST_KEY not in data:
-        return False
-    return record_bytes(data) == raw
-
-
-def plan_verb(home: Path, operator: str, harness: str | None) -> str:
-    grants = granting_proposals()
-    if grants:
-        raise SetupError("proposals grant: " + ", ".join(grants))
-    override = load_source(OVERRIDE_SOURCE)
-    if not comment_only(override):
-        raise SetupError("override starter has a line that is not a comment")
-    return format_plan(home, operator, harness)
+    def __init__(self) -> None:
+        self.dirs: list[str] = []
+        self.record: dict[str, Any] | None = None
+        self.backup: str | None = None
+        self.files: dict[str, str] = {}
+        self.settings: dict[str, Any] | None = None
 
 
 def apply_verb(home: Path, operator: str, harness: str | None,
-               approve: list[str], approve_all: bool) -> str:
-    with setup_lock(home) as lock:
-        return apply_locked(home, operator, harness, approve, approve_all, lock)
+               approve: list[str], approve_all: bool) -> tuple[str, list[str]]:
+    tree = Tree(home)
+    try:
+        lock = take_lock(tree)
+        try:
+            return apply_locked(tree, lock, operator, harness, approve, approve_all)
+        finally:
+            os.close(lock)
+    finally:
+        tree.close()
 
 
-def apply_locked(home: Path, operator: str, harness: str | None,
-                 approve: list[str], approve_all: bool, lock: SetupLock) -> str:
-    grants = granting_proposals()
-    if grants:
-        raise SetupError("proposals grant: " + ", ".join(grants))
-    override_text = load_source(OVERRIDE_SOURCE)
-    if not comment_only(override_text):
-        raise SetupError("override starter has a line that is not a comment")
-    rules_text = load_source(RULES_SOURCE)
-    rules_path = rel_path(home, RULES_REL)
-    override_path = rel_path(home, OVERRIDE_REL)
-    record_path = rel_path(home, RECORD_REL)
-    settings_path = rel_path(home, SETTINGS_REL)
-    if lexists(record_path):
-        raise SetupError("already applied; run remove first")
-    if lexists(rules_path):
-        raise SetupError(f"rules default already exists: {RULES_REL}")
+def apply_locked(tree: Tree, lock: int, operator: str, harness: str | None,
+                 approve: list[str], approve_all: bool) -> tuple[str, list[str]]:
+    # Preconditions: no writes.
+    rules_bytes, override_bytes = check_proposals()
+    raw, head, body = read_record(tree)
+    if raw is not None:
+        if body is not None:
+            raise SetupError("already applied; run remove first")
+        raise hard_stop_refusal(tree, head)
+    if tree.entry(BACKUP_REL) is not None:
+        raise SetupError(f"leftover settings backup: {tree.show(BACKUP_REL)}")
+    tree.dir(RULES_DIR_REL)
+    if tree.entry(RULES_REL) is not None:
+        raise SetupError(f"rules default already exists: {tree.show(RULES_REL)}")
+    tree.entry(OVERRIDE_REL)
+    tree.entry(SETTINGS_REL)
     claude = which_claude()
     ids = approved_ids(approve, approve_all)
-    if ids:
-        refuse_settings_link(settings_path)
-    settings, settings_existed, settings_indent, settings_raw = load_settings(
-        settings_path)
+    read_settings(tree)
 
-    messages: list[str] = []
-    files: list[dict[str, Any]] = []
-    # The lock made the .claude folder when the home had none: it is this
-    # run's to take out again, on rollback and on remove.
-    created_dirs: list[str] = [".claude"] if lock.made_dir else []
-    originals: dict[Path, bytes | None] = {}
-    written: dict[Path, bytes] = {}
-
-    def snapshot(path: Path) -> None:
-        if path in originals:
-            return
-        note_created_dirs(path, home, created_dirs)
-        if lexists(path):
-            originals[path] = path.read_bytes()
-        else:
-            originals[path] = None
-
+    # Configure, then the settings bytes apply builds on.
+    configure_ledger(claude, ledger_values(tree.home, operator, harness), lock)
     try:
-        snapshot(rules_path)
-        rules_bytes = rules_text.encode("utf-8")
-        write_new_file(rules_path, rules_text)
-        written[rules_path] = rules_bytes
-        files.append({
-            "path": RULES_REL,
-            "sha256": digest(rules_bytes),
-            "ours": True,
-        })
-
-        if lexists(override_path):
-            messages.append(f"kept: {OVERRIDE_REL} (already existed)")
-            files.append({"path": OVERRIDE_REL, "ours": False})
-        else:
-            snapshot(override_path)
-            override_bytes = override_text.encode("utf-8")
-            write_new_file(override_path, override_text)
-            written[override_path] = override_bytes
-            files.append({
-                "path": OVERRIDE_REL,
-                "sha256": digest(override_bytes),
-                "ours": True,
-            })
-
-        settings_created = not settings_existed
-        settings_records: list[dict[str, Any]] = []
-        if "sandbox" in ids:
-            added = apply_sandbox(settings)
-            if added is not None:
-                settings_records.append(added)
-        deny_ids = [ident[len("deny:"):] for ident in ids if ident.startswith("deny:")]
-        deny_wanted = [rule for rule in DENY_RULES if rule in deny_ids]
-        settings_records.extend(apply_deny_rules(settings, deny_wanted))
-        settings_written = bool(settings_records)
-        if settings_written:
-            if read_current(settings_path) != settings_raw:
-                raise SetupError(
-                    f"{SETTINGS_REL} changed while apply was running; "
-                    "it was not written")
-            snapshot(settings_path)
-            written[settings_path] = save_settings(
-                settings_path, settings, indent=settings_indent)
-
-        values = ledger_values(home, operator, harness)
-        snapshot(record_path)
-        record = {
-            "version": 1,
-            "files": files,
-            "settings": {
-                "created": settings_created and settings_written,
-                "existed": settings_existed,
-                "items": settings_records,
-                "sha256": (digest(written[settings_path])
-                           if settings_written else None),
-            },
-            "created_dirs": list(created_dirs),
-            "ledger_database": str(database_path(home)),
-            "configure": {"plugin": LEDGER_PLUGIN, "values": values},
-        }
-        record_raw = record_bytes(record)
-        write_new_file(record_path, record_raw.decode("utf-8"))
-        written[record_path] = record_raw
-        configure_ledger(claude, values)
-        messages.append(f"applied: {RECORD_REL}")
-        return "\n".join(messages) + ("\n" if messages else "")
+        base = read_settings(tree)
     except SetupError as exc:
-        kept = restore_apply(home, originals, created_dirs, written)
-        if kept:
-            raise with_kept(exc, home, kept) from exc
-        raise
-    except OSError as exc:
-        kept = restore_apply(home, originals, created_dirs, written)
-        raise with_kept(SetupError(f"apply failed: {exc}"), home, kept) from exc
+        raise SetupError(f"{exc}; {CONFIGURE_STAYS}") from exc
+    except Exception as exc:
+        raise SetupError(f"unexpected error: {type(exc).__name__}: {one_line(exc)}; "
+                         f"{CONFIGURE_STAYS}") from exc
+
+    changes = Changes()
+    notes: list[str] = []
+    try:
+        apply_changes(tree, changes, base, ids, rules_bytes, override_bytes, notes)
+    except Exception as exc:
+        raise rollback(tree, changes, exc) from exc
+
+    # Apply has completed: line 2 is written. The backup is no longer needed.
+    warnings: list[str] = []
+    if changes.backup is not None:
+        try:
+            current = tree.read(BACKUP_REL)
+            if current is not None and digest(current[0]) == changes.backup:
+                tree.unlink(BACKUP_REL)
+            elif current is not None:
+                warnings.append(f"warning: kept for a manual check: {tree.show(BACKUP_REL)}")
+        except Exception as exc:
+            warnings.append(
+                f"warning: could not delete the settings backup {tree.show(BACKUP_REL)} "
+                f"({type(exc).__name__}: {one_line(exc)}); remove deletes it")
+    notes.append(f"applied: {tree.show(RECORD_REL)}")
+    return "".join(line + "\n" for line in notes), warnings
 
 
-def neighbours_match(deny: list[Any], item: dict[str, Any]) -> bool:
-    index = item["index"]
-    if not isinstance(index, int) or index < 0 or index >= len(deny):
-        return False
-    if deny[index] != item["value"]:
-        return False
-    before = deny[index - 1] if index > 0 else None
-    after = deny[index + 1] if index + 1 < len(deny) else None
-    return before == item.get("before") and after == item.get("after")
+CONFIGURE_STAYS = "the ledger options claude plugin configure set stay set"
 
 
-def remove_settings(home: Path, record: dict[str, Any], messages: list[str]) -> None:
-    info = record.get("settings") or {}
-    items = list(info.get("items") or [])
-    settings_path = rel_path(home, SETTINGS_REL)
-    if not items:
-        return
-    if not settings_path.is_file():
-        messages.append(f"kept: {SETTINGS_REL} (missing)")
-        return
-    raw = read_named(settings_path)
-    if digest(raw) != info.get("sha256"):
-        messages.append(
-            f"needs a manual check: {SETTINGS_REL} (changed after apply wrote "
-            "it; only entries still at their recorded place were taken out)")
-    indent = detect_indent(decode_text(raw, settings_path))
-    settings = parse_json_object(raw, settings_path)
-    deny_items = [item for item in items if item.get("kind") == "deny"]
-    key_items = [item for item in items if item.get("kind") == "key"]
-    permissions = settings.get("permissions")
-    deny = permissions.get("deny") if isinstance(permissions, dict) else None
-    for item in sorted(deny_items, key=lambda row: row.get("index", -1), reverse=True):
-        value = item.get("value")
-        if isinstance(deny, list) and neighbours_match(deny, item):
-            del deny[item["index"]]
+def apply_changes(tree: Tree, changes: Changes, base: tuple[bytes, int, dict[str, Any]] | None,
+                  ids: set[str], rules_bytes: bytes, override_bytes: bytes,
+                  notes: list[str]) -> None:
+    def made(rel: str) -> None:
+        changes.dirs.append(rel)
+
+    # Record, then backup. Until the backup is in place nothing outside
+    # setup's own folder has changed.
+    tree.dir(SETUP_DIR_REL, create=True, made=made)
+    line1 = header_line(BACKUP_REL if base is not None else None)
+
+    def record_landed() -> None:
+        changes.record = {"line1": line1, "line2": None}
+
+    tree.publish(RECORD_REL, line1, record_landed)
+    if base is not None:
+        backup_sha = digest(base[0])
+
+        def backup_landed() -> None:
+            changes.backup = backup_sha
+
+        tree.publish(BACKUP_REL, base[0], backup_landed)
+
+    # Rules, then the override when the person has none.
+    tree.dir(RULES_DIR_REL, create=True, made=made)
+    files: list[dict[str, str]] = []
+    for rel, data in ((RULES_REL, rules_bytes), (OVERRIDE_REL, override_bytes)):
+        if rel == OVERRIDE_REL and tree.entry(OVERRIDE_REL) is not None:
+            notes.append(f"kept: {tree.show(OVERRIDE_REL)} (already existed)")
             continue
-        messages.append(
-            f"kept: permissions.deny rule {value!r} (moved or duplicated)")
-    for item in key_items:
-        name = item.get("name")
-        value = item.get("value")
-        if name in settings and settings[name] == value:
-            del settings[name]
-        elif name in settings:
-            messages.append(f"kept: settings key {name} (value changed)")
-        else:
-            messages.append(f"kept: settings key {name} (missing)")
-    if isinstance(permissions, dict):
-        deny_now = permissions.get("deny")
-        if isinstance(deny_now, list) and not deny_now:
-            created_deny = any(item.get("created_deny") for item in deny_items)
-            if created_deny:
-                del permissions["deny"]
-        if not permissions:
-            created_permissions = any(
-                item.get("created_permissions") for item in deny_items)
-            if created_permissions:
-                del settings["permissions"]
-    if info.get("created") and settings == {}:
-        settings_path.unlink()
-        return
+        sha = digest(data)
+
+        def file_landed(rel: str = rel, sha: str = sha) -> None:
+            changes.files[rel] = sha
+
+        try:
+            tree.publish(rel, data, file_landed)
+        except FileExistsError as exc:
+            raise SetupError(f"{tree.show(rel)} appeared while apply was running; "
+                             "it was not written") from exc
+        files.append({"path": rel, "sha256": sha})
+
+    # Settings, only when an approved item is absent.
+    obj = json.loads(json.dumps(base[2])) if base is not None else {}
+    items, created_permissions, created_deny = add_items(obj, ids, notes)
+    info = {"created": False, "sha256": None, "items": [],
+            "created_permissions": False, "created_deny": False}
     if items:
-        save_settings(settings_path, settings, indent=indent)
+        indent = detect_indent(base[0].decode("utf-8")) if base is not None else 2
+        new = dump_settings(obj, indent)
+        mode = base[1] if base is not None else 0o600
+        info = {"created": base is None, "sha256": digest(new), "items": items,
+                "created_permissions": created_permissions, "created_deny": created_deny}
+
+        def settings_landed() -> None:
+            changes.settings = {"base": base[0] if base is not None else None,
+                                "written": new, "info": info}
+
+        tree.replace_settings(new, base[0] if base is not None else None, mode,
+                              "apply", settings_landed)
+
+    # Finish: line 2.
+    body = {"complete": True, "files": files, "settings": info,
+            "dirs": list(changes.dirs),
+            "backup_sha256": changes.backup}
+    line2 = json_line(body)
+    changes.record["line2"] = line2
+    parent, name = tree.parent_of(RECORD_REL)
+    fd = os.open(name, APPEND_FLAGS, dir_fd=parent)
+    try:
+        write_all(fd, line2)
+        sync(fd)
+    finally:
+        os.close(fd)
 
 
-def remove_verb(home: Path) -> str:
-    with setup_lock(home) as lock:
-        return remove_locked(home, lock)
+def record_is_ours(current: bytes, record: dict[str, Any]) -> bool:
+    line1, line2 = record["line1"], record["line2"]
+    if not current.startswith(line1):
+        return False
+    rest = current[len(line1):]
+    return line2 is not None and line2.startswith(rest) or rest == b""
 
 
-def remove_locked(home: Path, lock: SetupLock) -> str:
-    record_path = rel_path(home, RECORD_REL)
-    if not record_path.is_file():
-        raise SetupError(f"no record at {RECORD_REL}")
-    raw = read_named(record_path)
-    if not record_intact(raw):
-        raise SetupError(
-            f"{RECORD_REL} changed after apply wrote it, left as it is, "
-            "needs a manual check")
-    record = parse_json_object(raw, record_path)
-    messages: list[str] = []
-    created_dirs = list(record.get("created_dirs") or [])
-    if ".claude" in created_dirs:
-        lock.prune_dir = True
-    if (record.get("settings") or {}).get("items"):
-        refuse_settings_link(rel_path(home, SETTINGS_REL))
-    for item in record.get("files") or []:
-        relative = item.get("path")
-        if not isinstance(relative, str):
+def rollback(tree: Tree, changes: Changes, exc: Exception) -> SetupError:
+    """Undo apply's changes from memory, under I2: a file whose bytes are not
+    the bytes setup wrote is kept and named. What to undo never comes from the
+    record, and nothing is written to it; its bytes are read only to compare
+    them with what this run wrote before it is deleted. If any step fails,
+    the record and the backup are kept, so the next run refuses by name."""
+    kept: list[str] = []
+    failed: list[str] = []
+
+    def attempt(shown: str, action: Callable[[], None]) -> None:
+        try:
+            action()
+        except Exception:
+            failed.append(shown)
+
+    if changes.settings is not None:
+        attempt(tree.show(SETTINGS_REL), lambda: rollback_settings(tree, changes, kept))
+    for rel in (OVERRIDE_REL, RULES_REL):
+        if rel in changes.files:
+            sha = changes.files[rel]
+            attempt(tree.show(rel), lambda rel=rel, sha=sha: delete_if(tree, rel, sha, kept))
+    if not failed:
+        if changes.record is not None:
+            record = changes.record
+
+            def drop_record() -> None:
+                current = tree.read(RECORD_REL)
+                if current is None:
+                    return
+                if not record_is_ours(current[0], record):
+                    kept.append(tree.show(RECORD_REL))
+                    return
+                tree.unlink(RECORD_REL)
+
+            attempt(tree.show(RECORD_REL), drop_record)
+        if changes.backup is not None and not failed:
+            sha = changes.backup
+            attempt(tree.show(BACKUP_REL), lambda: delete_if(tree, BACKUP_REL, sha, kept))
+    failed.extend(tree.drop_temps())
+    for rel in reversed(changes.dirs):
+        attempt(tree.show(rel), lambda rel=rel: tree.rmdir(rel))
+
+    if isinstance(exc, SetupError):
+        message = str(exc)
+    else:
+        message = f"unexpected error: {type(exc).__name__}: {one_line(exc)}"
+    message = f"{message}; {CONFIGURE_STAYS}"
+    if failed:
+        backup = tree.show(BACKUP_REL)
+        if changes.record is not None and changes.record["line1"] == header_line(None):
+            backup = "none (settings.json did not exist)"
+        return SetupError(
+            f"rollback incomplete; kept: {', '.join(failed + kept)}; "
+            f"record: {tree.show(RECORD_REL)}; settings backup: {backup}")
+    return SetupError(message + "".join(
+        f"; kept for a manual check: {shown}" for shown in kept))
+
+
+def delete_if(tree: Tree, rel: str, sha: str, kept: list[str]) -> None:
+    current = tree.read(rel)
+    if current is None:
+        return
+    if digest(current[0]) != sha:
+        kept.append(tree.show(rel))
+        return
+    tree.unlink(rel)
+
+
+def rollback_settings(tree: Tree, changes: Changes, kept: list[str]) -> None:
+    state = changes.settings
+    shown = tree.show(SETTINGS_REL)
+    found = tree.read(SETTINGS_REL)
+    if found is None:
+        kept.append(shown)
+        return
+    current, mode = found
+    if current == state["written"]:
+        if state["base"] is None:
+            tree.unlink(SETTINGS_REL)
+        else:
+            tree.replace_settings(state["base"], current, mode, "apply", lambda: None)
+        return
+    # Changed since apply wrote it: take apply's items out one by one.
+    kept.append(shown)
+    try:
+        obj = parse_json_object(current, shown)
+    except SetupError:
+        return
+    take_out(obj, state["info"], shown, [], [])
+    new = dump_settings(obj, detect_indent(current.decode("utf-8")))
+    if new != current:
+        tree.replace_settings(new, current, mode, "apply", lambda: None)
+
+
+# ---------------------------------------------------------------------------
+# Remove
+
+
+def remove_verb(home: Path) -> tuple[str, list[str]]:
+    tree = Tree(home)
+    try:
+        lock = take_lock(tree)
+        try:
+            try:
+                return remove_locked(tree)
+            except Exception:
+                # Remove does not roll back; it only deletes its own temp.
+                tree.drop_temps()
+                raise
+        finally:
+            os.close(lock)
+    finally:
+        tree.close()
+
+
+def remove_locked(tree: Tree) -> tuple[str, list[str]]:
+    raw, head, body = read_record(tree)
+    if raw is None:
+        if tree.entry(BACKUP_REL) is not None:
+            raise SetupError(f"leftover settings backup: {tree.show(BACKUP_REL)}")
+        raise SetupError(f"no record at {tree.show(RECORD_REL)}")
+    if body is None:
+        raise hard_stop_refusal(tree, head)
+    tree.dir(RULES_DIR_REL)
+    for rel in (RULES_REL, OVERRIDE_REL, SETTINGS_REL):
+        tree.entry(rel)
+    settings_now = read_settings(tree)
+
+    kept: list[str] = []
+    gone: list[str] = []
+    shown = tree.show(SETTINGS_REL)
+
+    # Settings.
+    info = body["settings"]
+    if info["items"]:
+        if settings_now is None:
+            gone.append(shown)
+        else:
+            current, mode, obj = settings_now
+            take_out(obj, info, shown, kept, gone)
+            if info["created"] and obj == {}:
+                again = tree.read(SETTINGS_REL)
+                if (again[0] if again else None) != current:
+                    raise SetupError(
+                        f"{SETTINGS_REL} changed while remove was running; "
+                        "it was not written")
+                tree.unlink(SETTINGS_REL)
+            else:
+                new = dump_settings(obj, detect_indent(current.decode("utf-8")))
+                if new != current:
+                    tree.replace_settings(new, current, mode, "remove", lambda: None)
+
+    # Files: the override, then the rules file.
+    listed = {item["path"]: item["sha256"] for item in body["files"]}
+    for rel in (OVERRIDE_REL, RULES_REL):
+        if rel not in listed:
             continue
-        path = rel_path(home, relative)
-        if not item.get("ours"):
-            messages.append(f"kept: {relative} (already existed)")
-            continue
-        if not path.is_file():
-            messages.append(f"kept: {relative} (missing)")
-            continue
-        current = digest(path.read_bytes())
-        if current != item.get("sha256"):
-            messages.append(f"kept: {relative} (edited)")
-            continue
-        path.unlink()
-    remove_settings(home, record, messages)
-    db = record.get("ledger_database")
-    if db:
-        messages.append(f"kept: ledger database at {db} (person's data)")
-    record_path.unlink()
-    prune_created(home, created_dirs)
-    return "\n".join(messages) + ("\n" if messages else "")
+        found = tree.read(rel)
+        if found is None:
+            gone.append(tree.show(rel))
+        elif digest(found[0]) != listed[rel]:
+            kept.append(tree.show(rel))
+        else:
+            tree.unlink(rel)
+
+    # Backup.
+    if head["backup"] is not None:
+        found = tree.read(BACKUP_REL)
+        if found is not None:
+            if digest(found[0]) == body["backup_sha256"]:
+                tree.unlink(BACKUP_REL)
+            else:
+                kept.append(tree.show(BACKUP_REL))
+
+    # Finish: folders off the record's path, then the record, then the
+    # record's own folders.
+    dirs = list(body["dirs"])
+    for rel in sorted((d for d in dirs if d not in RECORD_DIRS),
+                      key=lambda d: d.count("/"), reverse=True):
+        tree.rmdir(rel)
+    current = tree.read(RECORD_REL)
+    if current is None or current[0] != raw:
+        raise SetupError(f"{tree.show(RECORD_REL)} changed while remove was running")
+    tree.unlink(RECORD_REL)
+
+    warnings: list[str] = []
+    for rel in sorted((d for d in dirs if d in RECORD_DIRS),
+                      key=lambda d: d.count("/"), reverse=True):
+        try:
+            tree.rmdir(rel)
+        except Exception as exc:
+            warnings.append(
+                f"warning: could not remove the empty folder {tree.show(rel)} "
+                f"({type(exc).__name__}: {one_line(exc)})")
+
+    lines = [f"kept for a manual check: {item}" for item in kept]
+    lines += [f"already gone: {item}" for item in gone]
+    lines.append(f"kept: ledger database at {database_path(tree.home)} (person's data)")
+    lines.append(f"removed: {tree.show(RECORD_REL)}")
+    return "".join(line + "\n" for line in lines), warnings
+
+
+# ---------------------------------------------------------------------------
+# Command line
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message: str):  # type: ignore[override]
+        raise SetupError(message)
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Plan, apply or remove the default-tier setup.")
+    parser = Parser(description="Plan, apply or remove the default-tier setup.")
     parser.add_argument("verb", choices=("plan", "apply", "remove"))
-    parser.add_argument("--home", required=True, help="absolute fixture or user home")
-    parser.add_argument("--operator", default=None)
-    parser.add_argument("--harness", default=DEFAULT_HARNESS)
-    parser.add_argument("--approve", action="append", default=[], metavar="ID")
+    parser.add_argument("--home", required=True, help="absolute path of the home folder")
+    parser.add_argument("--operator", default=None,
+                        help="the ledger operator name (plan and apply)")
+    parser.add_argument("--harness", default=DEFAULT_HARNESS,
+                        help="the ledger harness name (plan and apply)")
+    parser.add_argument("--approve", action="append", default=[], metavar="ID",
+                        help="approve one optional settings proposal by id")
     parser.add_argument("--approve-all", action="store_true",
                         help="approve every optional settings proposal")
     return parser
 
 
+def resolve_home(value: str) -> Path:
+    if not os.path.isabs(value):
+        raise SetupError("home must be an absolute path")
+    home = Path(os.path.realpath(value))
+    if not home.is_dir():
+        raise SetupError(f"home is not a folder: {home}")
+    return home
+
+
+def run(argv: list[str]) -> tuple[str, list[str]]:
+    args = build_parser().parse_args(argv)
+    home = resolve_home(args.home)
+    if args.verb == "remove":
+        return remove_verb(home)
+    if not args.operator:
+        raise SetupError("--operator is required for plan and apply")
+    harness = args.harness or None
+    if args.verb == "plan":
+        return format_plan(home, args.operator, harness), []
+    return apply_verb(home, args.operator, harness, args.approve, args.approve_all)
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(sys.argv[1:] if argv is None else argv)
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    os.umask(0o077)
     try:
-        home = resolve_home(vars(args)["home"])
-        if args.verb in ("plan", "apply"):
-            if not args.operator:
-                print(f"{PREFIX} --operator is required for plan and apply", file=sys.stderr)
-                return 2
-            harness = args.harness or None
-            if args.verb == "plan":
-                sys.stdout.write(plan_verb(home, args.operator, harness))
-            else:
-                sys.stdout.write(apply_verb(
-                    home, args.operator, harness, args.approve, args.approve_all))
-        else:
-            sys.stdout.write(remove_verb(home))
+        out, warnings = run(sys.argv[1:] if argv is None else argv)
     except SetupError as exc:
-        print(f"{PREFIX} {exc}", file=sys.stderr)
+        print(f"{PREFIX} {one_line(exc)}", file=sys.stderr)
         return 1
+    except Exception as exc:
+        print(f"{PREFIX} unexpected error: {type(exc).__name__}: {one_line(exc)}",
+              file=sys.stderr)
+        return 1
+    sys.stdout.write(out)
+    for line in warnings:
+        print(f"{PREFIX} {line}", file=sys.stderr)
     return 0
 
 

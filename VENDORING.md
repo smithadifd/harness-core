@@ -59,7 +59,7 @@ the text itself.
 | `.github/workflows/commit-identity.yml` | CI: the commit identity check on every pull request |
 | `.gitignore` | keeps the bytecode Python writes out of the tree |
 | `CHANGELOG.md` | the changes of each tag |
-| `KNOWN-LIMITS.md` | limits that are known and out of scope for the current stage, one per line |
+| `KNOWN-LIMITS.md` | limits that are known and out of scope for the current stage, one per line, and the harness setup script's promise and limits |
 | `LICENSE` | the license: MIT, the same as the vendored ledger's |
 | `README.md` | what this repository is and how it is vendored |
 | `SECURITY.md` | how to report a vulnerability |
@@ -81,7 +81,7 @@ the text itself.
 | `scripts/tests/test_check_ledger_vendor.py` | tests of the ledger drift check |
 | `scripts/tests/test_check_no_person.py` | tests of the no-person check |
 | `scripts/tests/test_ci_workflow.py` | tests of the CI workflows' runners, triggers and gates, and that every gate script runs under an isolated python3 |
-| `scripts/tests/test_harness_setup.py` | fixture-home tests of the harness plan, apply and remove script |
+| `scripts/tests/test_harness_setup.py` | fixture-home tests of the harness plan, apply and remove script, with a hard stop and an injected exception at every step |
 | `scripts/tests/test_marketplace_manifest.py` | tests of the marketplace check (folders, manifests, expected sources, full-commit pins, tag against pin with a fake API fetch and with urllib's opener over a local transport) and of the plugin validation job |
 | `scripts/tests/test_probe_default_tier_load.py` | tests of the load probe, against a stubbed claude and git |
 

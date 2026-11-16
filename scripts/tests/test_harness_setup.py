@@ -1,20 +1,30 @@
 """Fixture-home tests of the harness plugin's plan, apply and remove script.
 
-Covers design § 6 (override file and settings proposals) and § 8 (uninstall),
-and the CI parts of § 7 tests 2 and 4. Homes are pytest tmp_path folders.
-A stub `claude` records configure arguments. Nothing granting is proposed.
+Homes are pytest tmp_path folders. A stub `claude` on PATH stands in for
+`claude plugin configure`. Most runs go through a small driver that imports
+setup.py in a child process, wraps the os calls setup makes (open with
+O_CREAT, write, fsync, fchmod, link, replace, unlink, mkdir, rmdir), logs
+each one as a numbered point, and at a chosen point can SIGKILL the child
+(a hard stop), raise an exception, make a short write, or run a test action.
+Nothing in setup.py knows about the driver.
 """
 from __future__ import annotations
 
+import errno
 import fcntl
 import hashlib
 import importlib.util
 import json
 import os
+import re
+import shutil
+import signal
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -29,1073 +39,1620 @@ _spec.loader.exec_module(mod)
 
 OPERATOR = "operator"
 HARNESS = "claude-code"
-CLAUDE_STUB = """\
-#!/usr/bin/env python3
-import json, sys
-from pathlib import Path
-log = Path(__file__).with_name("claude-log.json")
-record = {"argv": sys.argv[1:], "stdin": sys.stdin.read()}
-log.write_text(json.dumps(record), encoding="utf-8")
+PRE_SETTINGS = (json.dumps({"model": "kept", "permissions": {"deny": ["Read(seeded)"]}},
+                           indent=2) + "\n").encode("utf-8")
+MUTATING = {"create", "write", "fchmod", "link", "replace", "unlink", "mkdir", "rmdir"}
+FOLDER_OPS = {"mkdir", "link", "replace", "unlink", "rmdir"}
+CONFIGURE_STAYS = "the ledger options claude plugin configure set stay set"
+
+DRIVER = r'''
+import errno, importlib.util, json, os, signal, sys
+spec = json.loads(sys.argv[1])
+hooks = spec.get("hooks", {})
+R = {name: getattr(os, name) for name in (
+    "open", "write", "fsync", "fchmod", "link", "replace", "unlink", "mkdir",
+    "rmdir", "close", "fstat")}
+trace = R["open"](spec["trace"], os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+if "umask" in hooks:
+    os.umask(hooks["umask"])
+paths = {}
+count = [0]
+quiet = [False]
+
+
+def at(dir_fd, name):
+    if not isinstance(name, str) or os.path.isabs(name) or dir_fd is None:
+        return name if isinstance(name, str) else None
+    base = paths.get(dir_fd)
+    return f"{base}/{name}" if base is not None else None
+
+
+def note(event):
+    count[0] += 1
+    event["n"] = count[0]
+    R["write"](trace, (json.dumps(event) + "\n").encode())
+    return count[0]
+
+
+def after(n):
+    action = hooks.get("act_after", {}).get(str(n))
+    if action:
+        quiet[0] = True
+        try:
+            exec(action, {"os": os, "home": hooks.get("home"), "Path": __import__("pathlib").Path})
+        finally:
+            quiet[0] = False
+    if hooks.get("kill_after") == n:
+        os.kill(os.getpid(), signal.SIGKILL)
+
+
+def counted(op, path, perform, extra=None):
+    n = count[0] + 1
+    if n in hooks.get("raise_at", []):
+        note({"op": op, "path": path, "raised": True})
+        if hooks.get("raise_type") == "ValueError":
+            raise ValueError("injected")
+        raise OSError(errno.EIO, "injected")
+    try:
+        result = perform(n)
+    except OSError as exc:
+        note({"op": op, "path": path, "error": exc.errno})
+        raise
+    event = {"op": op, "path": path}
+    if extra is not None:
+        event.update(extra(result))
+    note(event)
+    after(n)
+    return result
+
+
+def w_open(path, flags, mode=0o777, *, dir_fd=None):
+    if quiet[0]:
+        return R["open"](path, flags, mode, dir_fd=dir_fd)
+    full = at(dir_fd, path)
+    if not flags & os.O_CREAT:
+        fd = R["open"](path, flags, mode, dir_fd=dir_fd)
+        paths[fd] = full
+        return fd
+
+    def perform(n):
+        fd = R["open"](path, flags, mode, dir_fd=dir_fd)
+        paths[fd] = full
+        return fd
+
+    return counted("create", full, perform,
+                   lambda fd: {"mode": R["fstat"](fd).st_mode & 0o7777})
+
+
+def w_write(fd, data):
+    if quiet[0]:
+        return R["write"](fd, data)
+    data = bytes(data)
+
+    def perform(n):
+        if hooks.get("zero_at") == n:
+            return 0
+        if hooks.get("short_at") == n and len(data) > 1:
+            return R["write"](fd, data[: len(data) // 2])
+        return R["write"](fd, data)
+
+    return counted("write", paths.get(fd), perform, lambda got: {"bytes": got})
+
+
+def w_fsync(fd):
+    if quiet[0]:
+        return R["fsync"](fd)
+    return counted("fsync", paths.get(fd), lambda n: R["fsync"](fd))
+
+
+def w_fchmod(fd, mode):
+    if quiet[0]:
+        return R["fchmod"](fd, mode)
+    return counted("fchmod", paths.get(fd), lambda n: R["fchmod"](fd, mode),
+                   lambda _r: {"mode": mode})
+
+
+def w_link(src, dst, *, src_dir_fd=None, dst_dir_fd=None, follow_symlinks=True):
+    if quiet[0]:
+        return R["link"](src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd,
+                         follow_symlinks=follow_symlinks)
+    return counted("link", at(dst_dir_fd, dst),
+                   lambda n: R["link"](src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd,
+                                       follow_symlinks=follow_symlinks),
+                   lambda _r: {"src": at(src_dir_fd, src)})
+
+
+def w_replace(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
+    if quiet[0]:
+        return R["replace"](src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+    return counted("replace", at(dst_dir_fd, dst),
+                   lambda n: R["replace"](src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd),
+                   lambda _r: {"src": at(src_dir_fd, src)})
+
+
+def simple(op):
+    def wrapper(path, *args, dir_fd=None):
+        if quiet[0]:
+            return R[op](path, *args, dir_fd=dir_fd)
+        return counted(op, at(dir_fd, path), lambda n: R[op](path, *args, dir_fd=dir_fd))
+    return wrapper
+
+
+def w_close(fd):
+    paths.pop(fd, None)
+    return R["close"](fd)
+
+
+loaded = importlib.util.spec_from_file_location("setup_under_driver", spec["script"])
+mod = importlib.util.module_from_spec(loaded)
+loaded.loader.exec_module(mod)
+names = {base: list(given) for base, given in hooks.get("temp_names", {}).items()}
+real_temp_name = mod.temp_name
+mod.temp_name = lambda base: names[base].pop(0) if names.get(base) else real_temp_name(base)
+os.open, os.write, os.fsync, os.fchmod = w_open, w_write, w_fsync, w_fchmod
+os.link, os.replace, os.close = w_link, w_replace, w_close
+os.unlink, os.mkdir, os.rmdir = simple("unlink"), simple("mkdir"), simple("rmdir")
+sys.exit(mod.main(spec["argv"]))
+'''
+
+CLAUDE_OK = """#!/bin/sh
+here=$(dirname "$0")
+cat > "$here/claude-stdin"
+printf '%s\\n' "$@" > "$here/claude-argv"
+"""
+CLAUDE_FAIL = """#!/bin/sh
+cat > /dev/null
+echo "configure boom" >&2
+exit 3
+"""
+CLAUDE_SLEEP = """#!/bin/sh
+here=$(dirname "$0")
+echo $$ > "$here/claude-pid.tmp"
+mv "$here/claude-pid.tmp" "$here/claude-pid"
+exec sleep 30
 """
 
 
-def listing(home: Path) -> dict[str, str]:
-    found: dict[str, str] = {}
+# ---------------------------------------------------------------------------
+# Helpers
+
+
+def sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def install(folder: Path, body: str = CLAUDE_OK) -> Path:
+    bin_dir = folder / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    claude = bin_dir / "claude"
+    claude.write_text(body, encoding="utf-8")
+    claude.chmod(0o755)
+    return bin_dir
+
+
+def make_home(tmp_path: Path, settings: bytes | None = PRE_SETTINGS, *,
+              mode: int = 0o644, name: str = "home") -> Path:
+    home = tmp_path / name
+    home.mkdir()
+    home = home.resolve()
+    if settings is not None:
+        (home / ".claude").mkdir()
+        target = home / ".claude" / "settings.json"
+        target.write_bytes(settings)
+        target.chmod(mode)
+    return home
+
+
+def fresh(tmp_path: Path, tag: str, settings: bytes | None = PRE_SETTINGS) -> Path:
+    folder = tmp_path / tag
+    folder.mkdir()
+    return make_home(folder, settings)
+
+
+def safe_path(bin_dir: Path | None) -> str:
+    """PATH for a run: the stub folder and the system folders only, so no
+    real `claude` is ever found."""
+    system = os.pathsep.join(("/usr/bin", "/bin"))
+    return system if bin_dir is None else str(bin_dir) + os.pathsep + system
+
+
+def at(home: Path, rel: str) -> Path:
+    return home.joinpath(*rel.split("/"))
+
+
+def snap(home: Path) -> dict[str, tuple]:
+    found: dict[str, tuple] = {}
     for dirpath, dirnames, filenames in os.walk(home):
-        base = Path(dirpath)
-        if not dirnames and not filenames:
-            rel = base.relative_to(home).as_posix()
-            if rel != ".":
-                found[rel + "/"] = "dir"
-        for name in filenames:
-            path = base / name
+        for name in dirnames + filenames:
+            path = Path(dirpath) / name
             rel = path.relative_to(home).as_posix()
-            if path.is_symlink():
-                found[rel] = "link:" + os.readlink(path)
-                continue
-            found[rel] = hashlib.sha256(path.read_bytes()).hexdigest()
+            info = os.lstat(path)
+            if stat.S_ISLNK(info.st_mode):
+                found[rel] = ("link", os.readlink(path))
+            elif stat.S_ISDIR(info.st_mode):
+                found[rel] = ("dir", stat.S_IMODE(info.st_mode))
+            else:
+                found[rel] = ("file", stat.S_IMODE(info.st_mode), sha(path.read_bytes()))
     return found
 
 
-def install_claude(folder: Path) -> Path:
-    bin_dir = folder / "bin"
-    bin_dir.mkdir()
-    claude = bin_dir / "claude"
-    claude.write_text(CLAUDE_STUB, encoding="utf-8")
-    claude.chmod(claude.stat().st_mode | stat.S_IXUSR)
-    return bin_dir
+def unchanged(before: dict, after: dict) -> bool:
+    """Equal apart from a .claude the lock created and the lock file."""
+    after = dict(after)
+    after.pop(mod.LOCK_REL, None)
+    if ".claude" not in before:
+        after.pop(".claude", None)
+    return before == after
 
 
-def run(verb: str, home: Path, *extra: str, path_prefix: Path | None = None,
-        operator: str | None = OPERATOR, harness: str | None = HARNESS) -> subprocess.CompletedProcess[str]:
-    env = {key: value for key, value in os.environ.items() if key != "CLAUDE_CONFIG_DIR"}
-    if path_prefix is not None:
-        env["PATH"] = str(path_prefix) + os.pathsep + env.get("PATH", "")
-    cmd = [sys.executable, str(SCRIPT), verb, "--home", str(home)]
+def run(verb: str, home: Path, *extra: str, bin_dir: Path | None = None,
+        hooks: dict | None = None, timeout: float = 60,
+        operator: str | None = OPERATOR) -> SimpleNamespace:
+    folder = home.parent
+    driver = folder / "driver.py"
+    if not driver.exists():
+        driver.write_text(DRIVER, encoding="utf-8")
+    index = len(list(folder.glob("trace-*.jsonl")))
+    trace = folder / f"trace-{index}.jsonl"
+    argv = [verb, "--home", str(home)]
     if verb in ("plan", "apply") and operator is not None:
-        cmd.extend(["--operator", operator])
-    if verb in ("plan", "apply") and harness is not None:
-        cmd.extend(["--harness", harness])
-    cmd.extend(extra)
-    return subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=30)
+        argv += ["--operator", operator, "--harness", HARNESS]
+    argv += list(extra)
+    hooks = dict(hooks or {})
+    hooks.setdefault("home", str(home))
+    env = {key: value for key, value in os.environ.items() if key != "CLAUDE_CONFIG_DIR"}
+    env["PATH"] = safe_path(bin_dir)
+    spec ={"script": str(SCRIPT), "argv": argv, "hooks": hooks, "trace": str(trace)}
+    done = subprocess.run([sys.executable, str(driver), json.dumps(spec)],
+                          capture_output=True, text=True, env=env, timeout=timeout)
+    events = []
+    if trace.exists():
+        events = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
+    return SimpleNamespace(rc=done.returncode, out=done.stdout, err=done.stderr,
+                           events=events)
 
 
-def apply_all(home: Path, bin_dir: Path, *extra: str) -> subprocess.CompletedProcess[str]:
-    return run("apply", home, "--approve-all", *extra, path_prefix=bin_dir)
+def apply_all(home: Path, bin_dir: Path, **kw) -> SimpleNamespace:
+    return run("apply", home, "--approve-all", bin_dir=bin_dir, **kw)
 
 
-def configure_log(bin_dir: Path) -> dict:
-    return json.loads((bin_dir / "claude-log.json").read_text(encoding="utf-8"))
+def points(events: list[dict], op: str, rel_suffix: str = "") -> list[int]:
+    return [e["n"] for e in events if e["op"] == op and (e.get("path") or "").endswith(rel_suffix)]
 
 
-def settings_of(home: Path) -> dict:
-    return json.loads((home / ".claude" / "settings.json").read_text(encoding="utf-8"))
+def first_point(events: list[dict], op: str, rel_suffix: str = "") -> int:
+    found = points(events, op, rel_suffix)
+    assert found, f"no {op} point on {rel_suffix} in the trace"
+    return found[0]
 
 
-def record_of(home: Path) -> dict:
-    return json.loads(
-        (home / ".claude" / "plugins" / "harness-core" / "harness" / "setup-record.json")
-        .read_text(encoding="utf-8"))
+def temp_points(events: list[dict], base: str) -> list[int]:
+    return [e["n"] for e in events
+            if e["op"] == "create" and f"/.{base}.harness-" in (e.get("path") or "")]
 
 
-# § 6: plan prints the two files, the three ledger options, and each optional
-# settings key as the exact text to be added. Plan writes nothing.
-
-def test_plan_writes_nothing(tmp_path):
-    before = listing(tmp_path)
-    done = run("plan", tmp_path)
-    assert done.returncode == 0, done.stderr
-    assert listing(tmp_path) == before
+def writes_before_first(events: list[dict], home: Path) -> list[dict]:
+    """Mutating points inside the home other than the lock and .claude."""
+    allowed = {str(home / ".claude"), str(at(home, mod.LOCK_REL))}
+    return [e for e in events
+            if e["op"] in MUTATING and (e.get("path") or "").startswith(str(home) + "/")
+            and e["path"] not in allowed]
 
 
-def test_plan_prints_two_files_as_exact_text(tmp_path):
-    done = run("plan", tmp_path)
-    assert done.returncode == 0, done.stderr
+def record_bytes(home: Path) -> bytes | None:
+    path = at(home, mod.RECORD_REL)
+    return path.read_bytes() if path.exists() else None
+
+
+def hard_stop_line(home: Path, state: str) -> str:
+    backup = str(at(home, mod.BACKUP_REL))
+    shown = {
+        "present": f"{backup} (present)",
+        "absent": f"{backup} (absent: settings.json was not changed)",
+        "none": "none (settings.json did not exist)",
+    }[state]
+    return ("setup: an earlier setup run stopped before it finished; "
+            f"record: {at(home, mod.RECORD_REL)}; settings backup: {shown}; "
+            'see KNOWN-LIMITS "After a hard stop" to recover by hand\n')
+
+
+def one_refusal(done: SimpleNamespace) -> str:
+    assert done.rc == 1, (done.rc, done.err)
+    lines = done.err.splitlines()
+    assert len(lines) == 1 and lines[0].startswith("setup: "), done.err
+    assert "Traceback" not in done.err
+    return lines[0]
+
+
+def no_temps(home: Path) -> list[str]:
+    return [rel for rel in snap(home) if ".harness-" in rel.rsplit("/", 1)[-1]]
+
+
+# ---------------------------------------------------------------------------
+# Plan: two files, three ledger options, each optional item as exact text.
+
+
+def test_plan_writes_nothing_and_takes_no_lock(tmp_path):
+    home = make_home(tmp_path, None)
+    done = run("plan", home)
+    assert done.rc == 0, done.err
+    assert snap(home) == {}
+    assert [e for e in done.events if e["op"] in MUTATING and e.get("path")] == []
+
+
+def test_plan_prints_two_files_options_and_items_as_exact_text(tmp_path):
+    home = make_home(tmp_path, None)
+    done = run("plan", home)
+    assert done.rc == 0, done.err
     rules = RULES_SOURCE.read_text(encoding="utf-8").rstrip("\n")
     override = OVERRIDE_SOURCE.read_text(encoding="utf-8").rstrip("\n")
-    assert f"FILE {mod.RULES_REL}\n----\n{rules}\n----\n" in done.stdout
-    assert f"FILE {mod.OVERRIDE_REL}\n----\n{override}\n----\n" in done.stdout
-    assert f"FILE {mod.RECORD_REL}\nrecord of this apply\n" in done.stdout
-
-
-def test_plan_prints_three_ledger_options_as_exact_text(tmp_path):
-    done = run("plan", tmp_path)
-    assert done.returncode == 0, done.stderr
-    values = mod.ledger_values(tmp_path.resolve(), OPERATOR, HARNESS)
-    assert values["database"] == str(tmp_path.resolve() / ".local" / "share" / "ledger" / "ledger.db")
-    assert values["operator"] == OPERATOR
-    assert values["harness"] == HARNESS
-    assert json.dumps(values, indent=2) in done.stdout
-    assert f"claude plugin configure {mod.LEDGER_PLUGIN} --values-stdin" in done.stdout
-
-
-def test_plan_prints_each_optional_key_as_exact_text(tmp_path):
-    done = run("plan", tmp_path)
-    assert done.returncode == 0, done.stderr
+    assert f"FILE {mod.RULES_REL}\n----\n{rules}\n----\n" in done.out
+    assert f"FILE {mod.OVERRIDE_REL}\n----\n{override}\n----\n" in done.out
+    values = {"database": str(home / ".local" / "share" / "ledger" / "ledger.db"),
+              "operator": OPERATOR, "harness": HARNESS}
+    assert json.dumps(values, indent=2) in done.out
+    assert f"claude plugin configure {mod.LEDGER_PLUGIN} --values-stdin" in done.out
     for ident, text in mod.optional_items():
-        assert f"OPTIONAL {ident}\n----\n{text}\n----\n" in done.stdout
-    assert "OPTIONAL sandbox" in done.stdout
-    for rule in mod.DENY_RULES:
-        assert f"OPTIONAL deny:{rule}" in done.stdout
+        assert f"OPTIONAL {ident}\n----\n{text}\n----\n" in done.out
+    lower = done.out.lower()
+    for word in ("allow(", "additionaldirectories", "extradirectories", "autoallow"):
+        assert word not in lower
 
 
-def test_plan_never_prints_a_grant(tmp_path):
-    done = run("plan", tmp_path)
-    assert done.returncode == 0, done.stderr
-    lower = done.stdout.lower()
-    assert "allow(" not in lower
-    assert "additionaldirectories" not in lower
-    assert "extradirectories" not in lower
-    assert "autoallow" not in lower
-
-
-# § 6: apply places files, skips an existing override, refuses an existing
-# rules default, adds only absent keys, appends deny rules, records neighbours.
-
-def test_apply_places_both_files_when_absent(tmp_path):
-    bin_dir = install_claude(tmp_path)
-    home = tmp_path / "home"
-    home.mkdir()
-    done = apply_all(home, bin_dir)
-    assert done.returncode == 0, done.stderr
-    assert (home / ".claude" / "rules" / "harness.md").read_text(encoding="utf-8") == (
-        RULES_SOURCE.read_text(encoding="utf-8"))
-    assert (home / ".claude" / "rules" / "harness-local.md").read_text(encoding="utf-8") == (
-        OVERRIDE_SOURCE.read_text(encoding="utf-8"))
-
-
-def test_apply_skips_existing_override_and_records_not_ours(tmp_path):
-    bin_dir = install_claude(tmp_path)
-    home = tmp_path / "home"
-    home.mkdir()
-    override = home / ".claude" / "rules" / "harness-local.md"
-    override.parent.mkdir(parents=True)
-    override.write_text("# mine\n", encoding="utf-8")
-    before = override.read_bytes()
-    done = apply_all(home, bin_dir)
-    assert done.returncode == 0, done.stderr
-    assert override.read_bytes() == before
-    assert "kept: .claude/rules/harness-local.md (already existed)" in done.stdout
-    record = record_of(home)
-    entry = next(item for item in record["files"] if item["path"] == mod.OVERRIDE_REL)
-    assert entry["ours"] is False
-    assert "sha256" not in entry
-
-
-def test_apply_stops_when_rules_default_exists_and_writes_nothing(tmp_path):
-    bin_dir = install_claude(tmp_path)
-    home = tmp_path / "home"
-    home.mkdir()
-    rules = home / ".claude" / "rules" / "harness.md"
-    rules.parent.mkdir(parents=True)
-    rules.write_text("# already\n", encoding="utf-8")
-    seeded = home / ".claude" / "skills" / "config.json"
-    seeded.parent.mkdir(parents=True)
-    seeded.write_text("{}\n", encoding="utf-8")
-    before = listing(home)
-    done = apply_all(home, bin_dir)
-    assert done.returncode == 1
-    assert "rules default already exists" in done.stderr
-    assert listing(home) == before
-    assert not (home / ".claude" / "plugins").exists()
-
-
-def test_apply_adds_only_absent_keys_and_never_changes_a_present_key(tmp_path):
-    bin_dir = install_claude(tmp_path)
-    home = tmp_path / "home"
-    home.mkdir()
-    settings = home / ".claude" / "settings.json"
-    settings.parent.mkdir(parents=True)
-    original = {
-        "sandbox": {"enabled": False},
-        "model": "kept",
-        "permissions": {"deny": ["Read(seeded)"]},
-    }
-    settings.write_text(json.dumps(original, indent=2) + "\n", encoding="utf-8")
-    done = apply_all(home, bin_dir)
-    assert done.returncode == 0, done.stderr
-    data = settings_of(home)
-    assert data["sandbox"] == {"enabled": False}
-    assert data["model"] == "kept"
-    assert data["permissions"]["deny"][0] == "Read(seeded)"
-    assert data["permissions"]["deny"][1:] == list(mod.DENY_RULES)
-
-
-def test_apply_appends_deny_rules_without_reordering_and_skips_present(tmp_path):
-    bin_dir = install_claude(tmp_path)
-    home = tmp_path / "home"
-    home.mkdir()
-    settings = home / ".claude" / "settings.json"
-    settings.parent.mkdir(parents=True)
-    already = mod.DENY_RULES[0]
-    settings.write_text(json.dumps({
-        "permissions": {"deny": ["Read(seeded)", already, "Read(other)"]},
-    }) + "\n", encoding="utf-8")
-    done = apply_all(home, bin_dir)
-    assert done.returncode == 0, done.stderr
-    deny = settings_of(home)["permissions"]["deny"]
-    assert deny[:3] == ["Read(seeded)", already, "Read(other)"]
-    assert already not in deny[3:]
-    assert deny[3:] == [rule for rule in mod.DENY_RULES if rule != already]
-
-
-def test_apply_records_position_and_neighbours(tmp_path):
-    bin_dir = install_claude(tmp_path)
-    home = tmp_path / "home"
-    home.mkdir()
-    settings = home / ".claude" / "settings.json"
-    settings.parent.mkdir(parents=True)
-    settings.write_text(json.dumps({
-        "permissions": {"deny": ["Read(seeded)"]},
-    }) + "\n", encoding="utf-8")
-    done = apply_all(home, bin_dir)
-    assert done.returncode == 0, done.stderr
-    items = [item for item in record_of(home)["settings"]["items"] if item["kind"] == "deny"]
-    assert items[0]["value"] == mod.DENY_RULES[0]
-    assert items[0]["index"] == 1
-    assert items[0]["before"] == "Read(seeded)"
-    assert items[0]["after"] is None
-    assert items[1]["index"] == 2
-    assert items[1]["before"] == mod.DENY_RULES[0]
-    assert items[1]["after"] is None
-
-
-def test_apply_writes_nothing_under_skill_config(tmp_path):
-    bin_dir = install_claude(tmp_path)
-    home = tmp_path / "home"
-    home.mkdir()
-    seeded = home / ".claude" / "skills" / "config.json"
-    seeded.parent.mkdir(parents=True)
-    seeded.write_text('{"kept": true}\n', encoding="utf-8")
-    other = home / ".claude" / "rules" / "other.md"
-    other.parent.mkdir(parents=True)
-    other.write_text("# other\n", encoding="utf-8")
-    done = apply_all(home, bin_dir)
-    assert done.returncode == 0, done.stderr
-    assert seeded.read_text(encoding="utf-8") == '{"kept": true}\n'
-    assert other.read_text(encoding="utf-8") == "# other\n"
-
-
-def test_apply_configure_stub_receives_planned_options(tmp_path):
-    bin_dir = install_claude(tmp_path)
-    home = tmp_path / "home"
-    home.mkdir()
-    done = apply_all(home, bin_dir)
-    assert done.returncode == 0, done.stderr
-    log = configure_log(bin_dir)
-    assert log["argv"] == ["plugin", "configure", mod.LEDGER_PLUGIN, "--values-stdin"]
-    assert json.loads(log["stdin"]) == mod.ledger_values(home.resolve(), OPERATOR, HARNESS)
-
-
-def test_apply_without_approvals_does_not_write_settings(tmp_path):
-    bin_dir = install_claude(tmp_path)
-    home = tmp_path / "home"
-    home.mkdir()
-    settings = home / ".claude" / "settings.json"
-    settings.parent.mkdir(parents=True)
-    settings.write_text('{"model": "kept"}\n', encoding="utf-8")
-    before = settings.read_bytes()
-    done = run("apply", home, path_prefix=bin_dir)
-    assert done.returncode == 0, done.stderr
-    assert settings.read_bytes() == before
-    assert not (home / ".claude" / "settings.json").read_text(encoding="utf-8") == ""
-
-
-# § 7 test 2 CI: plan, apply with every optional, remove restores the home.
-# A second case edits the override between apply and remove.
-
-def test_remove_restores_an_empty_home(tmp_path):
-    bin_dir = install_claude(tmp_path)
-    home = tmp_path / "home"
-    home.mkdir()
-    before = listing(home)
-    planned = run("plan", home)
-    assert planned.returncode == 0, planned.stderr
-    assert listing(home) == before
-    applied = apply_all(home, bin_dir)
-    assert applied.returncode == 0, applied.stderr
-    assert listing(home) != before
-    removed = run("remove", home)
-    assert removed.returncode == 0, removed.stderr
-    assert listing(home) == before
-    assert f"kept: ledger database at {home.resolve() / '.local' / 'share' / 'ledger' / 'ledger.db'} (person's data)" in removed.stdout
-
-
-def test_remove_names_and_leaves_an_edited_override(tmp_path):
-    bin_dir = install_claude(tmp_path)
-    home = tmp_path / "home"
-    home.mkdir()
-    before = listing(home)
-    assert apply_all(home, bin_dir).returncode == 0
-    override = home / ".claude" / "rules" / "harness-local.md"
-    override.write_text(override.read_text(encoding="utf-8") + "# edited\n", encoding="utf-8")
-    removed = run("remove", home)
-    assert removed.returncode == 0, removed.stderr
-    assert "kept: .claude/rules/harness-local.md (edited)" in removed.stdout
-    after = listing(home)
-    extra = {path: digest for path, digest in after.items() if path not in before}
-    assert list(extra) == [".claude/rules/harness-local.md"]
-    assert override.is_file()
-
-
-def test_remove_keeps_a_moved_deny_rule_and_names_it(tmp_path):
-    bin_dir = install_claude(tmp_path)
-    home = tmp_path / "home"
-    home.mkdir()
-    assert apply_all(home, bin_dir).returncode == 0
-    data = settings_of(home)
-    first = data["permissions"]["deny"].pop(0)
-    data["permissions"]["deny"].append(first)
-    (home / ".claude" / "settings.json").write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-    removed = run("remove", home)
-    assert removed.returncode == 0, removed.stderr
-    assert f"kept: permissions.deny rule {first!r} (moved or duplicated)" in removed.stdout
-    remaining = settings_of(home)["permissions"]["deny"]
-    assert first in remaining
-
-
-def test_remove_keeps_a_duplicated_deny_rule_and_names_it(tmp_path):
-    bin_dir = install_claude(tmp_path)
-    home = tmp_path / "home"
-    home.mkdir()
-    assert apply_all(home, bin_dir).returncode == 0
-    data = settings_of(home)
-    data["permissions"]["deny"].append(mod.DENY_RULES[0])
-    (home / ".claude" / "settings.json").write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-    removed = run("remove", home)
-    assert removed.returncode == 0, removed.stderr
-    assert f"kept: permissions.deny rule {mod.DENY_RULES[0]!r} (moved or duplicated)" in removed.stdout
-    remaining = settings_of(home)["permissions"]["deny"]
-    assert remaining.count(mod.DENY_RULES[0]) >= 1
-
-
-def test_remove_takes_out_a_rule_still_at_its_recorded_place(tmp_path):
-    bin_dir = install_claude(tmp_path)
-    home = tmp_path / "home"
-    home.mkdir()
-    assert apply_all(home, bin_dir).returncode == 0
-    assert settings_of(home)["permissions"]["deny"] == list(mod.DENY_RULES)
-    removed = run("remove", home)
-    assert removed.returncode == 0, removed.stderr
-    assert "moved or duplicated" not in removed.stdout
-    assert not (home / ".claude" / "settings.json").exists()
-
-
-def test_remove_names_and_keeps_the_ledger_database(tmp_path):
-    bin_dir = install_claude(tmp_path)
-    home = tmp_path / "home"
-    home.mkdir()
-    db = home / ".local" / "share" / "ledger" / "ledger.db"
-    db.parent.mkdir(parents=True)
-    db.write_text("person-data\n", encoding="utf-8")
-    before = db.read_bytes()
-    assert apply_all(home, bin_dir).returncode == 0
-    removed = run("remove", home)
-    assert removed.returncode == 0, removed.stderr
-    assert db.read_bytes() == before
-    assert f"kept: ledger database at {db.resolve()} (person's data)" in removed.stdout
-
-
-def test_remove_without_a_record_fails_and_leaves_files(tmp_path):
-    home = tmp_path / "home"
-    home.mkdir()
-    rules = home / ".claude" / "rules" / "harness.md"
-    rules.parent.mkdir(parents=True)
-    rules.write_text("x\n", encoding="utf-8")
-    before = listing(home)
-    done = run("remove", home)
-    assert done.returncode == 1
-    assert "no record" in done.stderr
-    assert listing(home) == before
-
-
-# § 7 test 4 CI: grants start empty. Override starter is comments only.
-
-def test_grants_start_empty_after_apply_with_every_optional(tmp_path):
-    bin_dir = install_claude(tmp_path)
-    home = tmp_path / "home"
-    home.mkdir()
-    assert apply_all(home, bin_dir).returncode == 0
-    data = settings_of(home)
-    assert mod.granting_in_settings(data) == []
-    assert "allow" not in data.get("permissions", {})
-    assert "additionalDirectories" not in data.get("permissions", {})
-    assert "autoAllow" not in data
-    assert "autoAllowBashIfSandboxed" not in data.get("sandbox", {})
-    assert data["sandbox"] == {"enabled": True}
-    assert data["permissions"]["deny"] == list(mod.DENY_RULES)
-
-
-def test_override_starter_has_no_non_comment_line():
-    text = OVERRIDE_SOURCE.read_text(encoding="utf-8")
-    assert mod.comment_only(text)
-    for line in text.splitlines():
-        if line.strip():
-            assert line.startswith("#")
-
-
-def test_i5_every_proposed_settings_path_is_checked_for_grants():
-    """I5: a sibling key added to the one proposals list is driven through
-    the grants rule. The test reads that list; it does not duplicate it."""
+def test_proposals_grant_nothing_and_the_starter_is_comments_only():
     assert mod.granting_proposals() == []
-    for ident, _text in mod.optional_items():
-        if ident == "sandbox":
-            assert "sandbox" not in mod.GRANTING_KEYS
-            assert not any(key in mod.GRANTING_KEYS for key in mod.SANDBOX_VALUE)
-        else:
-            assert ident.startswith("deny:")
-            rule = ident[len("deny:"):]
-            assert not mod.proposal_is_granting("deny", "deny", rule)
-    for rule in mod.DENY_RULES:
-        assert not rule.startswith("Allow")
-        assert "allow(" not in rule.lower()
-
-
-def test_proposals_contain_no_grant():
-    assert "allow" not in mod.GRANTING_KEYS or "sandbox" not in mod.GRANTING_KEYS
-    assert set(mod.SANDBOX_VALUE) == {"enabled"}
-    assert mod.SANDBOX_VALUE["enabled"] is True
+    assert set(mod.SANDBOX_VALUE) == {"enabled"} and mod.SANDBOX_VALUE["enabled"] is True
     for rule in mod.DENY_RULES:
         assert rule.startswith("Read(")
+    assert mod.comment_only(OVERRIDE_SOURCE.read_text(encoding="utf-8"))
 
 
-def test_apply_does_not_add_a_grant_beside_a_seeded_allow(tmp_path):
-    bin_dir = install_claude(tmp_path)
-    home = tmp_path / "home"
-    home.mkdir()
-    settings = home / ".claude" / "settings.json"
-    settings.parent.mkdir(parents=True)
-    settings.write_text(json.dumps({
-        "permissions": {
-            "allow": ["Read(seeded)"],
-            "additionalDirectories": ["/tmp/seeded"],
-            "deny": [],
-        },
-        "autoAllow": True,
-    }) + "\n", encoding="utf-8")
+def test_a_granting_proposal_or_a_non_comment_starter_refuses(monkeypatch, tmp_path):
+    monkeypatch.setattr(mod, "DENY_RULES", mod.DENY_RULES + ("Allow(everything)",))
+    with pytest.raises(mod.SetupError, match=r"^proposals grant: deny:Allow\(everything\)$"):
+        mod.check_proposals()
+    monkeypatch.undo()
+    starter = tmp_path / "harness-local.md"
+    starter.write_text("# comment\nallow = yes\n", encoding="utf-8")
+    monkeypatch.setattr(mod, "OVERRIDE_SOURCE", starter)
+    with pytest.raises(mod.SetupError,
+                       match="^override starter has a line that is not a comment$"):
+        mod.check_proposals()
+
+
+# ---------------------------------------------------------------------------
+# A completed apply and remove.
+
+
+def test_apply_places_both_files_adds_items_and_records_them(tmp_path):
+    bin_dir = install(tmp_path)
+    home = make_home(tmp_path)
     done = apply_all(home, bin_dir)
-    assert done.returncode == 0, done.stderr
-    data = settings_of(home)
-    assert data["permissions"]["allow"] == ["Read(seeded)"]
-    assert data["permissions"]["additionalDirectories"] == ["/tmp/seeded"]
-    assert data["autoAllow"] is True
-    assert data["permissions"]["deny"] == list(mod.DENY_RULES)
-    # Seeded grants remain; none of them were added by apply.
-    added = [item for item in record_of(home)["settings"]["items"] if item.get("kind") == "key"]
-    assert all(item["name"] != "allow" for item in added)
-    assert all(item["name"] != "autoAllow" for item in added)
-
-
-FAILING_CLAUDE_STUB = """\
-#!/usr/bin/env python3
-import sys
-sys.stderr.write("configure boom\\n")
-sys.exit(3)
-"""
-
-
-def install_claude_failing(folder: Path) -> Path:
-    bin_dir = folder / "bin"
-    bin_dir.mkdir()
-    claude = bin_dir / "claude"
-    claude.write_text(FAILING_CLAUDE_STUB, encoding="utf-8")
-    claude.chmod(claude.stat().st_mode | stat.S_IXUSR)
-    return bin_dir
-
-
-def test_apply_rolls_back_when_configure_fails(tmp_path):
-    bin_dir = install_claude_failing(tmp_path)
-    home = tmp_path / "home"
-    home.mkdir()
-    seeded = home / "seeded.txt"
-    seeded.write_text("keep\n", encoding="utf-8")
-    before = listing(home)
-    done = apply_all(home, bin_dir)
-    assert done.returncode == 1
-    assert "claude plugin configure failed" in done.stderr
-    assert listing(home) == before
-    record = home / ".claude" / "plugins" / "harness-core" / "harness" / "setup-record.json"
-    assert not record.exists()
-
-
-def test_apply_refuses_invalid_settings_json_before_any_write(tmp_path):
-    bin_dir = install_claude(tmp_path)
-    home = tmp_path / "home"
-    home.mkdir()
-    settings = home / ".claude" / "settings.json"
-    settings.parent.mkdir(parents=True)
-    settings.write_text("{not json", encoding="utf-8")
-    extra = home / "seeded.txt"
-    extra.write_text("keep\n", encoding="utf-8")
-    before = listing(home)
-    done = apply_all(home, bin_dir)
-    assert done.returncode == 1
-    assert "not valid JSON" in done.stderr
-    assert listing(home) == before
-    record = home / ".claude" / "plugins" / "harness-core" / "harness" / "setup-record.json"
-    assert not record.exists()
-
-
-def test_apply_sandbox_only_does_not_create_permissions(tmp_path):
-    bin_dir = install_claude(tmp_path)
-    home = tmp_path / "home"
-    home.mkdir()
-    settings = home / ".claude" / "settings.json"
-    settings.parent.mkdir(parents=True)
-    original = json.dumps({"model": "kept"}, indent=2, ensure_ascii=False) + "\n"
-    settings.write_text(original, encoding="utf-8")
-    done = run("apply", home, "--approve", "sandbox", path_prefix=bin_dir)
-    assert done.returncode == 0, done.stderr
-    data = settings_of(home)
-    assert data["sandbox"] == {"enabled": True}
+    assert done.rc == 0, done.err
+    assert done.err == ""
+    assert at(home, mod.RULES_REL).read_bytes() == RULES_SOURCE.read_bytes()
+    assert at(home, mod.OVERRIDE_REL).read_bytes() == OVERRIDE_SOURCE.read_bytes()
+    data = json.loads(at(home, mod.SETTINGS_REL).read_bytes())
     assert data["model"] == "kept"
-    assert "permissions" not in data
-    removed = run("remove", home)
-    assert removed.returncode == 0, removed.stderr
-    assert settings.read_bytes() == original.encode("utf-8")
+    assert data["sandbox"] == {"enabled": True}
+    assert data["permissions"]["deny"] == ["Read(seeded)", *mod.DENY_RULES]
+    assert mod.granting_in_settings(data) == []
+    raw = record_bytes(home)
+    head, body = mod.parse_record(raw)
+    assert body is not None
+    assert raw.startswith(mod.header_line(mod.BACKUP_REL))
+    assert {item["path"] for item in body["files"]} == {mod.RULES_REL, mod.OVERRIDE_REL}
+    deny = [item for item in body["settings"]["items"] if item["kind"] == "deny"]
+    assert deny[0] == {"kind": "deny", "value": mod.DENY_RULES[0], "index": 1,
+                       "before": "Read(seeded)", "after": mod.DENY_RULES[1]}
+    assert deny[-1]["after"] is None
+    assert not at(home, mod.BACKUP_REL).exists()
+    assert no_temps(home) == []
+    assert (bin_dir / "claude-argv").read_text().split() == [
+        "plugin", "configure", mod.LEDGER_PLUGIN, "--values-stdin"]
+    assert json.loads((bin_dir / "claude-stdin").read_text()) == {
+        "database": str(home / ".local" / "share" / "ledger" / "ledger.db"),
+        "operator": OPERATOR, "harness": HARNESS}
 
 
-def test_apply_sandbox_only_on_absent_settings_removes_the_file(tmp_path):
-    bin_dir = install_claude(tmp_path)
-    home = tmp_path / "home"
-    home.mkdir()
-    done = run("apply", home, "--approve", "sandbox", path_prefix=bin_dir)
-    assert done.returncode == 0, done.stderr
-    assert "permissions" not in settings_of(home)
-    removed = run("remove", home)
-    assert removed.returncode == 0, removed.stderr
-    assert not (home / ".claude" / "settings.json").exists()
-
-
-def test_apply_refuses_dangling_symlink_at_rules_path(tmp_path):
-    bin_dir = install_claude(tmp_path)
-    home = tmp_path / "home"
-    home.mkdir()
-    rules_dir = home / ".claude" / "rules"
-    rules_dir.mkdir(parents=True)
-    rules = rules_dir / "harness.md"
-    rules.symlink_to("missing-target.md")
-    dest = rules_dir / "missing-target.md"
+def test_apply_keeps_an_existing_override_and_does_not_list_it(tmp_path):
+    bin_dir = install(tmp_path)
+    home = make_home(tmp_path)
+    override = at(home, mod.OVERRIDE_REL)
+    override.parent.mkdir()
+    override.write_bytes(b"# mine\n")
     done = apply_all(home, bin_dir)
-    assert done.returncode == 1
-    assert "rules default already exists" in done.stderr
-    assert rules.is_symlink()
-    assert rules.readlink().as_posix() == "missing-target.md"
-    assert not dest.exists()
-    assert not (home / ".claude" / "plugins").exists()
+    assert done.rc == 0, done.err
+    assert f"kept: {override} (already existed)" in done.out
+    assert override.read_bytes() == b"# mine\n"
+    _head, body = mod.parse_record(record_bytes(home))
+    assert [item["path"] for item in body["files"]] == [mod.RULES_REL]
+    assert run("remove", home).rc == 0
+    assert override.read_bytes() == b"# mine\n"
 
 
-def test_apply_second_time_after_rules_deleted_keeps_record(tmp_path):
-    bin_dir = install_claude(tmp_path)
-    home = tmp_path / "home"
-    home.mkdir()
+def test_apply_never_changes_a_present_key_and_appends_absent_rules_only(tmp_path):
+    bin_dir = install(tmp_path)
+    present = mod.DENY_RULES[2]
+    home = make_home(tmp_path, json.dumps({
+        "sandbox": {"enabled": False},
+        "permissions": {"allow": ["Read(seeded)"], "deny": ["Read(a)", present, "Read(b)"]},
+        "autoAllow": True}, indent=2).encode() + b"\n")
     done = apply_all(home, bin_dir)
-    assert done.returncode == 0, done.stderr
-    rules = home / ".claude" / "rules" / "harness.md"
-    rules.unlink()
-    record_path = home / ".claude" / "plugins" / "harness-core" / "harness" / "setup-record.json"
-    before = record_path.read_bytes()
-    again = apply_all(home, bin_dir)
-    assert again.returncode == 1
-    assert "already applied; run remove first" in again.stderr
-    assert record_path.read_bytes() == before
+    assert done.rc == 0, done.err
+    data = json.loads(at(home, mod.SETTINGS_REL).read_bytes())
+    assert data["sandbox"] == {"enabled": False}
+    assert data["permissions"]["allow"] == ["Read(seeded)"]
+    assert data["autoAllow"] is True
+    deny = data["permissions"]["deny"]
+    assert deny[:3] == ["Read(a)", present, "Read(b)"]
+    assert deny[3:] == [rule for rule in mod.DENY_RULES if rule != present]
+
+
+def test_settings_keep_non_ascii_text(tmp_path):
+    bin_dir = install(tmp_path)
+    home = make_home(tmp_path, (json.dumps({"model": "café"}, indent=2,
+                                           ensure_ascii=False) + "\n").encode())
+    assert apply_all(home, bin_dir).rc == 0
+    text = at(home, mod.SETTINGS_REL).read_text(encoding="utf-8")
+    assert "café" in text and "\\u00e9" not in text
+
+
+def test_remove_restores_the_home_exactly(tmp_path):
+    bin_dir = install(tmp_path)
+    for settings in (PRE_SETTINGS, None):
+        home = make_home(tmp_path, settings, name=f"home-{settings is None}")
+        before = snap(home)
+        assert apply_all(home, bin_dir).rc == 0
+        done = run("remove", home)
+        assert done.rc == 0, done.err
+        assert done.err == ""
+        assert unchanged(before, snap(home))
+        assert f"removed: {at(home, mod.RECORD_REL)}" in done.out
+        assert f"kept: ledger database at {home}/.local/share/ledger/ledger.db" in done.out
+
+
+def test_sandbox_only_apply_and_remove(tmp_path):
+    bin_dir = install(tmp_path)
+    home = make_home(tmp_path, b'{\n  "model": "kept"\n}\n')
+    before = snap(home)
+    assert run("apply", home, "--approve", "sandbox", bin_dir=bin_dir).rc == 0
+    data = json.loads(at(home, mod.SETTINGS_REL).read_bytes())
+    assert data == {"model": "kept", "sandbox": {"enabled": True}}
+    assert run("remove", home).rc == 0
+    assert unchanged(before, snap(home))
+
+
+def test_apply_with_no_approvals_leaves_settings_alone(tmp_path):
+    bin_dir = install(tmp_path)
+    home = make_home(tmp_path)
+    done = run("apply", home, bin_dir=bin_dir)
+    assert done.rc == 0, done.err
+    assert at(home, mod.SETTINGS_REL).read_bytes() == PRE_SETTINGS
+    assert points(done.events, "replace") == []
 
 
 def test_remove_keeps_a_rules_folder_that_existed(tmp_path):
-    bin_dir = install_claude(tmp_path)
-    home = tmp_path / "home"
-    home.mkdir()
-    rules_dir = home / ".claude" / "rules"
-    rules_dir.mkdir(parents=True)
-    assert list(rules_dir.iterdir()) == []
+    bin_dir = install(tmp_path)
+    home = make_home(tmp_path)
+    at(home, mod.RULES_DIR_REL).mkdir()
+    assert apply_all(home, bin_dir).rc == 0
+    assert run("remove", home).rc == 0
+    assert at(home, mod.RULES_DIR_REL).is_dir()
+    assert list(at(home, mod.RULES_DIR_REL).iterdir()) == []
+
+
+# ---------------------------------------------------------------------------
+# Command line and simple refusals.
+
+
+@pytest.mark.parametrize("argv, message", [
+    (["apply", "--home", "relative"], "setup: home must be an absolute path"),
+    (["remove", "--home", "/nonexistent-harness-home"],
+     "setup: home is not a folder: /nonexistent-harness-home"),
+    (["apply", "--home", "{home}"], "setup: --operator is required for plan and apply"),
+    (["frobnicate", "--home", "{home}"], "setup: argument verb: invalid choice"),
+    (["apply", "--home", "{home}", "--operator", "o", "--approve", "allow:x"],
+     "setup: unknown approval 'allow:x'"),
+], ids=["relative-home", "home-not-a-folder", "no-operator", "bad-verb", "unknown-approval"])
+def test_command_line_refusals_are_one_named_line(tmp_path, argv, message):
+    bin_dir = install(tmp_path)
+    home = make_home(tmp_path)
+    before = snap(home)
+    argv = [part.replace("{home}", str(home)) for part in argv]
+    env = dict(os.environ, PATH=safe_path(bin_dir))
+    done = subprocess.run([sys.executable, str(SCRIPT), *argv], capture_output=True,
+                          text=True, env=env, timeout=30)
+    line = one_refusal(SimpleNamespace(rc=done.returncode, err=done.stderr))
+    assert line.startswith(message)
+    assert unchanged(before, snap(home))
+
+
+def test_claude_missing_refuses_before_any_write(tmp_path):
+    home = make_home(tmp_path)
+    before = snap(home)
+    empty = tmp_path / "empty-bin"
+    empty.mkdir()
+    env = dict(os.environ, PATH=safe_path(empty))
+    done = subprocess.run([sys.executable, str(SCRIPT), "apply", "--home", str(home),
+                           "--operator", OPERATOR], capture_output=True, text=True,
+                          env=env, timeout=30)
+    assert one_refusal(SimpleNamespace(rc=done.returncode, err=done.stderr)) == (
+        "setup: claude is not on PATH")
+    assert unchanged(before, snap(home))
+
+
+@pytest.mark.parametrize("content, reason", [
+    (b"\xff\xfe{}", "is not valid UTF-8"),
+    (b"{not json", "is not valid JSON"),
+    (b'{"a": 1, "a": 2}', "is not valid JSON"),
+    (b"[1, 2]", "is not a JSON object"),
+], ids=["not-utf8", "not-json", "duplicate-key", "not-an-object"])
+def test_invalid_settings_refuse_by_name_before_any_write(tmp_path, content, reason):
+    bin_dir = install(tmp_path)
+    home = make_home(tmp_path, content)
+    before = snap(home)
     done = apply_all(home, bin_dir)
-    assert done.returncode == 0, done.stderr
+    line = one_refusal(done)
+    assert line.startswith(f"setup: {at(home, mod.SETTINGS_REL)} {reason}")
+    assert writes_before_first(done.events, home) == []
+    assert unchanged(before, snap(home))
+    assert not (bin_dir / "claude-argv").exists()
+
+
+def test_a_settings_folder_refuses_as_not_a_regular_file(tmp_path):
+    bin_dir = install(tmp_path)
+    home = make_home(tmp_path, None)
+    at(home, mod.SETTINGS_REL).mkdir(parents=True)
+    done = apply_all(home, bin_dir)
+    assert one_refusal(done) == f"setup: {at(home, mod.SETTINGS_REL)} is not a regular file"
+
+
+def test_apply_refuses_an_existing_rules_default_before_any_write(tmp_path):
+    bin_dir = install(tmp_path)
+    home = make_home(tmp_path)
+    rules = at(home, mod.RULES_REL)
+    rules.parent.mkdir()
+    rules.write_bytes(b"# already\n")
+    before = snap(home)
+    done = apply_all(home, bin_dir)
+    assert one_refusal(done) == f"setup: rules default already exists: {rules}"
+    assert writes_before_first(done.events, home) == []
+    assert unchanged(before, snap(home))
+
+
+def test_a_second_apply_refuses_already_applied(tmp_path):
+    bin_dir = install(tmp_path)
+    home = make_home(tmp_path)
+    assert apply_all(home, bin_dir).rc == 0
+    at(home, mod.RULES_REL).unlink()
+    before = snap(home)
+    done = apply_all(home, bin_dir)
+    assert one_refusal(done) == "setup: already applied; run remove first"
+    assert snap(home) == before
+
+
+def test_remove_without_a_record_refuses(tmp_path):
+    home = make_home(tmp_path)
+    before = snap(home)
+    done = run("remove", home)
+    assert one_refusal(done) == f"setup: no record at {at(home, mod.RECORD_REL)}"
+    assert unchanged(before, snap(home))
+
+
+# ---------------------------------------------------------------------------
+# Order.
+
+
+def test_a_configure_failure_writes_nothing_of_setups(tmp_path):
+    bin_dir = install(tmp_path, CLAUDE_FAIL)
+    home = make_home(tmp_path)
+    before = snap(home)
+    done = apply_all(home, bin_dir)
+    assert one_refusal(done) == "setup: claude plugin configure failed: configure boom"
+    assert writes_before_first(done.events, home) == []
+    assert unchanged(before, snap(home))
+
+
+@pytest.mark.parametrize("case", ["approval", "rules", "settings", "claude"])
+def test_preconditions_run_before_the_first_write(tmp_path, case):
+    bin_dir = install(tmp_path)
+    home = make_home(tmp_path, b"{bad" if case == "settings" else PRE_SETTINGS)
+    extra = ["--approve-all"]
+    if case == "approval":
+        extra = ["--approve", "sandbox", "--approve", "nope"]
+    if case == "rules":
+        at(home, mod.RULES_DIR_REL).mkdir()
+        at(home, mod.RULES_REL).write_bytes(b"x")
+    if case == "claude":
+        (bin_dir / "claude").unlink()
+    done = run("apply", home, *extra, bin_dir=bin_dir)
+    one_refusal(done)
+    assert writes_before_first(done.events, home) == []
+
+
+def test_settings_that_configure_made_invalid_refuse_by_name(tmp_path):
+    home = make_home(tmp_path)
+    bin_dir = install(tmp_path, "#!/bin/sh\ncat > /dev/null\n"
+                      f"printf '{{bad' > '{at(home, mod.SETTINGS_REL)}'\n")
+    done = apply_all(home, bin_dir)
+    line = one_refusal(done)
+    assert line.startswith(f"setup: {at(home, mod.SETTINGS_REL)} is not valid JSON")
+    assert line.endswith(CONFIGURE_STAYS)
+    assert not at(home, mod.SETUP_DIR_REL).exists()
+    assert at(home, mod.SETTINGS_REL).read_bytes() == b"{bad"
+
+
+def test_apply_with_every_item_present_leaves_settings_byte_identical(tmp_path):
+    bin_dir = install(tmp_path)
+    compact = json.dumps({"sandbox": {"enabled": True},
+                          "permissions": {"deny": list(mod.DENY_RULES)}},
+                         separators=(",", ":")).encode()
+    home = make_home(tmp_path, compact)
+    inode = at(home, mod.SETTINGS_REL).stat().st_ino
+    done = apply_all(home, bin_dir)
+    assert done.rc == 0, done.err
+    assert at(home, mod.SETTINGS_REL).read_bytes() == compact
+    assert at(home, mod.SETTINGS_REL).stat().st_ino == inode
+    _head, body = mod.parse_record(record_bytes(home))
+    assert body["settings"]["items"] == []
+
+
+# ---------------------------------------------------------------------------
+# The promise after a hard stop.
+
+
+def check_hard_stop_state(tmp_path: Path, home: Path, bin_dir: Path,
+                          pre: bytes | None, post: bytes, k: int) -> str:
+    settings = at(home, mod.SETTINGS_REL)
+    backup = at(home, mod.BACKUP_REL)
+    where = f"SIGKILL after point {k}"
+    # settings.json is whole, and keeps its mode.
+    if settings.exists():
+        now = settings.read_bytes()
+        assert now in (pre, post), where
+        assert stat.S_IMODE(settings.stat().st_mode) == (0o644 if pre is not None else 0o600), where
+    else:
+        assert pre is None, where
+    # Targets are never partial.
+    for rel, source in ((mod.RULES_REL, RULES_SOURCE), (mod.OVERRIDE_REL, OVERRIDE_SOURCE)):
+        if at(home, rel).exists():
+            assert at(home, rel).read_bytes() == source.read_bytes(), where
+    raw = record_bytes(home)
+    # The record is never empty or torn in line 1.
+    line1 = mod.header_line(mod.BACKUP_REL if pre is not None else None)
+    if raw is not None:
+        assert raw.startswith(line1), where
+    outside = (at(home, mod.RULES_REL).exists() or at(home, mod.OVERRIDE_REL).exists()
+               or (settings.read_bytes() if settings.exists() else None) != pre)
+    _head, body = mod.parse_record(raw) if raw is not None else (None, None)
+    if outside and body is None:
+        assert raw is not None, where
+        if pre is not None:
+            assert backup.exists(), f"{where}: no backup though the home changed"
+            assert backup.read_bytes() == pre, where
+            assert stat.S_IMODE(backup.stat().st_mode) == 0o600, where
+    if body is not None:
+        again = apply_all(home, bin_dir)
+        assert one_refusal(again) == "setup: already applied; run remove first", where
+        removed = run("remove", home)
+        assert removed.rc == 0, (where, removed.err)
+        assert not backup.exists(), where
+        return "complete"
+    if raw is not None:
+        state = "present" if backup.exists() else ("absent" if pre is not None else "none")
+        if state == "absent":
+            assert settings.read_bytes() == pre, where
+        for verb in ("apply", "remove"):
+            before = snap(home)
+            again = run(verb, home, "--approve-all", bin_dir=bin_dir) if verb == "apply" \
+                else run(verb, home)
+            assert again.rc == 1, where
+            assert again.err == hard_stop_line(home, state), where
+            assert snap(home) == before, where
+        return "unfinished-" + state
+    assert not outside, where
+    assert not backup.exists(), where
+    again = apply_all(home, bin_dir)
+    assert again.rc == 0, (where, again.err)
+    return "none"
+
+
+@pytest.mark.parametrize("pre", [PRE_SETTINGS, None], ids=["settings", "no-settings"])
+def test_a_sigkill_at_every_apply_point_keeps_the_promise(tmp_path, pre):
+    bin_dir = install(tmp_path)
+    template = make_home(tmp_path, pre, name="template")
+    traced = apply_all(template, bin_dir)
+    assert traced.rc == 0, traced.err
+    assert no_temps(template) == []
+    post = at(template, mod.SETTINGS_REL).read_bytes()
+    total = len(traced.events)
+    outcomes = set()
+    for k in range(1, total + 1):
+        home = fresh(tmp_path, f"k{k}", pre)
+        killed = apply_all(home, bin_dir, hooks={"kill_after": k})
+        assert killed.rc == -signal.SIGKILL, (k, killed.rc, killed.err)
+        outcomes.add(check_hard_stop_state(tmp_path, home, bin_dir, pre, post, k))
+    expected = {"none", "complete", "unfinished-present" if pre else "unfinished-none"}
+    if pre is not None:
+        expected.add("unfinished-absent")
+    assert outcomes == expected
+
+
+@pytest.mark.parametrize("shape", ["line1-only", "torn-line2", "third-line", "line2-not-complete",
+                                   "no-newline", "bad-header"])
+def test_an_unfinished_record_refuses_apply_and_remove(tmp_path, shape):
+    bin_dir = install(tmp_path)
+    home = make_home(tmp_path)
+    assert apply_all(home, bin_dir).rc == 0
+    raw = record_bytes(home)
+    line1, line2 = raw.splitlines(keepends=True)
+    shaped = {
+        "line1-only": line1,
+        "torn-line2": line1 + line2[: len(line2) // 2],
+        "third-line": raw + line2,
+        "line2-not-complete": line1 + line2.replace(b'"complete": true', b'"complete": false'),
+        "no-newline": raw[:-1],
+        "bad-header": line1.replace(b"harness-setup", b"harness-other") + line2,
+    }[shape]
+    at(home, mod.RECORD_REL).write_bytes(shaped)
+    before = snap(home)
+    for verb in ("apply", "remove"):
+        done = run(verb, home, *(["--approve-all"] if verb == "apply" else []), bin_dir=bin_dir)
+        assert done.err == hard_stop_line(home, "absent")
+        assert done.rc == 1
+        assert snap(home) == before
+
+
+@pytest.mark.parametrize("verb", ["apply", "remove"])
+def test_a_backup_with_no_record_refuses_by_name(tmp_path, verb):
+    bin_dir = install(tmp_path)
+    home = make_home(tmp_path)
+    backup = at(home, mod.BACKUP_REL)
+    backup.parent.mkdir(parents=True)
+    backup.write_bytes(b'{"old": true}\n')
+    before = snap(home)
+    done = run(verb, home, *(["--approve-all"] if verb == "apply" else []), bin_dir=bin_dir)
+    assert one_refusal(done) == f"setup: leftover settings backup: {backup}"
+    assert unchanged(before, snap(home))
+
+
+def test_a_stop_after_line_2_is_complete_and_remove_deletes_the_backup(tmp_path):
+    bin_dir = install(tmp_path)
+    template = make_home(tmp_path, name="template")
+    traced = apply_all(template, bin_dir)
+    line2_sync = [e["n"] for e in traced.events
+                  if e["op"] == "fsync" and (e["path"] or "").endswith(mod.RECORD_REL)][-1]
+    home = make_home(tmp_path)
+    before = snap(home)
+    killed = apply_all(home, bin_dir, hooks={"kill_after": line2_sync})
+    assert killed.rc == -signal.SIGKILL
+    assert at(home, mod.BACKUP_REL).exists()
+    assert one_refusal(apply_all(home, bin_dir)) == "setup: already applied; run remove first"
     removed = run("remove", home)
-    assert removed.returncode == 0, removed.stderr
-    assert rules_dir.is_dir()
-    assert list(rules_dir.iterdir()) == []
-    assert not (home / ".claude" / "rules" / "harness.md").exists()
+    assert removed.rc == 0, removed.err
+    assert not at(home, mod.BACKUP_REL).exists()
+    assert unchanged(before, snap(home))
 
 
-def test_settings_write_keeps_non_ascii(tmp_path):
-    bin_dir = install_claude(tmp_path)
-    home = tmp_path / "home"
-    home.mkdir()
-    settings = home / ".claude" / "settings.json"
-    settings.parent.mkdir(parents=True)
-    original = json.dumps({"model": "café"}, indent=2, ensure_ascii=False) + "\n"
-    settings.write_text(original, encoding="utf-8")
-    done = apply_all(home, bin_dir)
-    assert done.returncode == 0, done.stderr
-    text = settings.read_text(encoding="utf-8")
-    assert "café" in text
-    assert "\\u00e9" not in text
-    assert settings_of(home)["model"] == "café"
+def test_a_sigkill_at_every_rollback_point_keeps_record_and_backup_or_the_home(tmp_path):
+    bin_dir = install(tmp_path)
+    template = make_home(tmp_path, name="template")
+    traced = apply_all(template, bin_dir)
+    line2 = [e["n"] for e in traced.events
+             if e["op"] == "write" and (e["path"] or "").endswith(mod.RECORD_REL)][-1]
+    probe = make_home(tmp_path, name="probe")
+    rolled = apply_all(probe, bin_dir, hooks={"raise_at": [line2]})
+    one_refusal(rolled)
+    total = len(rolled.events)
+    assert total > line2 + 10
+    seen = set()
+    for m in range(line2 + 1, total + 1):
+        (tmp_path / f"m{m}").mkdir()
+        home = make_home(tmp_path / f"m{m}")
+        before = snap(home)
+        killed = apply_all(home, bin_dir, hooks={"raise_at": [line2], "kill_after": m})
+        assert killed.rc == -signal.SIGKILL, m
+        record = at(home, mod.RECORD_REL).exists()
+        backup = at(home, mod.BACKUP_REL).exists()
+        assert backup or not record, f"record without backup after rollback point {m}"
+        if not record:
+            assert not at(home, mod.RULES_REL).exists(), m
+            assert not at(home, mod.OVERRIDE_REL).exists(), m
+            assert at(home, mod.SETTINGS_REL).read_bytes() == PRE_SETTINGS, m
+        if backup:
+            assert at(home, mod.BACKUP_REL).read_bytes() == PRE_SETTINGS, m
+        if not backup and not record:
+            # Rollback is done but for pruning: only empty folders remain.
+            after = {rel: v for rel, v in snap(home).items()
+                     if not (rel in mod.CREATABLE_DIRS and v[0] == "dir")}
+            assert unchanged(before, after), m
+        seen.add((record, backup))
+    assert (True, True) in seen and (False, True) in seen
 
 
-# Round 3: the record comes before configure, a concurrent settings.json edit
-# is never overwritten on save or on rollback, a non-UTF-8 settings.json is a
-# named refusal, and the module docstring states the rollback scope.
-
-def test_apply_record_write_failure_happens_before_configure(tmp_path):
-    bin_dir = install_claude(tmp_path)
-    home = tmp_path / "home"
-    plugins = home / ".claude" / "plugins"
-    plugins.mkdir(parents=True)
-    # A dangling link where the record's folder must be made: the folder
-    # cannot be created, so the record cannot be written.
-    (plugins / "harness-core").symlink_to("nowhere")
-    before = listing(home)
-    done = apply_all(home, bin_dir)
-    assert done.returncode == 1
-    assert "apply failed" in done.stderr
-    assert not (bin_dir / "claude-log.json").exists()
-    assert listing(home) == before
+# ---------------------------------------------------------------------------
+# Signals are hard stops.
 
 
-@pytest.mark.parametrize("existing", [True, False])
-def test_apply_refuses_when_settings_change_between_load_and_save(
-        tmp_path, monkeypatch, existing):
-    bin_dir = install_claude(tmp_path)
-    home = tmp_path / "home"
-    home.mkdir()
-    settings = home / ".claude" / "settings.json"
-    if existing:
-        settings.parent.mkdir(parents=True)
-        settings.write_text('{"model": "kept"}\n', encoding="utf-8")
-    other = b'{"model": "edited elsewhere"}\n'
-    real = mod.write_new_file
-
-    def racing(path, content):
-        real(path, content)
-        if path.name == "harness-local.md":
-            settings.parent.mkdir(parents=True, exist_ok=True)
-            settings.write_bytes(other)
-
-    monkeypatch.setattr(mod, "write_new_file", racing)
-    monkeypatch.setenv("PATH", str(bin_dir) + os.pathsep + os.environ.get("PATH", ""))
-    with pytest.raises(mod.SetupError, match="changed while apply was running"):
-        mod.apply_verb(home.resolve(), OPERATOR, HARNESS, [], True)
-    assert settings.read_bytes() == other
-    assert not (bin_dir / "claude-log.json").exists()
-    assert listing(home) == {".claude/settings.json": hashlib.sha256(other).hexdigest()}
+def start_and_wait_for_configure(tmp_path: Path, home: Path) -> tuple[subprocess.Popen, Path]:
+    bin_dir = install(tmp_path, CLAUDE_SLEEP)
+    env = dict(os.environ, PATH=safe_path(bin_dir))
+    proc = subprocess.Popen([sys.executable, str(SCRIPT), "apply", "--home", str(home),
+                             "--operator", OPERATOR, "--approve-all"],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+                            start_new_session=True)
+    marker = bin_dir / "claude-pid"
+    deadline = time.monotonic() + 20
+    while not marker.exists():
+        assert time.monotonic() < deadline, "configure never started"
+        assert proc.poll() is None, proc.communicate()
+        time.sleep(0.02)
+    return proc, marker
 
 
-def install_claude_editing_settings(folder: Path, settings_path: Path,
-                                    payload: bytes) -> Path:
-    bin_dir = folder / "bin"
-    bin_dir.mkdir()
-    claude = bin_dir / "claude"
-    claude.write_text(
-        "#!/usr/bin/env python3\n"
-        "import sys\n"
-        "from pathlib import Path\n"
-        f"Path({str(settings_path)!r}).write_bytes({payload!r})\n"
-        "sys.stderr.write('configure boom\\n')\n"
-        "sys.exit(3)\n",
-        encoding="utf-8")
-    claude.chmod(claude.stat().st_mode | stat.S_IXUSR)
-    return bin_dir
+def stop_fake(marker: Path) -> None:
+    try:
+        os.kill(int(marker.read_text()), signal.SIGKILL)
+    except (ProcessLookupError, ValueError):
+        pass
 
 
-@pytest.mark.parametrize("existing", [True, False])
-def test_rollback_keeps_a_settings_edit_made_after_apply_wrote_it(tmp_path, existing):
-    home = tmp_path / "home"
-    home.mkdir()
-    settings = home / ".claude" / "settings.json"
-    if existing:
-        settings.parent.mkdir(parents=True)
-        settings.write_text('{"model": "kept"}\n', encoding="utf-8")
-    other = b'{"model": "edited while configure ran"}\n'
-    bin_dir = install_claude_editing_settings(tmp_path, settings, other)
-    done = apply_all(home, bin_dir)
-    assert done.returncode == 1
-    assert "configure boom" in done.stderr
-    assert ".claude/settings.json" in done.stderr
-    assert "needs a manual check" in done.stderr
-    assert settings.read_bytes() == other
-    assert listing(home) == {".claude/settings.json": hashlib.sha256(other).hexdigest()}
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM, signal.SIGHUP],
+                         ids=["SIGINT", "SIGTERM", "SIGHUP"])
+def test_a_signal_ends_apply_by_that_signal_with_no_traceback(tmp_path, signum):
+    home = make_home(tmp_path)
+    proc, marker = start_and_wait_for_configure(tmp_path, home)
+    try:
+        proc.send_signal(signum)
+        try:
+            _out, err = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            _out, err = proc.communicate()
+            pytest.fail(f"setup did not end on signal {signum}")
+    finally:
+        stop_fake(marker)
+    assert proc.returncode == -signum, (proc.returncode, err)
+    assert "Traceback" not in err
+    assert "KeyboardInterrupt" not in err
 
 
-def test_apply_refuses_non_utf8_settings_by_name_before_any_write(tmp_path):
-    bin_dir = install_claude(tmp_path)
-    home = tmp_path / "home"
-    home.mkdir()
-    settings = home / ".claude" / "settings.json"
-    settings.parent.mkdir(parents=True)
-    settings.write_bytes(b'\xff\xfe{"model": "kept"}\n')
-    before = listing(home)
-    done = apply_all(home, bin_dir)
-    assert done.returncode == 1
-    assert "is not valid UTF-8" in done.stderr
-    assert "Traceback" not in done.stderr
-    assert listing(home) == before
-    assert not (bin_dir / "claude-log.json").exists()
+def test_setup_installs_no_other_signal_handling():
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert re.findall(r"signal\.signal\(.*\)", source) == [
+        "signal.signal(signal.SIGINT, signal.SIG_DFL)"]
+    for name in ("sigtimedwait", "sigwaitinfo", "set_wakeup_fd", "pthread_sigmask"):
+        assert name not in source
 
 
-def test_apply_refuses_unreadable_settings_by_name_before_any_write(tmp_path):
-    bin_dir = install_claude(tmp_path)
-    home = tmp_path / "home"
-    home.mkdir()
-    (home / ".claude" / "settings.json").mkdir(parents=True)
-    before = listing(home)
-    done = apply_all(home, bin_dir)
-    assert done.returncode == 1
-    assert "cannot read" in done.stderr
-    assert "Traceback" not in done.stderr
-    assert listing(home) == before
+# ---------------------------------------------------------------------------
+# Rollback from memory.
 
 
-def test_module_docstring_states_record_first_and_rollback_scope():
-    doc = " ".join(mod.__doc__.split())
-    assert "rolls back every change this run made: the files, the settings and the setup record" in doc
-    assert "The record is written before `claude plugin configure` runs" in doc
-    assert "A configure that has succeeded is not undone" in doc
+def test_an_exception_at_every_point_before_completion_leaves_the_home_unchanged(tmp_path):
+    bin_dir = install(tmp_path)
+    template = make_home(tmp_path, name="template")
+    traced = apply_all(template, bin_dir)
+    last = [e["n"] for e in traced.events
+            if e["op"] == "fsync" and (e["path"] or "").endswith(mod.RECORD_REL)][-1]
+    record_points = [e["n"] for e in traced.events if e["path"]
+                     and (e["path"] or "").endswith(mod.RECORD_REL)]
+    assert record_points
+    for k in range(1, last + 1):
+        (tmp_path / f"r{k}").mkdir()
+        home = make_home(tmp_path / f"r{k}")
+        before = snap(home)
+        done = apply_all(home, bin_dir, hooks={"raise_at": [k]})
+        line = one_refusal(done)
+        assert "rollback incomplete" not in line, (k, line)
+        assert unchanged(before, snap(home)), (k, line)
 
 
-# Round 4: one apply or remove run at a time under an exclusive lock, the
-# exact written bytes compared on rollback and on remove, and settings written
-# through a temp file and os.replace.
+@pytest.mark.parametrize("kind", ["short", "zero"])
+def test_a_short_write_is_finished_or_rolled_back(tmp_path, kind):
+    bin_dir = install(tmp_path)
+    template = make_home(tmp_path, name="template")
+    traced = apply_all(template, bin_dir)
+    writes = [e["n"] for e in traced.events if e["op"] == "write"
+              and (e.get("path") or "").startswith(str(template))]
+    assert len(writes) >= 5
+    for k in writes:
+        (tmp_path / f"w{k}").mkdir()
+        home = make_home(tmp_path / f"w{k}")
+        before = snap(home)
+        done = apply_all(home, bin_dir, hooks={f"{kind}_at": k})
+        if kind == "short":
+            assert done.rc == 0, (k, done.err)
+            assert at(home, mod.RULES_REL).read_bytes() == RULES_SOURCE.read_bytes(), k
+            assert at(home, mod.OVERRIDE_REL).read_bytes() == OVERRIDE_SOURCE.read_bytes(), k
+            assert mod.parse_record(record_bytes(home))[1] is not None, k
+            assert at(template, mod.SETTINGS_REL).read_bytes() == \
+                at(home, mod.SETTINGS_REL).read_bytes(), k
+        else:
+            line = one_refusal(done)
+            assert "os.write wrote nothing" in line, (k, line)
+            assert unchanged(before, snap(home)), k
 
-LOCK_NAME = "another harness setup run holds the lock"
+
+def test_a_rollback_that_cannot_delete_a_file_refuses_rollback_incomplete(tmp_path):
+    bin_dir = install(tmp_path)
+    template = make_home(tmp_path, name="template")
+    traced = apply_all(template, bin_dir)
+    line2 = [e["n"] for e in traced.events
+             if e["op"] == "write" and (e["path"] or "").endswith(mod.RECORD_REL)][-1]
+    probe = make_home(tmp_path, name="probe")
+    rolled = apply_all(probe, bin_dir, hooks={"raise_at": [line2]})
+    rules_unlink = [e["n"] for e in rolled.events
+                    if e["op"] == "unlink" and (e["path"] or "").endswith(mod.RULES_REL)][0]
+    home = make_home(tmp_path)
+    done = apply_all(home, bin_dir, hooks={"raise_at": [line2, rules_unlink]})
+    line = one_refusal(done)
+    assert line == (f"setup: rollback incomplete; kept: {at(home, mod.RULES_REL)}; "
+                    f"record: {at(home, mod.RECORD_REL)}; "
+                    f"settings backup: {at(home, mod.BACKUP_REL)}")
+    assert at(home, mod.RULES_REL).exists()
+    assert at(home, mod.RECORD_REL).exists() and at(home, mod.BACKUP_REL).exists()
+    assert at(home, mod.SETTINGS_REL).read_bytes() == PRE_SETTINGS
+    assert run("remove", home).err == hard_stop_line(home, "present")
 
 
-def hold_lock(home: Path) -> int:
-    lock = home / ".claude" / "harness-setup.lock"
-    lock.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+def test_an_unexpected_exception_is_one_line_after_rollback(tmp_path):
+    bin_dir = install(tmp_path)
+    template = make_home(tmp_path, name="template")
+    traced = apply_all(template, bin_dir)
+    replace = first_point(traced.events, "replace", mod.SETTINGS_REL)
+    home = make_home(tmp_path)
+    before = snap(home)
+    done = apply_all(home, bin_dir, hooks={"raise_at": [replace], "raise_type": "ValueError"})
+    assert one_refusal(done) == f"setup: unexpected error: ValueError: injected; {CONFIGURE_STAYS}"
+    assert unchanged(before, snap(home))
+
+
+# ---------------------------------------------------------------------------
+# The lock.
+
+
+def hold(home: Path) -> int:
+    path = at(home, mod.LOCK_REL)
+    path.parent.mkdir(exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     return fd
 
 
 @pytest.mark.parametrize("verb", ["apply", "remove"])
-def test_a_second_run_is_refused_by_name_while_the_lock_is_held(tmp_path, verb):
-    bin_dir = install_claude(tmp_path)
-    home = tmp_path / "home"
-    home.mkdir()
-    extra: tuple[str, ...] = ()
+def test_a_held_lock_refuses_and_touches_nothing(tmp_path, verb):
+    bin_dir = install(tmp_path)
+    home = make_home(tmp_path)
     if verb == "remove":
-        assert apply_all(home, bin_dir).returncode == 0
-        (bin_dir / "claude-log.json").unlink()
-    else:
-        # Without the lock, apply would stop here and name the rules file.
-        rules = home / ".claude" / "rules" / "harness.md"
-        rules.parent.mkdir(parents=True)
-        rules.write_text("# already\n", encoding="utf-8")
-        extra = ("--approve-all",)
-    fd = hold_lock(home)
+        assert apply_all(home, bin_dir).rc == 0
+    fd = hold(home)
     try:
-        before = listing(home)
-        done = run(verb, home, *extra, path_prefix=bin_dir)
-        assert done.returncode == 1
-        assert LOCK_NAME in done.stderr
-        assert "rules default already exists" not in done.stderr
-        assert listing(home) == before
-        assert not (bin_dir / "claude-log.json").exists()
+        inode = at(home, mod.LOCK_REL).stat().st_ino
+        before = snap(home)
+        done = run(verb, home, *(["--approve-all"] if verb == "apply" else []), bin_dir=bin_dir)
+        assert one_refusal(done) == (
+            f"setup: another harness setup run holds the lock {at(home, mod.LOCK_REL)}; "
+            "nothing was changed")
+        assert snap(home) == before
+        assert at(home, mod.LOCK_REL).stat().st_ino == inode
     finally:
         os.close(fd)
 
 
-def install_claude_running_setup(folder: Path, home: Path) -> Path:
-    """A configure stub that starts a second apply and a second remove
-    against the same home while the first apply is still running."""
-    bin_dir = folder / "bin"
-    bin_dir.mkdir()
-    claude = bin_dir / "claude"
-    claude.write_text(
-        "#!/usr/bin/env python3\n"
-        "import json, subprocess\n"
-        "from pathlib import Path\n"
-        f"base = [{sys.executable!r}, {str(SCRIPT)!r}]\n"
-        "results = {}\n"
-        "for verb, extra in (('apply', ['--operator', 'second', '--approve-all']), ('remove', [])):\n"
-        f"    done = subprocess.run(base + [verb, '--home', {str(home)!r}] + extra,\n"
-        "                          capture_output=True, text=True)\n"
-        "    results[verb] = {'returncode': done.returncode, 'stderr': done.stderr}\n"
-        "Path(__file__).with_name('second-runs.json').write_text(json.dumps(results))\n",
-        encoding="utf-8")
-    claude.chmod(claude.stat().st_mode | stat.S_IXUSR)
-    return bin_dir
+def test_the_lock_file_keeps_its_inode_on_every_exit(tmp_path):
+    bin_dir = install(tmp_path)
+    home = make_home(tmp_path)
+    lock = at(home, mod.LOCK_REL)
+    line2, _events = line2_point(tmp_path, bin_dir)
+    assert apply_all(home, bin_dir).rc == 0
+    inode = lock.stat().st_ino
+    one_refusal(apply_all(home, bin_dir))
+    assert lock.stat().st_ino == inode, "after a refusal"
+    assert run("remove", home).rc == 0
+    assert lock.stat().st_ino == inode, "after a completed remove"
+    one_refusal(apply_all(home, bin_dir, hooks={"raise_at": [line2]}))
+    assert lock.stat().st_ino == inode, "after an exception and rollback"
+    killed = apply_all(home, bin_dir, hooks={"kill_after": line2})
+    assert killed.rc == -signal.SIGKILL
+    assert lock.stat().st_ino == inode, "after a SIGKILL"
 
 
-def test_a_run_started_while_apply_holds_the_lock_is_refused_by_name(tmp_path):
-    home = tmp_path / "home"
-    home.mkdir()
-    bin_dir = install_claude_running_setup(tmp_path, home)
-    done = apply_all(home, bin_dir)
-    assert done.returncode == 0, done.stderr
-    results = json.loads((bin_dir / "second-runs.json").read_text(encoding="utf-8"))
-    for verb in ("apply", "remove"):
-        assert results[verb]["returncode"] == 1, results[verb]
-        assert LOCK_NAME in results[verb]["stderr"], results[verb]
-    assert (home / mod.RULES_REL).is_file()
-    assert (home / mod.RECORD_REL).is_file()
-    removed = run("remove", home)
-    assert removed.returncode == 0, removed.stderr
-    assert listing(home) == {}
-
-
-def test_claim_refuses_a_lock_file_released_and_unlinked_since_it_was_opened(tmp_path):
-    path = tmp_path / "harness-setup.lock"
-    path.write_bytes(b"")
-    fd = os.open(path, os.O_RDWR)
-    try:
-        # The holder released the lock and unlinked the file after this run
-        # opened it: getting the lock on that old file is not holding it.
-        path.unlink()
-        with pytest.raises(mod.SetupError, match=LOCK_NAME):
-            mod.claim_lock(fd, path)
-        # A new lock file at the path is still not the one this run opened.
-        path.write_bytes(b"")
-        with pytest.raises(mod.SetupError, match=LOCK_NAME):
-            mod.claim_lock(fd, path)
-    finally:
-        os.close(fd)
-    fresh = os.open(path, os.O_RDWR)
-    try:
-        mod.claim_lock(fresh, path)
-    finally:
-        os.close(fresh)
+def test_a_replaced_lock_path_refuses(tmp_path):
+    bin_dir = install(tmp_path)
+    home = make_home(tmp_path)
+    traced = apply_all(make_home(tmp_path, name="template"), bin_dir)
+    lock_create = first_point(traced.events, "create", mod.LOCK_REL)
+    lock = at(home, mod.LOCK_REL)
+    (bin_dir / "claude-argv").unlink()
+    action = (f"os.rename({str(lock)!r}, {str(lock) + '.old'!r}); "
+              f"Path({str(lock)!r}).write_bytes(b'')")
+    done = apply_all(home, bin_dir, hooks={"act_after": {str(lock_create): action}})
+    assert one_refusal(done) == (
+        f"setup: cannot take the setup lock: {lock} was replaced while it was taken")
+    assert not at(home, mod.SETUP_DIR_REL).exists()
+    assert not (bin_dir / "claude-argv").exists()
+    assert Path(str(lock) + ".old").exists() and lock.exists()
 
 
 def test_a_symlink_at_the_lock_path_refuses_and_is_not_followed(tmp_path):
-    bin_dir = install_claude(tmp_path)
-    home = tmp_path / "home"
-    (home / ".claude").mkdir(parents=True)
-    target = tmp_path / "elsewhere.lock"
-    (home / ".claude" / "harness-setup.lock").symlink_to(target)
-    before = listing(home)
+    bin_dir = install(tmp_path)
+    home = make_home(tmp_path)
+    outside = tmp_path / "outside-lock"
+    at(home, mod.LOCK_REL).symlink_to(outside)
     done = apply_all(home, bin_dir)
-    assert done.returncode == 1
-    assert "cannot take the setup lock" in done.stderr
-    assert not target.exists()
-    assert listing(home) == before
-    assert not (bin_dir / "claude-log.json").exists()
+    assert one_refusal(done) == f"setup: {at(home, mod.LOCK_REL)} is a symlink"
+    assert not outside.exists()
 
 
-@pytest.mark.parametrize("case", ["applied", "refused", "rolled back", "removed"])
-def test_the_lock_is_released_and_its_file_removed_on_every_exit_path(tmp_path, case):
-    home = tmp_path / "home"
-    home.mkdir()
-    if case == "rolled back":
-        bin_dir = install_claude_failing(tmp_path)
-    else:
-        bin_dir = install_claude(tmp_path)
-    if case == "refused":
-        rules = home / ".claude" / "rules" / "harness.md"
-        rules.parent.mkdir(parents=True)
-        rules.write_text("# already\n", encoding="utf-8")
-    if case == "removed":
-        assert apply_all(home, bin_dir).returncode == 0
-        done = run("remove", home)
-    else:
-        done = apply_all(home, bin_dir)
-    assert done.returncode == (1 if case in ("refused", "rolled back") else 0), done.stderr
-    assert LOCK_NAME not in done.stderr
-    lock = home / mod.LOCK_REL
-    assert not lock.exists()
-    assert not lock.is_symlink()
-    os.close(hold_lock(home))
+def test_the_lock_file_is_made_0600(tmp_path):
+    bin_dir = install(tmp_path)
+    home = make_home(tmp_path)
+    lock = at(home, mod.LOCK_REL)
+    lock.write_bytes(b"")
+    lock.chmod(0o644)
+    assert apply_all(home, bin_dir).rc == 0
+    assert stat.S_IMODE(lock.stat().st_mode) == 0o600
 
 
-@pytest.mark.parametrize("rel", [mod.RULES_REL, mod.OVERRIDE_REL, mod.RECORD_REL])
-def test_rollback_keeps_a_written_file_edited_after_apply_wrote_it(tmp_path, rel):
-    home = tmp_path / "home"
-    home.mkdir()
-    target = home / rel
-    other = b"# edited while configure ran\n"
-    bin_dir = install_claude_editing_settings(tmp_path, target, other)
-    done = apply_all(home, bin_dir)
-    assert done.returncode == 1
-    assert "configure boom" in done.stderr
-    assert "needs a manual check" in done.stderr
-    assert rel in done.stderr
-    assert target.read_bytes() == other
-    assert listing(home) == {rel: hashlib.sha256(other).hexdigest()}
+def test_configure_holds_the_lock_after_setup_is_killed(tmp_path):
+    home = make_home(tmp_path)
+    proc, marker = start_and_wait_for_configure(tmp_path, home)
+    try:
+        proc.kill()
+        proc.communicate(timeout=10)
+        (tmp_path / "ok").mkdir()
+        ok_bin = install(tmp_path / "ok")
+        locked = apply_all(home, ok_bin)
+        assert one_refusal(locked).startswith("setup: another harness setup run holds the lock")
+    finally:
+        stop_fake(marker)
+    deadline = time.monotonic() + 10
+    while True:
+        again = apply_all(home, ok_bin)
+        if again.rc == 0 or time.monotonic() > deadline:
+            break
+        time.sleep(0.05)
+    assert again.rc == 0, again.err
 
 
-@pytest.mark.parametrize("edit", ["content", "bytes"])
-def test_remove_refuses_and_names_a_record_changed_after_apply_wrote_it(tmp_path, edit):
-    bin_dir = install_claude(tmp_path)
-    home = tmp_path / "home"
-    home.mkdir()
-    assert apply_all(home, bin_dir).returncode == 0
-    record_path = home / mod.RECORD_REL
-    if edit == "content":
-        data = record_of(home)
-        data["files"] = [item for item in data["files"] if item["path"] != mod.RULES_REL]
-        record_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-    else:
-        record_path.write_bytes(record_path.read_bytes() + b"\n")
-    before = listing(home)
+def test_no_other_child_inherits_the_lock_descriptor(tmp_path):
+    home = make_home(tmp_path)
+    tree = mod.Tree(home)
+    try:
+        fd = mod.take_lock(tree)
+        probe = subprocess.run([sys.executable, "-c", f"import os; os.fstat({fd})"],
+                               close_fds=False, capture_output=True, text=True, timeout=30)
+        assert probe.returncode != 0
+        assert "Bad file descriptor" in probe.stderr
+        os.close(fd)
+    finally:
+        tree.close()
+
+
+# ---------------------------------------------------------------------------
+# Files and modes.
+
+
+@pytest.mark.parametrize("umask", [0o022, 0o777], ids=["umask-022", "umask-777"])
+def test_every_file_setup_creates_is_born_0600(tmp_path, umask):
+    bin_dir = install(tmp_path, "#!/bin/sh\ncat > /dev/null\n")
+    home = make_home(tmp_path, None)
+    done = apply_all(home, bin_dir, hooks={"umask": umask})
+    assert done.rc == 0, done.err
+    creates = [e for e in done.events if e["op"] == "create" and e.get("path")]
+    assert len(creates) >= 5
+    assert {(e["path"], e["mode"]) for e in creates if e["mode"] != 0o600} == set()
+    for rel in (mod.RULES_DIR_REL, *mod.RECORD_DIRS):
+        assert stat.S_IMODE(at(home, rel).stat().st_mode) == 0o700, rel
+
+
+def test_settings_keep_their_mode_through_apply_rollback_and_remove(tmp_path):
+    bin_dir = install(tmp_path)
+    home = make_home(tmp_path)
+    settings = at(home, mod.SETTINGS_REL)
+    assert apply_all(home, bin_dir).rc == 0
+    assert stat.S_IMODE(settings.stat().st_mode) == 0o644
+    assert run("remove", home).rc == 0
+    assert stat.S_IMODE(settings.stat().st_mode) == 0o644
+    traced = apply_all(make_home(tmp_path, name="template"), bin_dir)
+    line2 = [e["n"] for e in traced.events
+             if e["op"] == "write" and (e["path"] or "").endswith(mod.RECORD_REL)][-1]
+    one_refusal(apply_all(home, bin_dir, hooks={"raise_at": [line2]}))
+    assert settings.read_bytes() == PRE_SETTINGS
+    assert stat.S_IMODE(settings.stat().st_mode) == 0o644
+    fresh = make_home(tmp_path, None, name="fresh")
+    assert apply_all(fresh, bin_dir).rc == 0
+    assert stat.S_IMODE(at(fresh, mod.SETTINGS_REL).stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize("rel", ["rules", "override"])
+def test_a_target_that_appears_during_apply_is_never_overwritten(tmp_path, rel):
+    bin_dir = install(tmp_path)
+    target_rel = mod.RULES_REL if rel == "rules" else mod.OVERRIDE_REL
+    traced = apply_all(make_home(tmp_path, name="template"), bin_dir)
+    temp_create = temp_points(traced.events, target_rel.rsplit("/", 1)[1])[0]
+    home = make_home(tmp_path)
+    target = at(home, target_rel)
+    action = f"Path({str(target)!r}).write_bytes(b'person')"
+    done = apply_all(home, bin_dir, hooks={"act_after": {str(temp_create): action}})
+    line = one_refusal(done)
+    assert line.startswith(f"setup: {target} appeared while apply was running; it was not written")
+    assert target.read_bytes() == b"person"
+    assert at(home, mod.SETTINGS_REL).read_bytes() == PRE_SETTINGS
+    assert not at(home, mod.RECORD_REL).exists()
+
+
+def test_temp_names_are_unique_so_a_persons_file_survives(tmp_path):
+    bin_dir = install(tmp_path)
+    home = make_home(tmp_path)
+    mine = at(home, ".claude/.settings.json.harness-x.tmp")
+    mine.write_bytes(b"mine")
+    rules_mine = at(home, ".claude/rules/.harness.md.harness-x.tmp")
+    rules_mine.parent.mkdir()
+    rules_mine.write_bytes(b"mine too")
+    names = {"harness.md": [".harness.md.harness-x.tmp"],
+             "settings.json": [".settings.json.harness-x.tmp"]}
+    done = apply_all(home, bin_dir, hooks={"temp_names": names})
+    assert done.rc == 0, done.err
+    assert mine.exists() and rules_mine.exists(), "a look-alike file was lost"
+    assert mine.read_bytes() == b"mine" and rules_mine.read_bytes() == b"mine too"
+    temps = [e["path"].rsplit("/", 1)[1] for e in done.events if e["op"] == "create"
+             and ".harness-" in (e.get("path") or "") and "error" not in e]
+    assert len(temps) == len(set(temps))
+
+
+def fsync_problems(events: list[dict], home: Path) -> list[str]:
+    inside = [e for e in events if (e.get("path") or "").startswith(str(home))
+              and "error" not in e and "raised" not in e]
+    problems = []
+    for i, event in enumerate(inside):
+        rest = inside[i + 1:]
+        if event["op"] in FOLDER_OPS:
+            folder = event["path"].rsplit("/", 1)[0]
+            window = []
+            for later in rest:
+                if later["op"] in MUTATING:
+                    break
+                window.append(later)
+            if not any(e["op"] == "fsync" and e["path"] == folder for e in window):
+                problems.append(f"{event['op']} {event['path']} (n={event['n']}) "
+                                "not followed by an fsync of its folder")
+        if event["op"] == "write":
+            window = []
+            for later in rest:
+                if later["op"] in MUTATING and not (
+                        later["op"] == "write" and later["path"] == event["path"]):
+                    break
+                window.append(later)
+            if not any(e["op"] == "fsync" and e["path"] == event["path"] for e in window):
+                problems.append(f"write {event['path']} (n={event['n']}) not fsynced "
+                                "before the next step")
+    return problems
+
+
+def test_every_file_and_folder_change_is_fsynced_before_the_next_step(tmp_path):
+    bin_dir = install(tmp_path)
+    home = make_home(tmp_path, None)
+    applied = apply_all(home, bin_dir)
+    assert applied.rc == 0
+    assert fsync_problems(applied.events, home) == []
+    ops = {e["op"] for e in applied.events}
+    assert {"mkdir", "link", "replace", "unlink", "write"} <= ops
+    removed = run("remove", home)
+    assert removed.rc == 0
+    assert fsync_problems(removed.events, home) == []
+    assert "rmdir" in {e["op"] for e in removed.events}
+    template = make_home(tmp_path, name="template")
+    traced = apply_all(template, bin_dir)
+    line2 = [e["n"] for e in traced.events
+             if e["op"] == "write" and (e["path"] or "").endswith(mod.RECORD_REL)][-1]
+    other = make_home(tmp_path, name="other")
+    rolled = apply_all(other, bin_dir, hooks={"raise_at": [line2]})
+    one_refusal(rolled)
+    assert fsync_problems(rolled.events, other) == []
+
+
+def test_full_fsync_is_used_where_defined_and_skipped_where_not(tmp_path, monkeypatch):
+    calls = []
+    path = tmp_path / "f"
+    path.write_bytes(b"x")
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        with_full = SimpleNamespace(F_FULLFSYNC=12345,
+                                    fcntl=lambda f, op: calls.append((f, op)))
+        monkeypatch.setattr(mod, "fcntl", with_full)
+        mod.sync(fd)
+        assert calls == [(fd, 12345)]
+        without = SimpleNamespace(fcntl=lambda f, op: calls.append((f, op)))
+        monkeypatch.setattr(mod, "fcntl", without)
+        mod.sync(fd)
+        assert calls == [(fd, 12345)]
+    finally:
+        os.close(fd)
+
+
+# ---------------------------------------------------------------------------
+# I2: never knowingly overwrite or delete bytes setup did not write.
+
+
+def line2_point(tmp_path: Path, bin_dir: Path, pre: bytes | None = PRE_SETTINGS) -> tuple[int, list]:
+    traced = apply_all(make_home(tmp_path, pre, name="template"), bin_dir)
+    assert traced.rc == 0, traced.err
+    return [e["n"] for e in traced.events
+            if e["op"] == "write" and (e["path"] or "").endswith(mod.RECORD_REL)][-1], traced.events
+
+
+def test_an_edit_to_a_setup_file_survives_rollback_and_is_named(tmp_path):
+    bin_dir = install(tmp_path)
+    line2, events = line2_point(tmp_path, bin_dir)
+    override_link = first_point(events, "link", mod.OVERRIDE_REL)
+    home = make_home(tmp_path)
+    override = at(home, mod.OVERRIDE_REL)
+    action = f"Path({str(override)!r}).write_bytes(b'# edited by the person\\n')"
+    done = apply_all(home, bin_dir, hooks={"raise_at": [line2],
+                                           "act_after": {str(override_link + 1): action}})
+    line = one_refusal(done)
+    assert line.endswith(f"; kept for a manual check: {override}")
+    assert override.read_bytes() == b"# edited by the person\n"
+    assert not at(home, mod.RULES_REL).exists()
+
+
+def test_an_edit_to_a_setup_file_survives_remove_and_is_named(tmp_path):
+    bin_dir = install(tmp_path)
+    home = make_home(tmp_path)
+    assert apply_all(home, bin_dir).rc == 0
+    override = at(home, mod.OVERRIDE_REL)
+    override.write_bytes(b"# edited\n")
     done = run("remove", home)
-    assert done.returncode == 1
-    assert f"{mod.RECORD_REL} changed after apply wrote it, left as it is, needs a manual check" in done.stderr
-    assert listing(home) == before
+    assert done.rc == 0, done.err
+    assert f"kept for a manual check: {override}\n" in done.out
+    assert override.read_bytes() == b"# edited\n"
+    assert not at(home, mod.RULES_REL).exists()
+    assert not at(home, mod.RECORD_REL).exists()
 
 
-@pytest.mark.parametrize("edited", [True, False])
-def test_remove_names_a_settings_file_changed_after_apply_wrote_it(tmp_path, edited):
-    bin_dir = install_claude(tmp_path)
-    home = tmp_path / "home"
-    home.mkdir()
-    assert apply_all(home, bin_dir).returncode == 0
-    settings = home / ".claude" / "settings.json"
-    if edited:
-        data = settings_of(home)
-        data["model"] = "added later"
-        settings.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-    removed = run("remove", home)
-    assert removed.returncode == 0, removed.stderr
-    note = f"needs a manual check: {mod.SETTINGS_REL} (changed after apply wrote it"
-    if edited:
-        assert note in removed.stdout
-        assert settings_of(home) == {"model": "added later"}
+def test_settings_changed_before_the_replace_refuse_unwritten_on_apply(tmp_path):
+    bin_dir = install(tmp_path)
+    _line2, events = line2_point(tmp_path, bin_dir)
+    temp = temp_points(events, "settings.json")[0]
+    home = make_home(tmp_path)
+    settings = at(home, mod.SETTINGS_REL)
+    action = f"Path({str(settings)!r}).write_bytes(b'{{\"model\": \"person\"}}\\n')"
+    done = apply_all(home, bin_dir, hooks={"act_after": {str(temp): action}})
+    line = one_refusal(done)
+    assert line.startswith(
+        "setup: .claude/settings.json changed while apply was running; it was not written")
+    assert settings.read_bytes() == b'{"model": "person"}\n'
+    assert not at(home, mod.RULES_REL).exists()
+    assert not at(home, mod.RECORD_REL).exists()
+    assert no_temps(home) == []
+
+
+def test_settings_changed_before_the_replace_refuse_unwritten_on_remove(tmp_path):
+    bin_dir = install(tmp_path)
+    home = make_home(tmp_path)
+    assert apply_all(home, bin_dir).rc == 0
+    traced_home = make_home(tmp_path, name="template")
+    assert apply_all(traced_home, bin_dir).rc == 0
+    traced = run("remove", traced_home)
+    temp = temp_points(traced.events, "settings.json")[0]
+    settings = at(home, mod.SETTINGS_REL)
+    record = record_bytes(home)
+    action = f"Path({str(settings)!r}).write_bytes(b'{{\"model\": \"person\"}}\\n')"
+    done = run("remove", home, hooks={"act_after": {str(temp): action}})
+    assert one_refusal(done) == (
+        "setup: .claude/settings.json changed while remove was running; it was not written")
+    assert settings.read_bytes() == b'{"model": "person"}\n'
+    assert record_bytes(home) == record
+    assert no_temps(home) == []
+
+
+def test_settings_rollback_with_changed_bytes_takes_out_only_apply_items(tmp_path):
+    bin_dir = install(tmp_path)
+    line2, events = line2_point(tmp_path, bin_dir)
+    replace = first_point(events, "replace", mod.SETTINGS_REL)
+    home = make_home(tmp_path)
+    settings = at(home, mod.SETTINGS_REL)
+    action = ("import json\n"
+              f"p = Path({str(settings)!r})\n"
+              "d = json.loads(p.read_bytes())\n"
+              "d['person'] = 'added during apply'\n"
+              "p.write_text(json.dumps(d, indent=2) + '\\n')\n")
+    done = apply_all(home, bin_dir, hooks={"raise_at": [line2],
+                                           "act_after": {str(replace + 1): action}})
+    line = one_refusal(done)
+    assert line.endswith(f"; kept for a manual check: {settings}")
+    data = json.loads(settings.read_bytes())
+    assert data == {"model": "kept", "permissions": {"deny": ["Read(seeded)"]},
+                    "person": "added during apply"}
+
+
+# ---------------------------------------------------------------------------
+# I3: exact, re-runnable remove.
+
+
+def test_remove_leaves_other_settings_content_when_settings_changed_elsewhere(tmp_path):
+    bin_dir = install(tmp_path)
+    home = make_home(tmp_path)
+    assert apply_all(home, bin_dir).rc == 0
+    settings = at(home, mod.SETTINGS_REL)
+    data = json.loads(settings.read_bytes())
+    data["model"] = "changed by the person"
+    settings.write_text(json.dumps(data, indent=2) + "\n")
+    done = run("remove", home)
+    assert done.rc == 0, done.err
+    assert json.loads(settings.read_bytes()) == {
+        "model": "changed by the person", "permissions": {"deny": ["Read(seeded)"]}}
+
+
+@pytest.mark.parametrize("how", ["moved", "duplicated"])
+def test_remove_keeps_and_names_moved_and_duplicated_rules(tmp_path, how):
+    bin_dir = install(tmp_path)
+    home = make_home(tmp_path)
+    assert apply_all(home, bin_dir).rc == 0
+    settings = at(home, mod.SETTINGS_REL)
+    data = json.loads(settings.read_bytes())
+    deny = data["permissions"]["deny"]
+    # A duplicate of a rule other than the last keeps that rule at its
+    # recorded place with its recorded neighbours.
+    rule = mod.DENY_RULES[-1] if how == "moved" else mod.DENY_RULES[2]
+    if how == "moved":
+        deny.remove(rule)
+        deny.insert(0, rule)
     else:
-        assert note not in removed.stdout
-        assert not settings.exists()
+        deny.append(rule)
+    settings.write_text(json.dumps(data, indent=2) + "\n")
+    done = run("remove", home)
+    assert done.rc == 0, done.err
+    assert (f"kept for a manual check: {settings}: permissions.deny rule {rule!r} "
+            "(moved or duplicated)") in done.out
+    left = json.loads(settings.read_bytes())["permissions"]["deny"]
+    assert rule in left and "Read(seeded)" in left
+    assert "sandbox" not in json.loads(settings.read_bytes())
 
 
-def test_a_settings_write_that_fails_before_the_replace_leaves_the_original_bytes(
-        tmp_path, monkeypatch):
-    bin_dir = install_claude(tmp_path)
-    home = tmp_path / "home"
-    home.mkdir()
-    settings = home / ".claude" / "settings.json"
-    settings.parent.mkdir(parents=True)
-    original = b'{"model": "kept"}\n'
-    settings.write_bytes(original)
-    before = listing(home)
-    sources: list[Path] = []
-    real = os.replace
-
-    def failing(src, dst, *args, **kwargs):
-        if Path(dst).name == "settings.json":
-            sources.append(Path(src))
-            raise OSError("injected failure before the replace")
-        return real(src, dst, *args, **kwargs)
-
-    monkeypatch.setattr(mod.os, "replace", failing)
-    monkeypatch.setenv("PATH", str(bin_dir) + os.pathsep + os.environ.get("PATH", ""))
-    with pytest.raises(mod.SetupError, match="injected failure before the replace"):
-        mod.apply_verb(home.resolve(), OPERATOR, HARNESS, [], True)
-    assert sources
-    assert all(src.parent.resolve() == settings.parent.resolve() for src in sources)
-    assert settings.read_bytes() == original
-    assert listing(home) == before
-    assert not (bin_dir / "claude-log.json").exists()
+def applied_template(tmp_path: Path, bin_dir: Path) -> tuple[Path, dict]:
+    template = make_home(tmp_path, name="applied")
+    before = snap(template)
+    assert apply_all(template, bin_dir).rc == 0
+    return template, before
 
 
-def test_rollback_leaves_settings_alone_when_its_write_never_landed(tmp_path, monkeypatch):
-    bin_dir = install_claude(tmp_path)
-    home = tmp_path / "home"
-    home.mkdir()
-    settings = home / ".claude" / "settings.json"
-    settings.parent.mkdir(parents=True)
-    settings.write_bytes(b'{"model": "kept"}\n')
-    other = b'{"model": "edited by another tool"}\n'
-    calls: list[Path] = []
-    real = os.replace
-
-    def racing(src, dst, *args, **kwargs):
-        if Path(dst).name == "settings.json" and not calls:
-            calls.append(Path(src))
-            Path(dst).write_bytes(other)
-            raise OSError("injected failure before the replace")
-        return real(src, dst, *args, **kwargs)
-
-    monkeypatch.setattr(mod.os, "replace", racing)
-    monkeypatch.setenv("PATH", str(bin_dir) + os.pathsep + os.environ.get("PATH", ""))
-    with pytest.raises(mod.SetupError, match="injected failure before the replace"):
-        mod.apply_verb(home.resolve(), OPERATOR, HARNESS, [], True)
-    assert settings.read_bytes() == other
-    assert listing(home) == {".claude/settings.json": hashlib.sha256(other).hexdigest()}
+def copy_home(template: Path, dest: Path) -> Path:
+    shutil.copytree(template, dest, symlinks=True)
+    return dest.resolve()
 
 
-def test_rollback_restores_settings_through_a_temp_file_and_replace(tmp_path, monkeypatch):
-    bin_dir = install_claude_failing(tmp_path)
-    home = tmp_path / "home"
-    home.mkdir()
-    settings = home / ".claude" / "settings.json"
-    settings.parent.mkdir(parents=True)
-    original = b'{"model": "kept"}\n'
-    settings.write_bytes(original)
-    before = listing(home)
-    calls: list[tuple[Path, Path]] = []
-    real = os.replace
-
-    def spying(src, dst, *args, **kwargs):
-        calls.append((Path(src), Path(dst)))
-        return real(src, dst, *args, **kwargs)
-
-    monkeypatch.setattr(mod.os, "replace", spying)
-    monkeypatch.setenv("PATH", str(bin_dir) + os.pathsep + os.environ.get("PATH", ""))
-    with pytest.raises(mod.SetupError, match="claude plugin configure failed"):
-        mod.apply_verb(home.resolve(), OPERATOR, HARNESS, [], True)
-    targets = [dst.resolve() for _src, dst in calls]
-    # One replace for apply's write, one for rollback's restore.
-    assert targets == [settings.resolve(), settings.resolve()]
-    assert all(src.parent.resolve() == settings.parent.resolve() for src, _dst in calls)
-    assert settings.read_bytes() == original
-    assert listing(home) == before
-
-
-def test_settings_write_keeps_the_file_mode(tmp_path):
-    bin_dir = install_claude(tmp_path)
-    home = tmp_path / "home"
-    home.mkdir()
-    settings = home / ".claude" / "settings.json"
-    settings.parent.mkdir(parents=True)
-    settings.write_text('{"model": "kept"}\n', encoding="utf-8")
-    os.chmod(settings, 0o640)
-    done = apply_all(home, bin_dir)
-    assert done.returncode == 0, done.stderr
-    assert settings_of(home)["sandbox"] == {"enabled": True}
-    assert stat.S_IMODE(settings.stat().st_mode) == 0o640
+def test_a_sigkill_at_every_remove_point_then_a_rerun_finishes(tmp_path):
+    bin_dir = install(tmp_path)
+    template, before = applied_template(tmp_path, bin_dir)
+    record = record_bytes(template)
+    probe = copy_home(template, tmp_path / "probe" / "home")
+    traced = run("remove", probe)
+    assert traced.rc == 0
+    record_unlink = first_point(traced.events, "unlink", mod.RECORD_REL)
+    saw_gone = False
+    for m in range(1, record_unlink + 1):
+        home = copy_home(template, tmp_path / f"m{m}" / "home")
+        killed = run("remove", home, hooks={"kill_after": m})
+        assert killed.rc == -signal.SIGKILL, m
+        now = record_bytes(home)
+        assert now in (record, None), m
+        again = run("remove", home)
+        after = snap(home)
+        # A hard stop may leave one temp file beside a target; setup cannot
+        # tell it from a person's file of a like name, so it stays. It is
+        # 0600, or for settings.json the mode settings.json already has.
+        temps = [rel for rel in after if ".harness-" in rel]
+        assert len(temps) <= 1, (m, temps)
+        for rel in temps:
+            allowed = {0o600, 0o644} if "/.settings.json." in "/" + rel else {0o600}
+            assert after.pop(rel)[1] in allowed, (m, rel)
+        if now is None:
+            # Remove completed when the record went: only empty folders remain.
+            assert again.err == f"setup: no record at {at(home, mod.RECORD_REL)}\n", m
+            leftover = {rel: v for rel, v in after.items() if rel in mod.RECORD_DIRS}
+            assert all(v[0] == "dir" for v in leftover.values()), m
+            after = {rel: v for rel, v in after.items() if rel not in leftover}
+        else:
+            assert again.rc == 0, (m, again.err)
+            saw_gone = saw_gone or "already gone: " in again.out
+        assert unchanged(before, after), m
+    assert saw_gone
 
 
-def test_apply_refuses_a_symlinked_settings_file_before_any_write(tmp_path, monkeypatch):
-    bin_dir = install_claude(tmp_path)
-    home = tmp_path / "home"
-    (home / ".claude").mkdir(parents=True)
-    target = tmp_path / "kept-settings.json"
-    target.write_bytes(b'{"model": "kept"}\n')
-    link = home / ".claude" / "settings.json"
-    link.symlink_to(target)
-    before = listing(home)
-    writes: list[Path] = []
-    real = mod.write_new_file
-
-    def spying(path, content):
-        writes.append(path)
-        real(path, content)
-
-    monkeypatch.setattr(mod, "write_new_file", spying)
-    monkeypatch.setenv("PATH", str(bin_dir) + os.pathsep + os.environ.get("PATH", ""))
-    with pytest.raises(mod.SetupError, match="is a symbolic link; it is not written through"):
-        mod.apply_verb(home.resolve(), OPERATOR, HARNESS, [], True)
-    assert writes == []
-    assert link.is_symlink()
-    assert target.read_bytes() == b'{"model": "kept"}\n'
-    assert listing(home) == before
-    assert not (bin_dir / "claude-log.json").exists()
+def test_remove_writes_nothing_to_the_record(tmp_path):
+    bin_dir = install(tmp_path)
+    template, _before = applied_template(tmp_path, bin_dir)
+    done = run("remove", template)
+    assert done.rc == 0
+    touching = [e for e in done.events if (e.get("path") or "").endswith(mod.RECORD_REL)]
+    assert [e["op"] for e in touching] == ["unlink"]
 
 
-def test_remove_refuses_a_symlinked_settings_file_before_any_write(tmp_path):
-    bin_dir = install_claude(tmp_path)
-    home = tmp_path / "home"
-    home.mkdir()
-    assert apply_all(home, bin_dir).returncode == 0
-    settings = home / ".claude" / "settings.json"
-    target = tmp_path / "moved-settings.json"
-    target.write_bytes(settings.read_bytes())
-    settings.unlink()
-    settings.symlink_to(target)
-    kept = target.read_bytes()
-    before = listing(home)
-    removed = run("remove", home)
-    assert removed.returncode == 1
-    assert "is a symbolic link; it is not written through" in removed.stderr
-    assert listing(home) == before
-    assert settings.is_symlink()
-    assert target.read_bytes() == kept
+def test_an_exception_at_every_remove_point_keeps_the_record_and_a_rerun_finishes(tmp_path):
+    bin_dir = install(tmp_path)
+    template, before = applied_template(tmp_path, bin_dir)
+    record = record_bytes(template)
+    probe = copy_home(template, tmp_path / "probe" / "home")
+    record_unlink = first_point(run("remove", probe).events, "unlink", mod.RECORD_REL)
+    for k in range(1, record_unlink + 1):
+        home = copy_home(template, tmp_path / f"x{k}" / "home")
+        done = run("remove", home, hooks={"raise_at": [k]})
+        one_refusal(done)
+        assert record_bytes(home) == record, k
+        assert no_temps(home) == [], k
+        again = run("remove", home)
+        assert again.rc == 0, (k, again.err)
+        assert unchanged(before, snap(home)), k
+
+
+def test_a_pruning_failure_after_the_record_is_deleted_is_a_warning(tmp_path):
+    bin_dir = install(tmp_path)
+    template, _before = applied_template(tmp_path, bin_dir)
+    probe = copy_home(template, tmp_path / "probe" / "home")
+    events = run("remove", probe).events
+    record_unlink = first_point(events, "unlink", mod.RECORD_REL)
+    rmdir = [e["n"] for e in events if e["op"] == "rmdir" and e["n"] > record_unlink][0]
+    home = copy_home(template, tmp_path / "x" / "home")
+    done = run("remove", home, hooks={"raise_at": [rmdir]})
+    assert done.rc == 0, done.err
+    assert re.fullmatch(r"setup: warning: could not remove the empty folder \S+ "
+                        r"\(OSError: \[Errno 5\] injected\)\n", done.err), done.err
+    assert not at(home, mod.RECORD_REL).exists()
+
+
+def test_the_record_is_the_last_file_deleted_and_its_folders_are_pruned_after_it(tmp_path):
+    bin_dir = install(tmp_path)
+    template, _before = applied_template(tmp_path, bin_dir)
+    events = run("remove", template).events
+    unlinks = [e for e in events if e["op"] == "unlink" and ".harness-" not in e["path"]]
+    assert unlinks[-1]["path"].endswith(mod.RECORD_REL)
+    record_n = unlinks[-1]["n"]
+    # Every rmdir attempt, failed ones included.
+    rmdirs = [(e["path"][len(str(template)) + 1:], e["n"]) for e in events if e["op"] == "rmdir"]
+    assert {rel for rel, _n in rmdirs} == {mod.RULES_DIR_REL, *mod.RECORD_DIRS}
+    for rel, n in rmdirs:
+        if rel in mod.RECORD_DIRS:
+            assert n > record_n, (rel, n, record_n)
+        else:
+            assert n < record_n, (rel, n, record_n)
+
+
+def test_a_created_folder_with_a_persons_file_stays_and_claude_stays(tmp_path):
+    bin_dir = install(tmp_path)
+    home = make_home(tmp_path, None)
+    assert apply_all(home, bin_dir).rc == 0
+    mine = at(home, ".claude/rules/mine.md")
+    mine.write_bytes(b"mine")
+    done = run("remove", home)
+    assert done.rc == 0, done.err
+    assert mine.exists(), "the person's file in a created folder was lost"
+    assert mine.read_bytes() == b"mine"
+    assert not at(home, mod.RULES_REL).exists()
+    assert at(home, ".claude").is_dir()
+    assert not at(home, ".claude/plugins").exists()
+
+
+def test_remove_refuses_non_utf8_settings_by_name(tmp_path):
+    bin_dir = install(tmp_path)
+    home = make_home(tmp_path)
+    assert apply_all(home, bin_dir).rc == 0
+    at(home, mod.SETTINGS_REL).write_bytes(b"\xff\xfe{}")
+    before = snap(home)
+    done = run("remove", home)
+    assert one_refusal(done).startswith(
+        f"setup: {at(home, mod.SETTINGS_REL)} is not valid UTF-8")
+    assert snap(home) == before
+
+
+def test_remove_refuses_a_record_changed_while_it_ran(tmp_path):
+    bin_dir = install(tmp_path)
+    template, _before = applied_template(tmp_path, bin_dir)
+    probe = copy_home(template, tmp_path / "probe" / "home")
+    events = run("remove", probe).events
+    backup_or_rules = [e["n"] for e in events if e["op"] == "unlink"
+                       and (e["path"] or "").endswith(mod.RULES_REL)][0]
+    home = copy_home(template, tmp_path / "x" / "home")
+    record = at(home, mod.RECORD_REL)
+    action = f"p = Path({str(record)!r}); p.write_bytes(p.read_bytes() + b'x')"
+    done = run("remove", home, hooks={"act_after": {str(backup_or_rules): action}})
+    assert one_refusal(done) == f"setup: {record} changed while remove was running"
+    assert record.exists()
+
+
+# ---------------------------------------------------------------------------
+# Symlinks.
+
+
+@pytest.mark.parametrize("rel", [
+    ".claude", ".claude/rules", ".claude/plugins", ".claude/plugins/harness-core",
+    ".claude/plugins/harness-core/harness", mod.RULES_REL, mod.OVERRIDE_REL,
+    mod.SETTINGS_REL, mod.RECORD_REL, mod.BACKUP_REL])
+@pytest.mark.parametrize("verb", ["apply", "remove"])
+def test_a_symlink_at_any_component_refuses_and_nothing_outside_is_written(tmp_path, rel, verb):
+    bin_dir = install(tmp_path)
+    home = make_home(tmp_path, None)
+    if verb == "remove" and rel != ".claude":
+        assert apply_all(home, bin_dir).rc == 0
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "settings.json").write_bytes(b"{}\n")
+    target = at(home, rel)
+    if target.is_dir():
+        shutil.rmtree(target)
+    elif target.exists():
+        target.unlink()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    is_folder = rel in (".claude", ".claude/rules") or rel in mod.RECORD_DIRS
+    target.symlink_to(outside if is_folder else outside / "settings.json")
+    before = snap(outside)
+    done = run(verb, home, *(["--approve-all"] if verb == "apply" else []), bin_dir=bin_dir)
+    assert one_refusal(done) == f"setup: {target} is a symlink"
+    assert snap(outside) == before
+    assert target.is_symlink()
+
+
+def test_a_symlink_at_a_temp_path_refuses(tmp_path):
+    bin_dir = install(tmp_path)
+    home = make_home(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    planted = at(home, ".claude/.settings.json.harness-planted.tmp")
+    planted.symlink_to(outside / "written")
+    done = apply_all(home, bin_dir, hooks={"temp_names": {
+        "settings.json": [".settings.json.harness-planted.tmp"]}})
+    assert one_refusal(done).startswith(f"setup: {planted} is a symlink")
+    assert list(outside.iterdir()) == []
+    assert at(home, mod.SETTINGS_REL).read_bytes() == PRE_SETTINGS
+    assert not at(home, mod.RULES_REL).exists()
+
+
+def test_a_folder_swapped_for_a_symlink_after_it_was_opened_is_not_followed(tmp_path):
+    bin_dir = install(tmp_path)
+    traced = apply_all(make_home(tmp_path, name="template"), bin_dir)
+    temp_create = temp_points(traced.events, "harness.md")[0]
+    home = make_home(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    rules = at(home, mod.RULES_DIR_REL)
+    action = (f"os.rename({str(rules)!r}, {str(rules) + '-moved'!r}); "
+              f"os.symlink({str(outside)!r}, {str(rules)!r})")
+    done = apply_all(home, bin_dir, hooks={"act_after": {str(temp_create): action}})
+    assert list(outside.iterdir()) == []
+    assert (Path(str(rules) + "-moved") / "harness.md").read_bytes() == RULES_SOURCE.read_bytes()
+    assert done.rc == 0, done.err
+
+
+# ---------------------------------------------------------------------------
+# The remaining named refusals.
+
+
+def test_a_missing_plugin_file_refuses_by_name(tmp_path, monkeypatch):
+    monkeypatch.setattr(mod, "RULES_SOURCE", tmp_path / "harness.md")
+    with pytest.raises(mod.SetupError,
+                       match="^harness.md is missing from the plugin files folder$"):
+        mod.check_proposals()
+
+
+def test_a_temp_name_that_keeps_colliding_refuses_by_name(tmp_path):
+    bin_dir = install(tmp_path)
+    home = make_home(tmp_path)
+    rules_dir = at(home, mod.RULES_DIR_REL)
+    rules_dir.mkdir()
+    (rules_dir / ".harness.md.harness-x.tmp").write_bytes(b"mine")
+    before = snap(home)
+    done = apply_all(home, bin_dir, hooks={"temp_names": {
+        "harness.md": [".harness.md.harness-x.tmp"] * 100}})
+    assert one_refusal(done).startswith(f"setup: cannot make a temp file in {rules_dir}")
+    assert unchanged(before, snap(home))
+
+
+def test_an_error_taking_the_lock_refuses_by_name(tmp_path):
+    bin_dir = install(tmp_path)
+    home = make_home(tmp_path)
+    done = apply_all(home, bin_dir, hooks={"raise_at": [1]})
+    assert done.events[0]["op"] == "create" and done.events[0]["path"].endswith(mod.LOCK_REL)
+    assert one_refusal(done) == "setup: cannot take the setup lock: [Errno 5] injected"
