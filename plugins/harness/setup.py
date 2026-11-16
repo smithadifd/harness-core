@@ -13,18 +13,27 @@ record. The record is written before `claude plugin configure` runs, so a
 record that cannot be written fails before configure and leaves the home as it
 was. A configure that has succeeded is not undone, and does not need to be,
 because nothing that can fail runs after it. Apply refuses to overwrite a
-settings.json that changed since it was read, and rollback leaves a
-settings.json that changed after apply wrote it, naming it for a manual check.
+settings.json that changed since it was read. Apply keeps the exact bytes it
+wrote to each file; rollback leaves a file whose bytes have changed since,
+naming it for a manual check, and remove does the same with the record.
+Settings are written to a temp file in the same folder and moved into place
+with os.replace. Apply and remove each hold an exclusive lock in the home's
+.claude folder from their first read to their last write, rollback included;
+a run that finds the lock held refuses by name.
 """
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +47,10 @@ RULES_REL = ".claude/rules/harness.md"
 OVERRIDE_REL = ".claude/rules/harness-local.md"
 RECORD_REL = ".claude/plugins/harness-core/harness/setup-record.json"
 SETTINGS_REL = ".claude/settings.json"
+LOCK_REL = ".claude/harness-setup.lock"
+LOCKED = f"another harness setup run holds the lock {LOCK_REL}"
+RECORD_DIGEST_KEY = "record_sha256"
+RECORD_DIGEST_DRAFT = "0" * 64
 
 LEDGER_PLUGIN = "ledger-hooks@harness-core"
 DEFAULT_HARNESS = "claude-code"
@@ -320,12 +333,16 @@ def current_bytes(path: Path) -> bytes | None:
 def restore_apply(home: Path, originals: dict[Path, bytes | None],
                   created_dirs: list[str],
                   written: dict[Path, bytes]) -> list[Path]:
-    """Undo this run's changes. A path whose bytes apply wrote and that no
-    longer hold those bytes was changed by someone else since: it is left
-    as it is and returned, so the caller can name it."""
+    """Undo this run's changes. Each file apply wrote is compared against the
+    exact bytes apply wrote to it: one that no longer holds those bytes was
+    changed by someone else since, so it is left as it is and returned for
+    the caller to name. A file that held bytes before this run and that this
+    run never replaced is not touched."""
     kept: list[Path] = []
     for path, prior in reversed(list(originals.items())):
         expected = written.get(path)
+        if expected is None and prior is not None:
+            continue
         if expected is not None and current_bytes(path) != expected:
             kept.append(path)
             continue
@@ -337,8 +354,8 @@ def restore_apply(home: Path, originals: dict[Path, bytes | None],
                     pass
         else:
             try:
-                path.write_bytes(prior)
-            except OSError:
+                write_settings_bytes(path, prior)
+            except (OSError, SetupError):
                 pass
     prune_created(home, created_dirs)
     return kept
@@ -398,11 +415,50 @@ def load_settings(path: Path) -> tuple[dict[str, Any], bool, int | str, bytes | 
     return data, True, detect_indent(raw.decode("utf-8")), raw
 
 
+def refuse_settings_link(path: Path) -> None:
+    """os.replace would put a file where the link is: refuse instead."""
+    if path.is_symlink():
+        raise SetupError(
+            f"{SETTINGS_REL} is a symbolic link; it is not written through")
+
+
+def new_file_mode() -> int:
+    mask = os.umask(0)
+    os.umask(mask)
+    return 0o666 & ~mask
+
+
+def write_settings_bytes(path: Path, data: bytes) -> None:
+    """Write data to a temp file in path's folder, then os.replace it into
+    place, so a failure before the replace leaves the old bytes whole. The
+    file keeps its mode."""
+    refuse_settings_link(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        mode = stat.S_IMODE(os.lstat(path).st_mode)
+    except FileNotFoundError:
+        mode = new_file_mode()
+    fd, temp = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temp, mode)
+        os.replace(temp, path)
+    except BaseException:
+        try:
+            os.unlink(temp)
+        except OSError:
+            pass
+        raise
+
+
 def save_settings(path: Path, data: dict[str, Any],
                   indent: int | str = 2) -> bytes:
     payload = dump_json(data, indent=indent).encode("utf-8")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(payload)
+    write_settings_bytes(path, payload)
     return payload
 
 
@@ -468,6 +524,109 @@ def apply_deny_rules(settings: dict[str, Any], rules: list[str]) -> list[dict[st
     return recorded
 
 
+class SetupLock:
+    """The exclusive lock one apply or remove run holds from its first read
+    to its last write, rollback included."""
+
+    def __init__(self, path: Path, fd: int, made_dir: bool) -> None:
+        self.path = path
+        self.fd = fd
+        self.made_dir = made_dir
+        self.prune_dir = made_dir
+
+    def release(self) -> None:
+        # Unlink while still holding the lock, so a run that opened this
+        # file meanwhile finds it gone once it gets the lock, and refuses.
+        try:
+            os.unlink(self.path)
+        except OSError:
+            pass
+        os.close(self.fd)
+        if self.prune_dir:
+            try:
+                self.path.parent.rmdir()
+            except OSError:
+                pass
+
+
+def claim_lock(fd: int, path: Path) -> None:
+    """Take the lock on fd without waiting, or refuse by name. The file
+    locked must still be the one at path: a run that opened a lock file
+    another run has since released and unlinked does not hold the lock."""
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        raise SetupError(LOCKED) from exc
+    except OSError as exc:
+        raise SetupError(f"cannot take the setup lock: {exc}") from exc
+    held = os.fstat(fd)
+    try:
+        now = os.lstat(path)
+    except OSError:
+        now = None
+    if now is None or (now.st_dev, now.st_ino) != (held.st_dev, held.st_ino):
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        raise SetupError(LOCKED)
+
+
+def take_lock(home: Path) -> SetupLock:
+    path = rel_path(home, LOCK_REL)
+    made_dir = False
+    if not lexists(path.parent):
+        try:
+            path.parent.mkdir()
+            made_dir = True
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise SetupError(f"cannot take the setup lock: {exc}") from exc
+    flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(path, flags, 0o600)
+    except OSError as exc:
+        if made_dir:
+            try:
+                path.parent.rmdir()
+            except OSError:
+                pass
+        raise SetupError(f"cannot take the setup lock: {exc}") from exc
+    try:
+        claim_lock(fd, path)
+    except SetupError:
+        os.close(fd)
+        raise
+    return SetupLock(path, fd, made_dir)
+
+
+@contextlib.contextmanager
+def setup_lock(home: Path):
+    lock = take_lock(home)
+    try:
+        yield lock
+    finally:
+        lock.release()
+
+
+def record_bytes(record: dict[str, Any]) -> bytes:
+    """The record's exact bytes. It carries the digest of those same bytes
+    taken with the digest field set to a fixed draft value."""
+    body = dict(record)
+    body[RECORD_DIGEST_KEY] = RECORD_DIGEST_DRAFT
+    body[RECORD_DIGEST_KEY] = digest(dump_json(body).encode("utf-8"))
+    return dump_json(body).encode("utf-8")
+
+
+def record_intact(raw: bytes) -> bool:
+    """True when raw is byte for byte what apply wrote."""
+    try:
+        data = json.loads(raw.decode("utf-8"), object_pairs_hook=pairs)
+    except (UnicodeDecodeError, ValueError):
+        return False
+    if not isinstance(data, dict) or RECORD_DIGEST_KEY not in data:
+        return False
+    return record_bytes(data) == raw
+
+
 def plan_verb(home: Path, operator: str, harness: str | None) -> str:
     grants = granting_proposals()
     if grants:
@@ -480,6 +639,12 @@ def plan_verb(home: Path, operator: str, harness: str | None) -> str:
 
 def apply_verb(home: Path, operator: str, harness: str | None,
                approve: list[str], approve_all: bool) -> str:
+    with setup_lock(home) as lock:
+        return apply_locked(home, operator, harness, approve, approve_all, lock)
+
+
+def apply_locked(home: Path, operator: str, harness: str | None,
+                 approve: list[str], approve_all: bool, lock: SetupLock) -> str:
     grants = granting_proposals()
     if grants:
         raise SetupError("proposals grant: " + ", ".join(grants))
@@ -497,12 +662,16 @@ def apply_verb(home: Path, operator: str, harness: str | None,
         raise SetupError(f"rules default already exists: {RULES_REL}")
     claude = which_claude()
     ids = approved_ids(approve, approve_all)
+    if ids:
+        refuse_settings_link(settings_path)
     settings, settings_existed, settings_indent, settings_raw = load_settings(
         settings_path)
 
     messages: list[str] = []
     files: list[dict[str, Any]] = []
-    created_dirs: list[str] = []
+    # The lock made the .claude folder when the home had none: it is this
+    # run's to take out again, on rollback and on remove.
+    created_dirs: list[str] = [".claude"] if lock.made_dir else []
     originals: dict[Path, bytes | None] = {}
     written: dict[Path, bytes] = {}
 
@@ -517,10 +686,12 @@ def apply_verb(home: Path, operator: str, harness: str | None,
 
     try:
         snapshot(rules_path)
+        rules_bytes = rules_text.encode("utf-8")
         write_new_file(rules_path, rules_text)
+        written[rules_path] = rules_bytes
         files.append({
             "path": RULES_REL,
-            "sha256": digest(rules_text.encode("utf-8")),
+            "sha256": digest(rules_bytes),
             "ours": True,
         })
 
@@ -529,10 +700,12 @@ def apply_verb(home: Path, operator: str, harness: str | None,
             files.append({"path": OVERRIDE_REL, "ours": False})
         else:
             snapshot(override_path)
+            override_bytes = override_text.encode("utf-8")
             write_new_file(override_path, override_text)
+            written[override_path] = override_bytes
             files.append({
                 "path": OVERRIDE_REL,
-                "sha256": digest(override_text.encode("utf-8")),
+                "sha256": digest(override_bytes),
                 "ours": True,
             })
 
@@ -564,12 +737,16 @@ def apply_verb(home: Path, operator: str, harness: str | None,
                 "created": settings_created and settings_written,
                 "existed": settings_existed,
                 "items": settings_records,
+                "sha256": (digest(written[settings_path])
+                           if settings_written else None),
             },
             "created_dirs": list(created_dirs),
             "ledger_database": str(database_path(home)),
             "configure": {"plugin": LEDGER_PLUGIN, "values": values},
         }
-        write_new_file(record_path, dump_json(record))
+        record_raw = record_bytes(record)
+        write_new_file(record_path, record_raw.decode("utf-8"))
+        written[record_path] = record_raw
         configure_ledger(claude, values)
         messages.append(f"applied: {RECORD_REL}")
         return "\n".join(messages) + ("\n" if messages else "")
@@ -603,9 +780,13 @@ def remove_settings(home: Path, record: dict[str, Any], messages: list[str]) -> 
     if not settings_path.is_file():
         messages.append(f"kept: {SETTINGS_REL} (missing)")
         return
-    raw = settings_path.read_text(encoding="utf-8")
-    indent = detect_indent(raw)
-    settings = load_json_object(settings_path)
+    raw = read_named(settings_path)
+    if digest(raw) != info.get("sha256"):
+        messages.append(
+            f"needs a manual check: {SETTINGS_REL} (changed after apply wrote "
+            "it; only entries still at their recorded place were taken out)")
+    indent = detect_indent(decode_text(raw, settings_path))
+    settings = parse_json_object(raw, settings_path)
     deny_items = [item for item in items if item.get("kind") == "deny"]
     key_items = [item for item in items if item.get("kind") == "key"]
     permissions = settings.get("permissions")
@@ -645,12 +826,26 @@ def remove_settings(home: Path, record: dict[str, Any], messages: list[str]) -> 
 
 
 def remove_verb(home: Path) -> str:
+    with setup_lock(home) as lock:
+        return remove_locked(home, lock)
+
+
+def remove_locked(home: Path, lock: SetupLock) -> str:
     record_path = rel_path(home, RECORD_REL)
     if not record_path.is_file():
         raise SetupError(f"no record at {RECORD_REL}")
-    record = load_json_object(record_path)
+    raw = read_named(record_path)
+    if not record_intact(raw):
+        raise SetupError(
+            f"{RECORD_REL} changed after apply wrote it, left as it is, "
+            "needs a manual check")
+    record = parse_json_object(raw, record_path)
     messages: list[str] = []
     created_dirs = list(record.get("created_dirs") or [])
+    if ".claude" in created_dirs:
+        lock.prune_dir = True
+    if (record.get("settings") or {}).get("items"):
+        refuse_settings_link(rel_path(home, SETTINGS_REL))
     for item in record.get("files") or []:
         relative = item.get("path")
         if not isinstance(relative, str):
