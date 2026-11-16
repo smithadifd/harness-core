@@ -146,11 +146,21 @@ outside your Claude folder.
 
 ### Update to a newer tag
 
-Nothing updates by itself: a marketplace added by URL does not auto-update.
-`claude plugin marketplace update harness-core` refreshes the marketplace from
-the source it was added from, and that source names one tag, so it does not
-move to the next tag. To move, remove the marketplace and add it again at the
-newer tag:
+Nothing updates by itself: a marketplace added by URL does not auto-update. The
+tag you added is recorded with the marketplace, and no update command moves it.
+Confirmed on Claude Code 2.1.325:
+
+- `claude plugin marketplace update harness-core` succeeds and leaves the
+  marketplace at the tag it was added at.
+- `claude plugin update harness@harness-core` reports that the plugin is
+  already at the latest version.
+- Adding the marketplace again at a newer tag while it is still registered is
+  refused: the command exits 1 and says the source does not match the
+  marketplace's recorded entry.
+
+So the only way to move is to remove the marketplace, add it again at the newer
+tag and install `harness` again. This sequence was confirmed, and it brings all
+three plugins back:
 
 ```text
 claude plugin marketplace remove harness-core
@@ -158,12 +168,13 @@ claude plugin marketplace add https://github.com/<owner>/harness-core.git#vX.Y.Z
 claude plugin install harness@harness-core
 ```
 
-Removing a marketplace uninstalls every plugin installed from it and deletes
-those plugins' stored options, so set any option again afterwards. Start a new
-session, or run `/reload-plugins`, to load the new set.
-
-These update steps are written from Claude Code's documentation and are not yet
-confirmed on a real account; this section is corrected from the result.
+Removing a marketplace uninstalls every plugin installed from it (`harness`,
+`sdlc` and `ledger-hooks`). The command says it also deletes their saved
+options, secrets and data where it can, so check any option you had set
+afterwards. Whether an option survives the remove was not tested: the ledger
+hooks declare no option at this tag. `claude plugin configure` takes the full
+plugin id, for example `ledger-hooks@harness-core`. Start a new session, or run
+`/reload-plugins`, to load the new set.
 
 ### Uninstall
 
@@ -175,10 +186,13 @@ Three steps, in this order:
 2. In a terminal, uninstall the plugin and the dependencies its install pulled
    in: `claude plugin uninstall harness@harness-core --prune -y`. The `-y` is
    needed when the command is not run from an interactive terminal. Without
-   `--prune` the dependencies stay behind. A plugin you installed on its own
-   before `harness` is kept.
+   `--prune`, `sdlc` and `ledger-hooks` stay installed, and the command tells
+   you to run `claude plugin prune`. With it, `harness` and the two plugins its
+   install brought in are removed. A plugin you installed on its own before
+   `harness` is kept by `--prune`.
 3. Remove the marketplace: `claude plugin marketplace remove harness-core`.
-   This also uninstalls anything still installed from it.
+   This uninstalls every plugin installed from the marketplace, the
+   dependencies included, and also a plugin you installed on its own.
 
 ```text
 claude plugin uninstall harness@harness-core --prune -y
@@ -186,8 +200,8 @@ claude plugin marketplace remove harness-core
 claude plugin list
 ```
 
-The list then shows none of the three. Which of steps 2 and 3 removes the
-dependencies is not yet confirmed on a real account.
+The list then shows none of the three. These uninstall steps were confirmed on
+Claude Code 2.1.325.
 
 ### For maintainers: cutting a tag
 
