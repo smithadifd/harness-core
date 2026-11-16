@@ -461,16 +461,16 @@ def test_the_real_ls_remote_peels_an_annotated_tag_and_keeps_a_lightweight_one(t
     tag_object = git(repo, "rev-parse", "refs/tags/v1.0.0")
     assert tag_object != first, "the annotated tag is its own object"
 
-    code, output = cm.git_ls_remote(str(repo), "v1.0.0")
+    code, output = cm.run_ls_remote(str(repo), "v1.0.0")
     assert code == 0
     assert cm.resolve_tag(output, "v1.0.0") == (first, None)
-    code, output = cm.git_ls_remote(str(repo), "v2.0.0")
+    code, output = cm.run_ls_remote(str(repo), "v2.0.0")
     assert code == 0
     assert cm.resolve_tag(output, "v2.0.0") == (second, None)
-    code, output = cm.git_ls_remote(str(repo), "v3.0.0")
+    code, output = cm.run_ls_remote(str(repo), "v3.0.0")
     assert code == 0
     assert cm.resolve_tag(output, "v3.0.0") == (None, "tag v3.0.0 is not in the source repository")
-    code, _ = cm.git_ls_remote(str(tmp_path / "no-such-repository"), "v1.0.0")
+    code, _ = cm.run_ls_remote(str(tmp_path / "no-such-repository"), "v1.0.0")
     assert code != 0
 
 
@@ -479,6 +479,146 @@ def test_a_git_that_cannot_run_is_a_failure_code_never_a_pass(tmp_path, monkeypa
     code, output = cm.git_ls_remote("https://example.test/skills.git", "v1.0.0")
     assert code == 255
     assert output == ""
+
+
+# A url in the manifest is data, never an argument to git.
+
+class FakeDone:
+    returncode = 0
+    stdout = b""
+
+
+def forbid_subprocess(monkeypatch):
+    def refuse(*args, **kwargs):
+        raise AssertionError(f"a subprocess was started: {args!r}")
+    monkeypatch.setattr(cm.subprocess, "run", refuse)
+
+
+def recording_remote(calls: list):
+    """A stand-in for `git ls-remote` that records what it is asked and answers each tag at its pin."""
+    def run(url: str, tag: str) -> tuple[int, str]:
+        calls.append((url, tag))
+        return 0, tag_lines((SDLC_SHA if url == SKILLS_URL else LEDGER_SHA, f"refs/tags/{tag}"))
+    return run
+
+
+def test_a_manifest_url_that_is_an_option_never_reaches_the_runner(tmp_path):
+    marker = tmp_path / "marker"
+    market = copy.deepcopy(GOOD_MARKETPLACE)
+    for name in ("sdlc", "ledger-hooks"):
+        set_key(external(market, name), "url", f"--upload-pack=touch {marker}")
+    write_tree(tmp_path, market, GOOD_PLUGIN)
+    calls: list = []
+    assert cm.source_problems(tmp_path, recording_remote(calls)) == [
+        "plugin sdlc: not resolved, it failed the offline check",
+        "plugin ledger-hooks: not resolved, it failed the offline check"]
+    assert calls == [], "the runner was not called"
+    assert not marker.exists()
+
+
+def test_a_manifest_url_that_is_an_option_starts_no_subprocess_on_the_default_runner(tmp_path, monkeypatch):
+    marker = tmp_path / "marker"
+    market = copy.deepcopy(GOOD_MARKETPLACE)
+    for name in ("sdlc", "ledger-hooks"):
+        set_key(external(market, name), "url", f"--upload-pack=touch {marker}")
+    write_tree(tmp_path, market, GOOD_PLUGIN)
+    forbid_subprocess(monkeypatch)
+    assert cm.source_problems(tmp_path, cm.git_ls_remote) == [
+        "plugin sdlc: not resolved, it failed the offline check",
+        "plugin ledger-hooks: not resolved, it failed the offline check"]
+    assert cm.git_ls_remote(f"--upload-pack=touch {marker}", "v1.0.0") == (255, "")
+    assert not marker.exists()
+
+
+OFFLINE_FAILURES = [
+    # (id, change to the market dict, the plugin that must not be resolved)
+    ("short-pin", lambda m: set_key(external(m, "sdlc"), "sha", SDLC_SHA[:39]), "sdlc"),
+    ("branch-ref", lambda m: set_key(external(m, "ledger-hooks"), "ref", "main"), "ledger-hooks"),
+    ("other-repository", lambda m: set_key(external(m, "sdlc"), "url", LEDGER_URL), "sdlc"),
+    ("other-path", lambda m: set_key(external(m, "ledger-hooks"), "path", "plugins/other"), "ledger-hooks"),
+    ("unknown-key", lambda m: set_key(external(m, "sdlc"), "branch", "main"), "sdlc"),
+    ("listed-twice", lambda m: m["plugins"].append(copy.deepcopy(entry_of(m, "ledger-hooks"))), "ledger-hooks"),
+    ("folder-source", lambda m: set_key(entry_of(m, "sdlc"), "source", "./plugins/harness"), "sdlc"),
+]
+
+
+@pytest.mark.parametrize("change,name", [(case[1], case[2]) for case in OFFLINE_FAILURES],
+                         ids=[case[0] for case in OFFLINE_FAILURES])
+def test_an_entry_that_failed_the_offline_check_is_not_resolved(tmp_path, change, name):
+    market = copy.deepcopy(GOOD_MARKETPLACE)
+    change(market)
+    write_tree(tmp_path, market, GOOD_PLUGIN)
+    assert problems(tmp_path), "the offline check refuses the change"
+    calls: list = []
+    found = cm.source_problems(tmp_path, recording_remote(calls))
+    assert found == [f"plugin {name}: not resolved, it failed the offline check"]
+    other = {"sdlc": (SKILLS_URL, "v1.3.0"), "ledger-hooks": (LEDGER_URL, "v0.3.1")}
+    del other[name]
+    assert calls == list(other.values()), "only the clean entry reached the runner"
+
+
+def test_the_url_given_to_the_runner_is_the_tables_even_when_the_manifests_differs(tmp_path, monkeypatch):
+    market = copy.deepcopy(GOOD_MARKETPLACE)
+    set_key(external(market, "sdlc"), "url", "https://example.test/elsewhere.git")
+    set_key(external(market, "ledger-hooks"), "url", "https://example.test/other.git")
+    write_tree(tmp_path, market, GOOD_PLUGIN)
+    # An offline check that let both entries through, to prove the resolver
+    # does not lean on it for the url.
+    monkeypatch.setattr(cm, "external_problems", lambda *args: [])
+    calls: list = []
+    assert cm.source_problems(tmp_path, recording_remote(calls)) == []
+    assert calls == [(SKILLS_URL, "v1.3.0"), (LEDGER_URL, "v0.3.1")]
+
+
+def test_a_table_url_that_is_refused_by_name_is_not_resolved(tmp_path, monkeypatch):
+    write_tree(tmp_path, GOOD_MARKETPLACE, GOOD_PLUGIN)
+    monkeypatch.setattr(cm, "external_problems", lambda *args: [])
+    monkeypatch.setitem(cm.EXTERNAL_PLUGINS, "sdlc", {**cm.EXTERNAL_PLUGINS["sdlc"], "repository": "bad repo"})
+    calls: list = []
+    assert cm.source_problems(tmp_path, recording_remote(calls)) == [
+        "plugin sdlc: not resolved, url holds whitespace"]
+    assert calls == [(LEDGER_URL, "v0.3.1")], "only the entry with a clean url reached the runner"
+
+
+URL_REFUSALS = [
+    ("an-option", "--upload-pack=touch /x", "url starts with '-'"),
+    ("a-dash", "-x", "url starts with '-'"),
+    ("a-dash-before-https", "-https://example.test/a.git", "url starts with '-'"),
+    ("a-space", "https://example.test/a b.git", "url holds whitespace"),
+    ("a-newline", "https://example.test/a.git\n--upload-pack=x", "url holds whitespace"),
+    ("a-tab", "https://example.test/\ta.git", "url holds whitespace"),
+    ("plain-http", "http://example.test/a.git", "url is not https"),
+    ("a-local-path", "/tmp/repository", "url is not https"),
+    ("an-ssh-url", "ssh://example.test/a.git", "url is not https"),
+    ("uppercase-scheme", "HTTPS://example.test/a.git", "url is not https"),
+    ("empty", "", "url is empty"),
+    ("not-a-string", None, "url is empty"),
+    ("https", "https://example.test/a.git", None),
+]
+
+
+@pytest.mark.parametrize("url,expected", [(case[1], case[2]) for case in URL_REFUSALS],
+                         ids=[case[0] for case in URL_REFUSALS])
+def test_a_url_is_refused_by_name_before_any_subprocess(monkeypatch, url, expected):
+    assert cm.url_refusal(url) == expected
+    if expected is not None:
+        forbid_subprocess(monkeypatch)
+        assert cm.git_ls_remote(url, "v1.0.0") == (255, "")
+
+
+def test_git_runs_with_no_shell_a_fixed_argv_that_ends_its_options_and_no_prompt(monkeypatch):
+    seen: list = []
+
+    def fake_run(*args, **kwargs):
+        seen.append((args, kwargs))
+        return FakeDone()
+    monkeypatch.setattr(cm.subprocess, "run", fake_run)
+    assert cm.git_ls_remote("https://example.test/a.git", "v1.0.0") == (0, "")
+    (args, kwargs), = seen
+    assert args == (["git", "ls-remote", "--tags", "--", "https://example.test/a.git",
+                     "refs/tags/v1.0.0", "refs/tags/v1.0.0^{}"],)
+    assert kwargs["shell"] is False
+    assert kwargs["env"]["GIT_TERMINAL_PROMPT"] == "0"
 
 
 def test_source_mode_refusals_fail_the_run_and_are_printed(monkeypatch, capsys):

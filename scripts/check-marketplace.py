@@ -47,16 +47,21 @@ shown in ``problems``):
   present) a list of plain names, each another entry of this marketplace (no
   version range, no ``name@marketplace``, no object form, not itself).
 
-``--source`` also resolves each external entry's tag against the live
-repository the entry names, at use time, with ``git ls-remote`` on
+``--source`` also resolves the tag of each external entry that passed every
+offline check, against the live repository the table above names for that
+plugin (never the url written in the manifest), at use time, with
+``git ls-remote`` on
 ``refs/tags/<ref>`` and its peeled form ``refs/tags/<ref>^{}``. An annotated tag
 is peeled (the peeled line is used when it is present); a lightweight tag is its
 own commit. The commit must equal ``sha`` exactly. A tag that is not there, a
 ``git ls-remote`` that fails or times out, an output line off the grammar
 ``<40 lowercase hex><TAB>refs/tags/<ref>[^{}]``, and a tag that resolves to any
-other commit are each a refusal, never a pass. CI runs it in the
-``plugin-validate`` job of ci.yml, with no credential and none of the runner's
-git configuration.
+other commit are each a refusal, never a pass. An entry that failed an offline check is not resolved at all
+and is reported as such. A url that starts with ``-``, holds whitespace or does
+not start with ``https://`` is refused before any subprocess. git runs with no
+shell, a fixed argv that ends its options with ``--`` before the url, and
+``GIT_TERMINAL_PROMPT=0``. CI runs it in the ``plugin-validate`` job of ci.yml,
+with no credential and none of the runner's git configuration.
 
 Exit 0 clean; 1 on any refusal, one line per refusal; 2 on usage.
 """
@@ -97,6 +102,11 @@ EXTERNAL_PLUGINS = {
     "ledger-hooks": {"source": "git-subdir", "repository": "ledger", "path": "plugins/ledger-hooks"},
 }
 LS_REMOTE_SECONDS = 120
+
+
+def expected_url(name: str, owner: str) -> str:
+    """The one repository url of an external plugin name: the table's, never the manifest's."""
+    return f"https://github.com/{owner}/{EXTERNAL_PLUGINS[name]['repository']}.git"
 
 # (url, tag) -> (exit code, stdout). The one boundary to the network.
 LsRemote = Callable[[str, str], "tuple[int, str]"]
@@ -147,7 +157,7 @@ def external_problems(label: str, name: str, source: dict, owner: str | None) ->
     if isinstance(url, str) and not url.startswith("https://"):
         found.append(f"{label}: source url is not https")
     if expected is not None and owner is not None and isinstance(url, str) and url.startswith("https://"):
-        wanted = f"https://github.com/{owner}/{expected['repository']}.git"
+        wanted = expected_url(name, owner)
         if url != wanted:
             found.append(f"{label}: source url is not the expected {expected['repository']} repository")
     path = source.get("path")
@@ -200,7 +210,10 @@ def folder_problems(root: Path, label: str, entry: dict, source: str) -> tuple[l
     return found, dependencies
 
 
-def problems(root: Path) -> list[str]:
+def problems(root: Path, external: dict | None = None) -> list[str]:
+    """The offline refusals. When ``external`` is given it is filled with each
+    plugin name whose source is an object: its source when that entry passed
+    every offline check, else None (the entry --source must not resolve)."""
     path = root / MARKETPLACE
     if not path.is_file():
         return [f"{MARKETPLACE}: is missing"]
@@ -236,17 +249,25 @@ def problems(root: Path) -> list[str]:
         label = f"plugin {name}"
         if name in entries:
             found.append(f"{label}: is listed twice")
+            if external is not None and name in external:
+                external[name] = None
             continue
         entries[name] = entry
         source = entry.get("source")
         if isinstance(source, str):
             if name in EXTERNAL_PLUGINS:
                 found.append(f"{label}: source is not the expected external source")
+                if external is not None:
+                    external[name] = None
                 continue
             more, dependencies[name] = folder_problems(root, label, entry, source)
             found.extend(more)
         elif isinstance(source, dict):
-            found.extend(external_problems(label, name, source, owner))
+            more = external_problems(label, name, source, owner)
+            found.extend(more)
+            if external is not None:
+                clean = not more and owner is not None and name in EXTERNAL_PLUGINS
+                external[name] = source if clean else None
         else:
             found.append(f"{label}: source is neither a ./ path nor an object")
     if "harness" not in entries:
@@ -264,18 +285,42 @@ def problems(root: Path) -> list[str]:
 
 # --source: each external entry's tag against the live repository.
 
-def git_ls_remote(url: str, tag: str) -> tuple[int, str]:
+def url_refusal(url) -> str | None:
+    """The name of what is wrong with a url that is about to reach git, or None."""
+    if not isinstance(url, str) or url == "":
+        return "url is empty"
+    if url.startswith("-"):
+        return "url starts with '-'"
+    if any(char.isspace() for char in url):
+        return "url holds whitespace"
+    if not url.startswith("https://"):
+        return "url is not https"
+    return None
+
+
+def run_ls_remote(url: str, tag: str) -> tuple[int, str]:
     """``git ls-remote`` on the tag ref and its peeled form: (exit code, stdout).
-    A git that cannot run or times out is a non-zero code, never a pass."""
+    No shell, a fixed argv whose options end at ``--`` before the repository,
+    no terminal prompt. A git that cannot run or times out is a non-zero code,
+    never a pass. Callers give it a url that ``url_refusal`` has passed."""
     env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
     try:
         done = subprocess.run(
-            ["git", "ls-remote", "--tags", url, f"refs/tags/{tag}", f"refs/tags/{tag}^{{}}"],
-            capture_output=True, env=env, check=False, timeout=LS_REMOTE_SECONDS,
+            ["git", "ls-remote", "--tags", "--", url, f"refs/tags/{tag}", f"refs/tags/{tag}^{{}}"],
+            shell=False, stdin=subprocess.DEVNULL, capture_output=True, env=env, check=False,
+            timeout=LS_REMOTE_SECONDS,
         )
     except (OSError, subprocess.SubprocessError):
         return 255, ""
     return done.returncode, done.stdout.decode("utf-8", "replace")
+
+
+def git_ls_remote(url: str, tag: str) -> tuple[int, str]:
+    """``run_ls_remote`` for a url that passes ``url_refusal``; any other url is a
+    non-zero code before any subprocess starts."""
+    if url_refusal(url) is not None:
+        return 255, ""
+    return run_ls_remote(url, tag)
 
 
 def resolve_tag(output: str, tag: str) -> tuple[str | None, str | None]:
@@ -300,21 +345,24 @@ def resolve_tag(output: str, tag: str) -> tuple[str | None, str | None]:
 
 
 def source_problems(root: Path, ls_remote: LsRemote = git_ls_remote) -> list[str]:
-    """One refusal for every external entry whose tag does not resolve to its sha."""
-    try:
-        data = load_json(root / MARKETPLACE)
-    except (OSError, ValueError):
-        return []  # the offline check names this
-    plugins = data.get("plugins") if isinstance(data, dict) else None
+    """One refusal for every external entry whose tag does not resolve to its sha.
+
+    Only an entry that passed every offline check is resolved, and its url is the
+    table's (``expected_url``), never the manifest's."""
+    external: dict[str, dict | None] = {}
+    problems(root, external)
+    owner, _ = pin_owner(root)
     found: list[str] = []
-    for entry in plugins if isinstance(plugins, list) else []:
-        source = entry.get("source") if isinstance(entry, dict) else None
-        if not isinstance(source, dict):
+    for name, source in external.items():
+        label = f"plugin {name}"
+        if source is None or owner is None:
+            found.append(f"{label}: not resolved, it failed the offline check")
             continue
-        url, ref, sha = source.get("url"), source.get("ref"), source.get("sha")
-        if not all(isinstance(value, str) for value in (url, ref, sha)):
-            continue  # the offline check names this
-        label = f"plugin {entry.get('name')}"
+        url, ref, sha = expected_url(name, owner), source["ref"], source["sha"]
+        refusal = url_refusal(url)
+        if refusal is not None:
+            found.append(f"{label}: not resolved, {refusal}")
+            continue
         code, output = ls_remote(url, ref)
         if code != 0:
             found.append(f"{label}: git ls-remote failed (exit {code})")
