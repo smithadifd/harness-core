@@ -1,0 +1,13 @@
+{
+  "name": "harness",
+  "version": "0.1.0",
+  "description": "The default tier of an AI coding-agent harness. This skeleton carries no skill, hook or script yet; it brings the plugins it depends on.",
+  "author": {
+    "name": "harness-core maintainers"
+  },
+  "license": "MIT",
+  "dependencies": [
+    "sdlc",
+    "ledger-hooks"
+  ]
+}

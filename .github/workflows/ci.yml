@@ -156,3 +156,33 @@ jobs:
           git("-C", source, "fetch", "--no-tags", url, sha)
           check = subprocess.run(["python3", "scripts/check-ledger-vendor.py", "--source", source])
           sys.exit(check.returncode)
+
+  # The marketplace manifest and the harness plugin validate under Claude Code's
+  # own validator, strict (a warning fails the job), in a fresh HOME so no
+  # account, setting or plugin of the runner is read. Claude Code comes from npm
+  # at one exact version, into a folder of this job; moving that version is a
+  # change to this file. The runner's own node (22 or newer, which that version
+  # needs) is used and checked. Nothing here signs in or fetches a plugin.
+  plugin-validate:
+    name: plugin validate (marketplace and harness plugin, strict)
+    runs-on: ${{ fromJSON(vars.CORE_CI_RUNNER || '["ubuntu-latest"]') }}
+    timeout-minutes: 10
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: The runner's node is 22 or newer
+        run: |
+          node -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 22 ? 0 : 1)'
+      - name: Install Claude Code at the pinned version into a folder of this job
+        run: |
+          npm install --prefix "$RUNNER_TEMP/claude-code" --no-audit --no-fund "@anthropic-ai/claude-code@2.1.325"
+      - name: Validate the marketplace and the harness plugin, strict, in a fresh home
+        run: |
+          set -euo pipefail
+          home="$(mktemp -d "$RUNNER_TEMP/validate-home.XXXXXX")"
+          claude="$RUNNER_TEMP/claude-code/node_modules/.bin/claude"
+          HOME="$home" "$claude" --version
+          HOME="$home" "$claude" plugin validate --strict .
+          HOME="$home" "$claude" plugin validate --strict plugins/harness

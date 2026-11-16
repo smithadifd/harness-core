@@ -8,9 +8,9 @@ until it is the job.
 This repository is the part of one person's harness that handles it. That
 harness grew over months of daily use. The core is the piece carved out of it so
 that other people can, in time, install a default tier into their own Claude
-Code setup in a safe and controlled way. That install path is not built yet.
-This repository is the first step: the shared files, kept separate from
-everything that belongs to one person.
+Code setup in a safe and controlled way. That install path is being built:
+the marketplace below is its first part. This repository is the first step: the
+shared files, kept separate from everything that belongs to one person.
 
 ## Status: alpha
 
@@ -57,13 +57,14 @@ Two sibling repositories are published separately, and both are public:
 | `skills/_lib/*.py`, `skills/_lib/*.json`, `skills/_lib/*.tsv` | modules that resolve the harness root, configuration paths, overrides and model pool settings |
 | `skills/_lib/recall/` | a local full-text index over agent session transcripts, with a guard that refuses private folders |
 | `skills/_lib/ledger/` | the item ledger, itself vendored from the public ledger repository (see below) |
+| `.claude-plugin/marketplace.json`, `plugins/harness/` | the plugin marketplace and the `harness` plugin's skeleton (see "Install the default tier") |
 | `scripts/`, `install-profiles/` | two maintenance scripts and an install profile |
 | `skills/_lib/tests/`, `skills/_lib/recall/tests/`, `scripts/tests/` | the tests of the vendored modules |
 
 ## How it is used: vendored, byte for byte
 
-Nothing here is installed on its own. A consuming repository vendors these
-files: it copies each one, byte for byte and at the same relative path, from a
+The vendored files are not installed on their own. A consuming repository
+vendors these files: it copies each one, byte for byte and at the same relative path, from a
 tagged commit of this repository, and never edits them. `.core-manifest` at
 the root is the list of what is vendored: first the folders this repository
 owns entirely in every consumer (`tree <folder>/` lines), then every vendored
@@ -95,6 +96,102 @@ the same way: `ledger-vendor.pin` pins its tag, commit and blob ids,
 `scripts/ledger-vendor-bump.py` moves it. A ledger fix reaches a consumer of
 this repository in two steps: a pin move here, then a pin move in the
 consumer.
+
+## Install the default tier (alpha)
+
+The marketplace in `.claude-plugin/marketplace.json` is named `harness-core`.
+At this tag it lists three plugins:
+
+- `harness`, a folder in this repository (`plugins/harness/`). It is the one
+  plugin a person installs, and it depends on the other two. For now it carries
+  no skill, hook or script: installing it brings the set and nothing else. The
+  setup skill and the guard hooks (`rails`) come in later changes.
+- `sdlc`, the skills, from the public skills repository.
+- `ledger-hooks`, the ledger's hooks, from the public ledger repository.
+
+Each of the last two is fixed to one full commit id on a release tag, and
+`harness` is fixed by the tag of this repository you add the marketplace at. A
+tag of this repository therefore names one tested set; nothing resolves to a
+branch or a range. CI validates both manifests with `claude plugin validate
+--strict` on a pinned Claude Code version (2.1.325), and a test fails when a
+plugin's folder or manifest is missing or a pin is not a full commit id.
+
+You need Claude Code, `git`, network access to GitHub, and Python 3.11 or later
+for the ledger's command. The repository must be public or shared with your
+account. Run the commands in a shell, not in a session. Add the marketplace by
+its full URL with `#<tag>`: that form checks out exactly the tag's commit, while
+the bare `owner/repo` form follows the main branch whatever tag you meant. Do
+not add it from a local clone: a plugin installed from a clone is served from
+it, so the clone can never move.
+
+### Install
+
+```text
+claude plugin marketplace add https://github.com/<owner>/harness-core.git#vX.Y.Z
+claude plugin install harness@harness-core
+claude plugin list
+```
+
+`vX.Y.Z` is a release tag of this repository. The list shows `harness`, `sdlc`
+and `ledger-hooks` enabled. Start a new session, or run `/reload-plugins` in an
+open one, to load them.
+
+Claude Code, not this repository, writes the install's records: the
+marketplace's declaration and one `enabledPlugins` entry per plugin in your user
+`settings.json`, and a plugin cache in your Claude folder. Nothing is installed
+outside your Claude folder.
+
+### Update to a newer tag
+
+Nothing updates by itself: a marketplace added by URL does not auto-update.
+`claude plugin marketplace update harness-core` refreshes the marketplace from
+the source it was added from, and that source names one tag, so it does not
+move to the next tag. To move, remove the marketplace and add it again at the
+newer tag:
+
+```text
+claude plugin marketplace remove harness-core
+claude plugin marketplace add https://github.com/<owner>/harness-core.git#vX.Y.Z
+claude plugin install harness@harness-core
+```
+
+Removing a marketplace uninstalls every plugin installed from it and deletes
+those plugins' stored options, so set any option again afterwards. Start a new
+session, or run `/reload-plugins`, to load the new set.
+
+These update steps are written from Claude Code's documentation and are not yet
+confirmed on a real account; this section is corrected from the result.
+
+### Uninstall
+
+Three steps, in this order:
+
+1. When the setup skill exists, run its uninstall in a session first: it
+   removes the files setup placed, and no hook runs at uninstall. This
+   skeleton places no file, so there is nothing to remove yet.
+2. In a terminal, uninstall the plugin and the dependencies its install pulled
+   in: `claude plugin uninstall harness@harness-core --prune -y`. The `-y` is
+   needed when the command is not run from an interactive terminal. Without
+   `--prune` the dependencies stay behind. A plugin you installed on its own
+   before `harness` is kept.
+3. Remove the marketplace: `claude plugin marketplace remove harness-core`.
+   This also uninstalls anything still installed from it.
+
+```text
+claude plugin uninstall harness@harness-core --prune -y
+claude plugin marketplace remove harness-core
+claude plugin list
+```
+
+The list then shows none of the three. Which of steps 2 and 3 removes the
+dependencies is not yet confirmed on a real account.
+
+### For maintainers: cutting a tag
+
+A user's copy of a folder plugin changes only when its `version` string does,
+so raise `version` in `plugins/harness/.claude-plugin/plugin.json` before each
+tag, and move an external plugin's pin (its `ref` and `sha` together) only in
+the marketplace file.
 
 ## The default-tier load probe
 

@@ -26,7 +26,7 @@ RUNS_ON = "${{ fromJSON(vars.CORE_CI_RUNNER || '[\"ubuntu-latest\"]') }}"
 # literal of labels. Anything else is unparsed and fails.
 RUNS_ON_SHAPE = re.compile(r"\$\{\{ fromJSON\(vars\.CORE_CI_RUNNER \|\| '(\[[^']*\])'\) \}\}")
 HOSTED_DEFAULT = ["ubuntu-latest"]
-JOBS = ["pytest", "core-manifest", "no-person", "ledger-drift"]
+JOBS = ["pytest", "core-manifest", "no-person", "ledger-drift", "plugin-validate"]
 # Every workflow file and its jobs; a workflow file not listed here fails.
 WORKFLOWS = {CI: JOBS, IDENTITY: ["commit-identity"]}
 PULL_REQUEST_TYPES = ["opened", "synchronize", "reopened", "ready_for_review"]
