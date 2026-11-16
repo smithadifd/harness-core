@@ -1,0 +1,7 @@
+{
+  "name": "rails",
+  "version": "0.1.0",
+  "description": "Guard hooks that deny destructive shell commands. Deny only: no hook in this plugin ever allows.",
+  "license": "MIT",
+  "keywords": ["guard", "hooks", "deny"]
+}

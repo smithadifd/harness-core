@@ -66,6 +66,29 @@ the text itself.
 | `VENDORING.md` | this file |
 | `ledger-vendor.pin` | the vendored ledger's pin: repository, tag, commit and one blob id per file |
 | `plugins/harness/.claude-plugin/plugin.json` | the harness plugin's manifest: its version and the plugins it depends on |
+| `plugins/rails/.claude-plugin/plugin.json` | the rails plugin's manifest: name, version, description, license |
+| `plugins/rails/hooks/hooks.json` | the rails plugin's hook registration: the destructive-command guard on every Bash call, exec form, onFailure block |
+| `plugins/rails/hooks/destructive-command-guard.sh` | the destructive-command guard: denies an unsafe rm, git worktree remove or symlinked redirect, or stays silent; never allows |
+| `plugins/rails/tests/test_destructive_guard_suites.py` | runs every guard suite under pytest and checks the plugin's manifest and hooks fields |
+| `plugins/rails/tests/destructive-command-guard.test.sh` | the guard's main suite: containment, wrappers, protocol faults, reason codes, redaction |
+| `plugins/rails/tests/destructive-command-guard-cleanup-worktree.test.sh` | tests of the seat-bound cleanup-registry removal and its mutation audit |
+| `plugins/rails/tests/destructive-command-guard-dependencies.test.sh` | tests that a missing program denies by name, that programs are found only in the trusted roots, the crash and signal traps, the hook entry, inherited git variables and interpreter startup state |
+| `plugins/rails/tests/destructive-command-guard-dormant.test.sh` | tests that the lane-registry layer and the guard log are dormant unarmed and deny by name when armed and broken |
+| `plugins/rails/tests/destructive-command-guard-git-forms.test.sh` | tests of git worktree remove spelled through git options and prefixes, and of the stat flavours |
+| `plugins/rails/tests/destructive-command-guard-lane-remove.test.sh` | tests of the lane-registry removal and its identity binding |
+| `plugins/rails/tests/destructive-command-guard-linked-worktree.test.sh` | tests of the explicitly authorized linked-worktree removal |
+| `plugins/rails/tests/destructive-command-guard-merged-remove.test.sh` | regressions of the removed merged-or-pushed route, the graft case among them |
+| `plugins/rails/tests/destructive-command-guard-never-allow.test.sh` | tests that the guard never allows or asks |
+| `plugins/rails/tests/destructive-command-guard-pins.test.sh` | pins of the temp roots, the strict-descendant rules and delegated shells |
+| `plugins/rails/tests/destructive-command-guard-reasons.test.sh` | static checks of the guard's reason codes, hints and time budgets |
+| `plugins/rails/tests/destructive-command-guard-redirect.test.sh` | tests of the symlinked-redirect denial |
+| `plugins/rails/tests/destructive-command-guard-scope.test.sh` | the interface-level scope check: an accepted rm is silent, an ordinary command has no opinion |
+| `plugins/rails/tests/destructive-command-guard-unavailable-temp.test.sh` | the unavailable-temp regression |
+| `plugins/rails/tests/destructive-command-guard-workspace-cwd.test.sh` | tests of a working folder in no git repository |
+| `plugins/rails/tests/destructive-command-guard-wrappers.test.sh` | tests of temp-root removals, execution prefixes, wrapped removals and the command splitter |
+| `plugins/rails/tests/fixtures/destructive-command-guard/incident-call-1.json` | a recorded hook input the main suite replays |
+| `plugins/rails/tests/fixtures/destructive-command-guard/incident-call-2.json` | a recorded hook input the main suite replays |
+| `plugins/rails/tests/fixtures/destructive-command-guard/warn-then-exec.sh` | a stand-in engine that writes one stderr line, then runs the real engine |
 | `scripts/check-core-manifest.py` | checks that every tracked file is vendored or repository-only |
 | `scripts/check-ledger-vendor.py` | the vendored ledger's drift check |
 | `scripts/check-marketplace.py` | checks the marketplace and the harness plugin's manifest: folders, manifests, each external plugin bound to its expected source, full-commit pins, and, with the source option, each tag against its pin through the GitHub REST API, with no credential |
@@ -263,6 +286,19 @@ cmp ok 8fbc5a907c635701e16869033c2a50f9e7fbde97 skills/_lib/tests/test_ticket_so
 cmp ok 9ef274f2d55e77c0f220b7946803896eeb7872b6 skills/_lib/tests/test_trust_keys_documented_resolution.py
 cmp ok f3e28b0b2c76d88eb0fa7665e298a6f45fda0ae5 skills/_lib/ticket_source.py
 ```
+
+## The rails plugin's carve record
+
+The destructive-command guard (`plugins/rails/hooks/destructive-command-guard.sh`),
+its moved test suites and their fixtures were carved, without history, from a
+private repository at commit `d5eb2b4`, and rewritten there: it never allows
+or asks (an accepted command is silent), every program it runs by name comes
+only from fixed trusted roots, a missing program, an adapter fault or a signal
+denies by name, its lane-registry layer is dormant unless armed, the
+merged-or-pushed removal route and the home work-folder rule are removed, and
+owner-specific paths are scrubbed. No file of the plugin is a `cmp`-equal
+copy of its source. Three suites are new: never-allow, dependencies and
+dormant.
 
 ## Pin moves
 

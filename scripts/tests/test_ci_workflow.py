@@ -253,7 +253,7 @@ def test_each_gate_job_runs_its_check():
         "python3 -I scripts/check-no-person.py")
     no_person = steps(found["no-person"])[-1]
     assert DENY_FROM_SECRET in no_person
-    pytest_step = "\n".join(steps(found["pytest"])[-1])
+    pytest_step = "\n".join(named_step(found["pytest"], "Run every test suite"))
     for suite in ("skills/_lib/tests", "skills/_lib/recall/tests", "skills/_lib/ledger/tests",
                   "scripts/tests"):
         assert f'"{suite}"' in pytest_step, suite
@@ -275,6 +275,80 @@ def test_the_deny_list_reaches_ci_only_from_the_secret_and_no_step_echoes_it():
     no_person = steps(jobs(workflow())["no-person"])
     assert [DENY_FROM_SECRET in step for step in no_person] == [False] * (
         len(no_person) - 1) + [True]
+
+
+def named_step(job: list[str], title: str) -> list[str]:
+    """The one step of the job whose name is title."""
+    found = [step for step in steps(job) if step_keys(step).get("name", [""])[0] == title]
+    assert len(found) == 1, (title, len(found))
+    return found[0]
+
+
+# The rails plugin's guard suites: one step of the pytest job, right after the
+# existing suites, under python3 -I, in a fresh HOME, after a preflight that
+# looks for the guard's programs where the guard looks for them.
+
+RAILS_STEP = "Run the rails plugin's guard suites under python3 -I, in a fresh home"
+# As it reads in the step's body once the run block's own indent is removed.
+RAILS_COMMAND = ('command = [os.environ["CORE_PYTHON"], "-I", "-m", "pytest", "-q", "-ra",\n'
+                 '           "-p", "no:cacheprovider", "plugins/rails/tests"]')
+TRUSTED_ROOTS = '"/usr/bin", "/bin", "/usr/local/bin", "/opt/homebrew/bin", "/home" + "/linuxbrew/.linuxbrew/bin"'
+
+
+def rails_problems(text: str) -> list[str]:
+    """What is wrong with the rails step, by name."""
+    job = jobs(text)["pytest"]
+    found = [step for step in steps(job) if step_keys(step).get("name", [""])[0] == RAILS_STEP]
+    if len(found) != 1:
+        return [f"pytest: {len(found)} rails steps"]
+    step = found[0]
+    keys = step_keys(step)
+    body = "\n".join(line[10:] for line in keys.get("run", ["", ""])[1:])
+    problems = []
+    names = [step_keys(s).get("name", [""])[0] for s in steps(job)]
+    if names.index(RAILS_STEP) != names.index("Run every test suite") + 1:
+        problems.append("rails: the step does not follow the existing suites")
+    if keys.get("shell", [None])[0] != ISOLATED_SHELL:
+        problems.append("rails: the step's shell is not python3 -I")
+    if RAILS_COMMAND not in body:
+        problems.append("rails: pytest does not run plugins/rails/tests under -I")
+    if 'home = tempfile.mkdtemp(dir=os.environ["RUNNER_TEMP"])' not in body or "HOME=home" not in body:
+        problems.append("rails: HOME is not a fresh folder")
+    if f"roots = [{TRUSTED_ROOTS}]" not in body:
+        problems.append("rails: the preflight does not look in the guard's trusted roots")
+    if "command -v" in body or "shutil.which" in body or "PATH" in body:
+        problems.append("rails: the preflight looks on PATH")
+    for name in ('"jq"', '"git"', '"/usr/bin/perl"', '"import pytest"'):
+        if name not in body:
+            problems.append(f"rails: the preflight does not check {name}")
+    if "sys.exit(1)" not in body:
+        problems.append("rails: the preflight does not fail the step")
+    return problems
+
+
+def test_the_pytest_job_runs_the_rails_suites_isolated_after_a_trusted_roots_preflight():
+    assert rails_problems(workflow()) == []
+
+
+RAILS_NEAR_MISSES = [
+    ("not-isolated", lambda t: t.replace('[os.environ["CORE_PYTHON"], "-I", "-m", "pytest"', '[os.environ["CORE_PYTHON"], "-m", "pytest"'),
+     "rails: pytest does not run plugins/rails/tests under -I"),
+    ("preflight-on-path", lambda t: t.replace(f"roots = [{TRUSTED_ROOTS}]", 'roots = os.environ["PATH"].split(":")'),
+     "rails: the preflight does not look in the guard's trusted roots"),
+    ("home-not-fresh", lambda t: t.replace('env = dict(os.environ, HOME=home, PYTHONDONTWRITEBYTECODE="1")\n          command = [os.environ["CORE_PYTHON"], "-I"',
+                                            'env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")\n          command = [os.environ["CORE_PYTHON"], "-I"'),
+     "rails: HOME is not a fresh folder"),
+    ("step-missing", lambda t: t.replace("      - name: " + RAILS_STEP, "      - name: Something else"),
+     "pytest: 0 rails steps"),
+]
+
+
+@pytest.mark.parametrize("change,expected", [(case[1], case[2]) for case in RAILS_NEAR_MISSES],
+                         ids=[case[0] for case in RAILS_NEAR_MISSES])
+def test_a_rails_step_near_miss_is_refused_by_name(change, expected):
+    changed = change(workflow())
+    assert changed != workflow(), "the change did something"
+    assert expected in rails_problems(changed)
 
 
 # J7 and J8: the ledger drift job runs both checks.
@@ -358,7 +432,10 @@ ISOLATION_NEAR_MISSES = [
      "has the python shell 'python3 {0}', not 'python3 -I {0}'"),
     ("pytest-run-shell", lambda t: nth(t, SHELL, "        shell: python3 {0}\n", 2),
      "pytest: step 'Run every test suite' has the python shell 'python3 {0}', not 'python3 -I {0}'"),
-    ("ledger-drift-shell", lambda t: nth(t, SHELL, "        shell: python3 {0}\n", 3),
+    ("pytest-rails-shell", lambda t: nth(t, SHELL, "        shell: python3 {0}\n", 3),
+     "pytest: step \"Run the rails plugin's guard suites under python3 -I, in a fresh home\" "
+     "has the python shell 'python3 {0}', not 'python3 -I {0}'"),
+    ("ledger-drift-shell", lambda t: nth(t, SHELL, "        shell: python3 {0}\n", 4),
      "ledger-drift: step 'ledger-vendor.pin matches the ledger repository at the pinned commit (--source)' "
      "has the python shell 'python3 {0}', not 'python3 -I {0}'"),
     ("gate-step-removed", lambda t: t.replace("        run: python3 -I scripts/check-core-manifest.py\n", "        run: true\n"),
