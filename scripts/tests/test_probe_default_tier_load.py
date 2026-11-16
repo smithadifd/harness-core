@@ -530,6 +530,8 @@ def main():
             pattern = "NONE"
         if mode == "topbash":
             tool_use("Bash", {"command": "echo hi"}, "toolu_2")
+        if mode == "topread":
+            tool_use("Read", {"file_path": "/etc/hosts"}, "toolu_2")
         # The subagent's own Bash call and its result: events whose parent_tool_use_id
         # is the Agent call's id (a Bash result's content is a plain string). The
         # modes below leave the call out, double it, leave its result out, make the
@@ -540,14 +542,28 @@ def main():
         if mode == "replyfree":
             pattern = "The subagent has finished."
         owner = "toolu_8" if mode == "bashforeign" else "toolu_1"
+        # The Bash result event's own parent: the Agent call's id, but for the two modes that
+        # give it another's (resforeign) or none (resnoparent).
+        result_parent = {"resforeign": "toolu_8", "resnoparent": None}.get(mode, owner)
         if mode != "nobash":
-            tool_use("Bash", {"command": "echo inner"}, "toolu_3", parent=owner)
+            command = {"cmdnoname": "echo inner",
+                       "cmdvalue": 'echo "HARNESS_PROBE_OPTION=%s"' % option_value()}.get(
+                mode, 'echo "PROBE_OPT=[${HARNESS_PROBE_OPTION}]"')
+            tool_use("Bash", {"command": command}, "toolu_3", parent=owner)
             if mode == "twobash":
                 tool_use("Bash", {"command": "echo again"}, "toolu_6", parent=owner)
             if mode != "bashnores":
-                tool_result("toolu_3", nested_text, parent=owner, is_error=(mode == "basherr"))
+                tool_result("toolu_3", nested_text, parent=result_parent, is_error=(mode == "basherr"))
                 if mode == "twobash":
                     tool_result("toolu_6", nested_text, parent=owner)
+                # A second result for the same call: under another parent, under none, or
+                # an error beside the good one.
+                if mode == "resplusforeign":
+                    tool_result("toolu_3", nested_text, parent="toolu_8")
+                if mode == "resplusnull":
+                    tool_result("toolu_3", nested_text, parent=None)
+                if mode == "errplusgood":
+                    tool_result("toolu_3", "the command failed", parent=owner, is_error=True)
                 if mode == "bashtworesults":
                     tool_result("toolu_3", nested_text, parent=owner)
         if mode in ("background", "launch_notice"):
@@ -1764,6 +1780,18 @@ def test_b2_fails_when_the_subagents_own_bash_result_lacks_the_value_though_the_
     pytest.param("bashtworesults", "1 nested Bash call(s) and 2 non-error result(s)", id="nested-bash-two-results"),
     # Mutation F17-g (count a Bash call whatever its parent).
     pytest.param("bashforeign", "0 nested Bash call(s) and 0 non-error result(s)", id="bash-of-another-parent"),
+    # The Sol settle probe's shape: the Bash call is under the Agent call and its result has the
+    # right tool_use_id, but the result event's own parent is another call's, or missing. Mutation
+    # F17-j (drop the parent check on the result).
+    pytest.param("resforeign", "1 nested Bash call(s) and 1 non-error result(s)", id="result-of-another-parent"),
+    pytest.param("resnoparent", "1 nested Bash call(s) and 1 non-error result(s)", id="result-without-parent"),
+    # A right-parent result with the value plus a second result for the same call under a foreign
+    # parent, or none: counted before the parent is asked, so not one result. Mutation F17-k (keep
+    # only the results that are non-error and under the Agent call, then count them).
+    pytest.param("resplusforeign", "1 nested Bash call(s) and 2 non-error result(s)", id="good-result-plus-foreign-parent-result"),
+    pytest.param("resplusnull", "1 nested Bash call(s) and 2 non-error result(s)", id="good-result-plus-parentless-result"),
+    # An error result and a good one for one call. Mutation F17-k.
+    pytest.param("errplusgood", "1 nested Bash call(s) and 1 non-error result(s)", id="error-result-plus-good-result"),
 ])
 def test_b2_is_unverified_unless_the_agent_call_has_exactly_one_nested_bash_call_and_result(world, mode, counts):
     result = world.run("--only", "B", scenario={"B2": mode})
@@ -1771,8 +1799,40 @@ def test_b2_is_unverified_unless_the_agent_call_has_exactly_one_nested_bash_call
     evidence = result.evidence("B2")
     assert counts in evidence
     assert "expected exactly one of each" in evidence
+    if mode in ("resplusforeign", "resplusnull", "errplusgood"):
+        assert "(2 in all, 1 under it as a non-error result)" in evidence
     assert "the output of a subagent's own Bash is not shown" in evidence
     assert "saw HARNESS_PROBE_OPTION" not in evidence
+    assert result.rc == 2
+
+
+def test_b2_is_unverified_when_the_nested_bash_command_does_not_name_the_option(world):
+    # A command that never names HARNESS_PROBE_OPTION does not show the subagent's Bash reading
+    # the option. Mutation F17-l (drop the command-names check).
+    result = world.run("--only", "B", scenario={"B2": "cmdnoname"})
+    assert result.status("B2") == "UNVERIFIED", result.out
+    assert "does not name HARNESS_PROBE_OPTION" in result.evidence("B2")
+    assert "saw HARNESS_PROBE_OPTION" not in result.evidence("B2")
+    assert result.rc == 2
+
+
+def test_b2_is_unverified_when_the_value_is_in_the_nested_bash_commands_own_input(world):
+    # The command echoes the value itself, so the result proves a relayed value, not a read.
+    # Mutation F17-m (drop the check of the value in the command).
+    result = world.run("--only", "B", scenario={"B2": "cmdvalue"})
+    assert result.status("B2") == "UNVERIFIED", result.out
+    assert "the subagent's Bash command carried the value" in result.evidence("B2")
+    assert "saw HARNESS_PROBE_OPTION" not in result.evidence("B2")
+    assert result.rc == 2
+
+
+def test_b2_is_unverified_when_the_main_thread_called_any_tool_but_the_agent_call(world):
+    # A top-level Read could return the value; only the session flags kept it out. Mutation F17-n
+    # (count only a top-level Bash call).
+    result = world.run("--only", "B", scenario={"B2": "topread"})
+    assert result.status("B2") == "UNVERIFIED", result.out
+    assert "the main thread ran Read itself 1 time(s)" in result.evidence("B2")
+    assert "saw HARNESS_PROBE_OPTION" not in result.evidence("B2")
     assert result.rc == 2
 
 

@@ -332,7 +332,10 @@ rand_hex() {
 # value seen, field 2 an excerpt), NOSPAWN, COUNT, NOTGP, BGRUN, TOPBASH or
 # LEAK (the route was not the one under test; COUNT is more or fewer than one
 # Agent/Task call or result; NOBASH is, for B2, more or fewer than one Bash call
-# of the subagent itself or than one non-error result for it), NOBOUNDARY or LEAKSEED (the compaction was not
+# of the subagent itself, than one result for it, or a result not under the
+# Agent call, or a command that does not name the option; TOPBASH is any
+# top-level tool call but the Agent call; LEAK is also the value in that
+# Bash command), NOBOUNDARY or LEAKSEED (the compaction was not
 # shown, or the sentinel was there before it), ROOT (the install folder the
 # install record names), RAN or NORUN (the recording sh logged the plugin's two
 # hook scripts under a trusted root, or did not; RAN's second field names the
@@ -559,7 +562,7 @@ if mode == "subagent":
     top = [event for event in events if not event.get("parent_tool_use_id")]
     spawned = {}
     calls = 0
-    top_bash = 0
+    top_other = []
     for event in top:
         if event.get("type") != "assistant":
             continue
@@ -569,8 +572,8 @@ if mode == "subagent":
             if item.get("name") in ("Agent", "Task"):
                 calls += 1
                 spawned[item.get("id")] = item.get("input") or {}
-            elif item.get("name") == "Bash":
-                top_bash += 1
+            else:
+                top_other.append(str(item.get("name")))
     # The results of the top-level Agent/Task calls, by call id.
     answers = []
     errors = []
@@ -584,8 +587,8 @@ if mode == "subagent":
     counts = "%d top-level Agent/Task call(s), %d non-error result(s) for them" % (calls, len(answers))
     if not calls:
         out("NOSPAWN", "the main thread started no subagent (%s)" % counts)
-    if top_bash:
-        out("TOPBASH", "the main thread ran Bash itself %d time(s)" % top_bash)
+    if top_other:
+        out("TOPBASH", "the main thread ran %s itself %d time(s)" % (", ".join(sorted(set(top_other))), len(top_other)))
     # Exactly one call and one result: with more, a reply of one subagent could
     # stand for the route while another's was never read.
     if calls != 1 or len(spawned) != 1:
@@ -614,22 +617,36 @@ if mode == "subagent":
         # the main thread could have read the value itself and passed it on; the
         # subagent's own Bash is what the line says saw it. So the Agent call must
         # have exactly one Bash call of its own (a tool_use whose parent_tool_use_id
-        # is the Agent call's id) and exactly one non-error result for that call,
-        # and the value is read from that result, never from the Agent's reply.
+        # is the Agent call's id), the command must name HARNESS_PROBE_OPTION and not
+        # carry the value, and the call must have exactly one result of any kind:
+        # every tool_result for its id is counted whatever its parent and is_error,
+        # and that one must be a non-error result whose own parent_tool_use_id is
+        # the Agent call's id. The value is read from that result, never from the
+        # Agent's reply. (Counting first, then requiring the parent, keeps a second
+        # result under another parent from being dropped by a filter.)
         agent_id = next(iter(spawned))
-        nested = [item.get("id") for event in events
+        nested = [item for event in events
                   if event.get("type") == "assistant" and event.get("parent_tool_use_id") == agent_id
                   for item in blocks(event)
                   if item.get("type") == "tool_use" and item.get("name") == "Bash"]
-        ids = [ident for ident in nested if isinstance(ident, str) and ident]
-        shown = [block_text(item.get("content")) for event in events if event.get("type") == "user"
+        ids = [item.get("id") for item in nested if isinstance(item.get("id"), str) and item.get("id")]
+        every = [(event, item) for event in events if event.get("type") == "user"
                  for item in blocks(event)
-                 if item.get("type") == "tool_result" and item.get("tool_use_id") in ids
-                 and not item.get("is_error")]
-        if len(nested) != 1 or len(ids) != 1 or len(shown) != 1:
-            out("NOBASH", "the Agent call has %d nested Bash call(s) and %d non-error result(s) for them, "
-                "expected exactly one of each" % (len(nested), len(shown)))
-        reply = shown[0]
+                 if item.get("type") == "tool_result" and item.get("tool_use_id") in ids]
+        plain = [item for _event, item in every if not item.get("is_error")]
+        shown = [item for event, item in every
+                 if not item.get("is_error") and event.get("parent_tool_use_id") == agent_id]
+        if len(nested) != 1 or len(ids) != 1 or len(every) != 1 or len(shown) != 1:
+            out("NOBASH", "the Agent call has %d nested Bash call(s) and %d non-error result(s) for them "
+                "(%d in all, %d under it as a non-error result), "
+                "expected exactly one of each" % (len(nested), len(plain), len(every), len(shown)))
+        given_input = nested[0].get("input")
+        command = given_input.get("command") if isinstance(given_input, dict) else None
+        if not isinstance(command, str) or "HARNESS_PROBE_OPTION" not in command:
+            out("NOBASH", "the subagent's Bash command does not name HARNESS_PROBE_OPTION")
+        if needle in json.dumps(given_input):
+            out("LEAK", "the subagent's Bash command carried the value")
+        reply = block_text(shown[0].get("content"))
     if pattern in reply:
         out("FOUND", seen_option(reply), reply)
     out("MISSING", seen_option(reply), reply)
