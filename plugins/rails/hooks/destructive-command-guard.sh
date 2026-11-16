@@ -1270,9 +1270,12 @@ LANE_REGISTRY_HEADER=$'path\trepo\tbranch\tcreated_at'
 
 # Prints "<uid> <octal mode>" for $1. BSD stat takes -f FORMAT; on GNU stat -f
 # means "filesystem status", so the flavour is detected from `stat --version`
-# (GNU prints a version banner, BSD rejects the flag) and only that flavour's
-# syntax is ever used. The binary is taken from fixed absolute paths only,
-# never from PATH (a planted `stat` must not be able to vouch for a registry).
+# and only that flavour's syntax is ever used. A stat that prints a version
+# banner takes the GNU syntax, whatever the banner names: GNU coreutils and
+# its uutils rewrite (which some Linux distributions ship as /usr/bin/stat,
+# with a banner that does not say GNU) both do. BSD stat rejects the flag
+# and prints nothing on standard output. The binary is taken from fixed
+# absolute paths only, never from PATH (a planted `stat` must not be able to vouch for a registry).
 # No usable binary, or a failing stat, fails closed.
 STAT_CANDIDATES=(/usr/bin/stat /bin/stat)
 stat_fields() { # BSD_FORMAT GNU_FORMAT PATH
@@ -1281,7 +1284,7 @@ stat_fields() { # BSD_FORMAT GNU_FORMAT PATH
     if [ -x "$candidate" ] && [ ! -d "$candidate" ]; then stat_bin="$candidate"; break; fi
   done
   [ -n "$stat_bin" ] || return 1
-  if "$stat_bin" --version 2>/dev/null | grep -q 'GNU coreutils'; then
+  if "$stat_bin" --version 2>/dev/null | grep -q .; then
     out="$("$stat_bin" -c "$2" -- "$3" 2>/dev/null)" || return 1
   else
     out="$("$stat_bin" -f "$1" -- "$3" 2>/dev/null)" || return 1

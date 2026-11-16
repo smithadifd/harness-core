@@ -31,7 +31,7 @@ STUBS="$TMP/stubs"
 GUARD_COPIES="$TMP/guards"
 
 git_q() { HOME="$TMP/githome" git -c user.name=t -c user.email=t@example.invalid "$@"; }
-mkdir -p "$TMP/githome" "$TMP/scratch" "$REG_DIR" "$STUBS/bsd" "$STUBS/gnu" "$STUBS/plant" "$GUARD_COPIES"
+mkdir -p "$TMP/githome" "$TMP/scratch" "$REG_DIR" "$STUBS/bsd" "$STUBS/gnu" "$STUBS/uutils" "$STUBS/plant" "$GUARD_COPIES"
 for repo in "$PRIMARY" "$OTHER"; do
   git_q init -q --initial-branch=main "$repo" || exit 1
   printf 'x\n' >"$repo/f.txt"
@@ -156,7 +156,34 @@ target="$4"
 mode=600; [ ! -d "$target" ] || mode=700
 printf '%s %s\n' "${STUB_STAT_UID:-$(/usr/bin/id -u)}" "$mode"
 STUB
-chmod 755 "$STUBS/bsd/stat" "$STUBS/gnu/stat"
+# A GNU-syntax stat whose banner does not say GNU, as the uutils rewrite's
+# does not. It takes only the -c syntax and answers every field from the real
+# file (the owner, the whole mode, the identity and the size), so a registry
+# the host reports as group- or world-writable stays that way. STUB_STAT_UID
+# overrides only the reported owner.
+cat >"$STUBS/uutils/stat" <<'STUB'
+#!/bin/bash
+[ -z "${STUB_STAT_LOG:-}" ] || printf 'uutils %s\n' "$*" >>"$STUB_STAT_LOG"
+if [ "${1:-}" = "--version" ]; then printf 'stat (uutils coreutils) 0.0.24\n'; exit 0; fi
+[ "${1:-}" = "-c" ] && [ "${3:-}" = "--" ] && [ "$#" -eq 4 ] || exit 1
+host_gnu=0; /usr/bin/stat --version >/dev/null 2>&1 && host_gnu=1
+case "$2" in
+  "%u %a")
+    if [ "$host_gnu" = 1 ]; then out="$(/usr/bin/stat -c '%u %a' -- "$4")" || exit 1
+    else out="$(/usr/bin/stat -f '%u %Mp%Lp' -- "$4")" || exit 1; fi
+    owner="${out%% *}"; mode="${out#* }"
+    while [ "${mode#0}" != "$mode" ]; do mode="${mode#0}"; done
+    printf '%s %s\n' "${STUB_STAT_UID:-$owner}" "$mode" ;;
+  "%d %i %.9W")
+    [ "$host_gnu" = 1 ] && exec /usr/bin/stat -c '%d %i %.9W' -- "$4"
+    exec /usr/bin/stat -f '%d %i %.9FB' -- "$4" ;;
+  "%s")
+    [ "$host_gnu" = 1 ] && exec /usr/bin/stat -c '%s' -- "$4"
+    exec /usr/bin/stat -f '%z' -- "$4" ;;
+  *) exit 1 ;;
+esac
+STUB
+chmod 755 "$STUBS/bsd/stat" "$STUBS/gnu/stat" "$STUBS/uutils/stat"
 
 # Planted stat: sits first on PATH and claims every file is owned by the
 # caller with mode 600, whatever the real owner or mode is.
@@ -172,6 +199,12 @@ REG_BAD="$REG_BAD_DIR/lane-roots.tsv"
 mkdir -p "$REG_BAD_DIR"
 cp "$REG" "$REG_BAD"
 chmod 666 "$REG_BAD"; chmod 700 "$REG_BAD_DIR"
+# A private registry file in a folder the real stat reports as group-writable.
+REG_GW_DIR="$TMP/seat-gw/scratch"
+REG_GW="$REG_GW_DIR/lane-roots.tsv"
+mkdir -p "$REG_GW_DIR"
+cp "$REG" "$REG_GW"
+chmod 600 "$REG_GW"; chmod 770 "$REG_GW_DIR"
 
 # The registry / authorization rules below are exercised on worktrees that live
 # under the temp roots, which the guard would otherwise accept as throwaway
@@ -191,6 +224,7 @@ make_guard_copy() { # FLAVOUR STUB_BINARY -> path of a guard copy that uses only
 }
 GUARD_BSD="$(make_guard_copy bsd "$STUBS/bsd/stat")" || exit 1
 GUARD_GNU="$(make_guard_copy gnu "$STUBS/gnu/stat")" || exit 1
+GUARD_UUTILS="$(make_guard_copy uutils "$STUBS/uutils/stat")" || exit 1
 GUARD_NOSTAT="$(make_guard_copy nostat "$TMP/no-such-dir/stat")" || exit 1
 pass() { printf 'PASS: %s\n' "$1"; }
 fail() { printf 'FAIL: %s\n' "$1"; FAILURES=$((FAILURES + 1)); }
@@ -201,7 +235,7 @@ fail() { printf 'FAIL: %s\n' "$1"; FAILURES=$((FAILURES + 1)); }
 run_case() {
   local label="$1" expect="$2" cwd="$3" command_data="$4" variant="${5:--}" stubuid="${6:-}"
   local input output decision reason path="$PATH" guard="$GUARD"
-  case "$variant" in bsd) guard="$GUARD_BSD" ;; gnu) guard="$GUARD_GNU" ;; nostat) guard="$GUARD_NOSTAT" ;; esac
+  case "$variant" in bsd) guard="$GUARD_BSD" ;; gnu) guard="$GUARD_GNU" ;; uutils) guard="$GUARD_UUTILS" ;; nostat) guard="$GUARD_NOSTAT" ;; esac
   input="$($JQ -cn --arg cwd "$cwd" --arg command "$command_data" '{cwd:$cwd,command:$command}')"
   output="$(cd "$TMP" && printf '%s' "$input" | env PATH="$path" STUB_STAT_UID="$stubuid" \
     LANE_ROOTS_REGISTRY="$REG" HOME="$TMP/githome" /bin/bash --noprofile --norc -p "$guard" --policy 2>/dev/null)"
@@ -456,6 +490,21 @@ done
 
 run_case "no usable stat binary fails closed" deny "$PRIMARY" "git worktree remove $WT" nostat
 
+printf '%s\n' '== a GNU-syntax stat whose banner does not say GNU (uutils) =='
+# The flavour is the syntax the binary takes: a banner that does not name GNU
+# still gets the -c form, and the owner and mode rules still deny.
+run_uutils_registry() { # LABEL REGISTRY WANT_REASON [STUB_UID]
+  local out reason
+  out="$(cd "$TMP" && printf '%s' "$($JQ -cn --arg cwd "$PRIMARY" --arg command "git worktree remove $WT" '{cwd:$cwd,command:$command}')" \
+    | env STUB_STAT_UID="${4:-}" LANE_ROOTS_REGISTRY="$2" HOME="$TMP/githome" /bin/bash --noprofile --norc -p "$GUARD_UUTILS" --policy 2>/dev/null)"
+  reason="$(printf '%s' "$out" | "$JQ" -er 'select(.decision == "deny") | .reason' 2>/dev/null || printf invalid)"
+  if [ "$reason" = "$3" ]; then pass "$1 -> deny/$reason"; else fail "$1: expected deny/$3, got ${out:-no output}"; fi
+}
+run_case "uutils stat, trusted registry, owner is this user" accepted "$PRIMARY" "git worktree remove $WT" uutils
+run_uutils_registry "uutils stat, world-writable registry file" "$REG_BAD" lane_registry_untrusted
+run_uutils_registry "uutils stat, group-writable registry folder" "$REG_GW" lane_registry_untrusted
+run_uutils_registry "uutils stat, registry owned by another uid" "$REG" lane_registry_untrusted "$((REAL_UID + 1))"
+
 printf '%s\n' '== stat is never resolved through PATH =='
 run_plant() { # LABEL EXPECT REGISTRY [plant] -> runs with the planted stat first on PATH when asked
   local label="$1" expect="$2" reg="$3" out decision reason path="$PATH"
@@ -488,6 +537,9 @@ case "$gnu_calls" in *"gnu -c %u %a"*) pass "GNU stat receives the -c form" ;; *
 case "$gnu_calls" in *"gnu -f"*) fail "GNU stat received the BSD -f form (filesystem mode on GNU)" ;; *) pass "GNU stat never receives -f" ;; esac
 case "$bsd_calls" in *"bsd -f %d %i %.9FB"*) pass "BSD stat receives the -f nanosecond identity form" ;; *) fail "BSD stat never received the -f nanosecond identity form (saw: $bsd_calls)" ;; esac
 case "$gnu_calls" in *"gnu -c %d %i %.9W"*) pass "GNU stat receives the -c nanosecond identity form" ;; *) fail "GNU stat never received the -c nanosecond identity form (saw: $gnu_calls)" ;; esac
+uutils_calls="$(stat_calls uutils)"
+case "$uutils_calls" in *"uutils -c %u %a"*) pass "uutils stat receives the -c form" ;; *) fail "uutils stat never received -c (saw: $uutils_calls)" ;; esac
+case "$uutils_calls" in *"uutils -f"*) fail "uutils stat received the BSD -f form (filesystem mode there)" ;; *) pass "uutils stat never receives -f" ;; esac
 
 if [ "$FAILURES" -eq 0 ]; then
   printf '%s\n' 'ALL GIT-FORM TESTS PASSED'
