@@ -3095,35 +3095,76 @@ and_chain() { # FROM TO
   return 0
 }
 
-# C1 and C2, read once per push at segment PUSH_INDEX. SCOPE_ALL_AND is 1
-# when every delimiter from the first segment to the push is && (an earlier
-# || can skip a tracked segment while the push still runs). SCOPE_HOLDS[k]
-# is 1 when no segment from k up to the push closes the ( ) or { } group that
-# segment k's command runs in (a cd in a subshell ends with the subshell).
-# One pass each way, so a long chain stays linear.
+# § 7.3's conditions 1 and 3, read once per push at segment PUSH_INDEX.
+# SCOPE_ALL_AND is 1 when every delimiter from the first segment to the push
+# is && (condition 1: an earlier || can skip a tracked segment while the push
+# still runs). SCOPE_HOLDS[k] is 1 when no segment from k up to the push holds
+# a closer of a group it did not open itself (condition 3: a cd in a group
+# that closes before the push ends with that group, whatever follows the
+# closer). One pass each, so a long chain stays linear.
 SCOPE_ALL_AND=0
 SCOPE_HOLDS=()
 tracked_scope() { # PUSH_INDEX
-  local k=0 low=""
-  local -a open after
-  open=()
-  after=()
+  local k="$1" closed=0
   SCOPE_HOLDS=()
   SCOPE_ALL_AND=0
   and_chain 0 "$1" && SCOPE_ALL_AND=1
-  GROUP_DEPTH=0
-  while [ "$k" -lt "$1" ]; do
-    group_depth_step "${SEGS[$k]}"
-    open[k]="$GROUP_OPEN_DEPTH"
-    after[k]="$GROUP_DEPTH"
-    k=$((k + 1))
-  done
   while [ "$k" -gt 0 ]; do
     k=$((k - 1))
-    if [ -z "$low" ] || [ "${after[$k]}" -lt "$low" ]; then low="${after[$k]}"; fi
-    if [ "$low" -ge "${open[$k]}" ]; then SCOPE_HOLDS[k]=1; else SCOPE_HOLDS[k]=0; fi
+    if [ "$closed" -eq 0 ] && segment_closes_group "${SEGS[$k]}"; then closed=1; fi
+    if [ "$closed" -eq 0 ]; then SCOPE_HOLDS[k]=1; else SCOPE_HOLDS[k]=0; fi
   done
   return 0
+}
+
+# § 7.3's condition 3 for one segment: true when SEGMENT holds a closer of a
+# group it did not open itself, anywhere in it: a ) outside quotes and
+# expansions with no ( of the segment's own left open before it, or a } that
+# starts a word. A segment this scan cannot read counts as holding one.
+segment_closes_group() { # SEGMENT
+  local s="$1" n="${#1}" i=0 depth=0 prev=' '
+  case "$s" in *')'*|*'}'*) ;; *) return 1 ;; esac
+  while [ "$i" -lt "$n" ]; do
+    case "${s:i:1}" in
+      \\) i=$((i + 2)); prev=x; continue ;;
+      \') i=$((i + 1))
+          while [ "$i" -lt "$n" ] && [ "${s:i:1}" != "'" ]; do i=$((i + 1)); done
+          [ "$i" -lt "$n" ] || return 0 ;;
+      \") skip_dquote "$s" $((i + 1)) || return 0; i="$SKIP_END"; prev=x; continue ;;
+      \`) skip_backtick "$s" $((i + 1)) || return 0; i="$SKIP_END"; prev=x; continue ;;
+      '$')
+        case "${s:i+1:1}" in
+          '(') skip_paren "$s" $((i + 2)) || return 0; i="$SKIP_END"; prev=x; continue ;;
+          '{') skip_brace "$s" $((i + 2)) || return 0; i="$SKIP_END"; prev=x; continue ;;
+          "'") i=$((i + 2))
+               while [ "$i" -lt "$n" ] && [ "${s:i:1}" != "'" ]; do
+                 [ "${s:i:1}" != "\\" ] || i=$((i + 1))
+                 i=$((i + 1))
+               done
+               [ "$i" -lt "$n" ] || return 0 ;;
+        esac ;;
+      '(') depth=$((depth + 1)) ;;
+      ')') [ "$depth" -gt 0 ] || return 0
+           depth=$((depth - 1)) ;;
+      '}') case "$prev" in ' '|$'\t'|$'\n') return 0 ;; esac ;;
+    esac
+    prev="${s:i:1}"
+    i=$((i + 1))
+  done
+  return 1
+}
+
+# § 7.3's condition 2: true when the tracked segment INDEX is plain. Its
+# first word is its command word RAW itself, so nothing stands before it (no
+# !, keyword, group opener, assignment, prefix program or redirection), and
+# that word, DEQ once bash removes its quotes, is not a path. Anything else
+# does not prove the cd or checkout -b ran in this shell as the builtin or git
+# the guard reads.
+segment_plain() { # INDEX RAW DEQ
+  case "$3" in */*) return 1 ;; esac
+  trim_horizontal "${SEGS[$1]}"
+  case "$TRIMMED" in "$2"|"$2"[[:blank:]]*) return 0 ;; esac
+  return 1
 }
 
 # Joins a cd or -C path to FOLDER as git and cd do.
@@ -3157,11 +3198,12 @@ target_read() { # FOLDER ARGS...
 # interpreter, eval, source, ., xargs, flock, trap, alias, env -S, a variable
 # command word, find -exec, a reaching GIT_ name, or a git command that
 # switches branches or writes configuration. Sets EARLIER_UNRESOLVED, and
-# tracks the folder (cd, pushd) and a branch set by checkout -b, only when
-# every delimiter from the first segment to the push is && (C1: an earlier ||
-# can skip the tracked segment while the push still runs) and no group that
-# holds the tracked segment closes before the push (C2), as tracked_scope
-# read them for this push.
+# tracks the folder (cd, pushd) and a branch set by checkout -b only when
+# § 7.3's three conditions hold for this push: every delimiter from the first
+# segment to the push is && (1), the tracked segment is plain (2,
+# segment_plain), and no segment from it to the push holds a closer of a
+# group it did not open (3); tracked_scope reads 1 and 3 once per push.
+# Anything else is unresolved.
 EARLIER_UNRESOLVED=0
 EARLIER_FOLDER=""
 EARLIER_BRANCH=""
@@ -3204,6 +3246,7 @@ earlier_segment() { # INDEX PUSH_INDEX
     raw_word_literal "${RS_RAW[$((cmd + 1))]}" "${RS_OBS[$((cmd + 1))]}" || { EARLIER_UNRESOLVED=1; return 0; }
     case "$w" in ''|-*|'~'*) EARLIER_UNRESOLVED=1; return 0 ;; esac
     [ "$SCOPE_ALL_AND" -eq 1 ] || { EARLIER_UNRESOLVED=1; return 0; }
+    segment_plain "$idx" "$raw" "$deq" || { EARLIER_UNRESOLVED=1; return 0; }
     [ "${SCOPE_HOLDS[$idx]:-0}" -eq 1 ] || { EARLIER_UNRESOLVED=1; return 0; }
     join_folder "$EARLIER_FOLDER" "$w"
     EARLIER_FOLDER="$JOINED_FOLDER"
@@ -3225,8 +3268,7 @@ earlier_segment() { # INDEX PUSH_INDEX
     case "$sub" in
       checkout|switch)
         # checkout -b NAME or switch -c NAME, with a literal NAME, no folder
-        # or repository option of its own, only && from the first segment to
-        # the push, and no group around it that closes before the push.
+        # or repository option of its own, and § 7.3's three conditions.
         w="${RS_WORDS[$((GW_SUB + 1))]:-}"
         case "$sub:$w" in
           checkout:-b|checkout:-B|switch:-c|switch:-C) ;;
@@ -3243,6 +3285,7 @@ earlier_segment() { # INDEX PUSH_INDEX
         fi
         [ "${#GW_CPATHS[@]}" -eq 0 ] && [ "$GW_REPO" -eq 0 ] || { EARLIER_UNRESOLVED=1; return 0; }
         [ "$SCOPE_ALL_AND" -eq 1 ] || { EARLIER_UNRESOLVED=1; return 0; }
+        segment_plain "$idx" "$raw" "$deq" || { EARLIER_UNRESOLVED=1; return 0; }
         [ "${SCOPE_HOLDS[$idx]:-0}" -eq 1 ] || { EARLIER_UNRESOLVED=1; return 0; }
         EARLIER_BRANCH="$name"
         EARLIER_BRANCH_FOLDER="$EARLIER_FOLDER"
