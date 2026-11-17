@@ -105,8 +105,8 @@ At this tag it lists three plugins:
 - `harness`, a folder in this repository (`plugins/harness/`). It is the one
   plugin a person installs, and it depends on the other two. It carries the
   setup skill (`/harness:setup`, which also checks and uninstalls), the script
-  behind it, the rules default and the override starter. The guard hooks
-  (`rails`) come in a later change.
+  behind it, the rules default, the override starter and the instance folder
+  template. The guard hooks (`rails`) come in a later change.
 - `sdlc`, the skills, from the public skills repository.
 - `ledger-hooks`, the ledger's hooks, from the public ledger repository.
 
@@ -178,6 +178,9 @@ If a file is already at the rules default's path, setup stops and writes
 nothing; it never overwrites or merges. If you already have an override file
 at its path, setup leaves it as it is and uninstall leaves it too.
 
+Before the closing note, the skill also offers an instance folder (below). It
+asks once, and runs it only if you say yes.
+
 #### What setup writes
 
 These are the files the plan lists, under your home folder. Setup opens no file
@@ -220,6 +223,42 @@ since setup, or missing), the settings items setup added, the stored ledger
 options, whether the ledger database file exists, and whether Python 3.11 or
 later and the `ledger` command are found. A line starting `FAIL` is a problem;
 `note` is information.
+
+### Make an instance folder (optional)
+
+Setup can also make an instance folder: a new folder of your choosing, made a
+local git repository, for plans and decisions in markdown. It is offered once
+at the end of `/harness:setup` and runs only if you say yes; you can also ask
+for it later:
+
+```text
+/harness:setup instance
+```
+
+You give the folder as an absolute path. It must not exist yet, or must exist
+and be empty. Setup refuses a folder that holds anything (a hidden file counts),
+a symlink, a file, a path with a `..` part, and a folder under your `.claude`
+folder, and it needs `git` on your PATH. The skill prints the plan (each file
+with its text, and the `git init`) and writes nothing until you say yes. These
+are the files it makes, inside the folder, and then `git init`:
+
+| Path | What it is |
+|---|---|
+| `README.md` | what the folder is, what goes in it and what goes in the ledger |
+| `.gitignore` | keeps a ledger database out of the repository if one is ever put there |
+| `roadmaps/README.md` | what belongs in `roadmaps/`: plans and the order of work |
+| `decisions/README.md` | what belongs in `decisions/`: the reasoning behind each decision |
+| `standards/README.md` | what belongs in `standards/`: local overrides of the harness standards |
+
+The folder holds markdown only. It holds no ledger database (the ledger keeps
+its own, set up above), and no settings file needs editing for it. Setup makes
+no commit and adds no remote; commit with your own git identity when you
+choose. If anything fails, setup removes what it made and says what it could
+not remove. Files and folders are private to you (modes 0600 and 0700).
+
+The folder is yours. Setup records nothing about it, so `doctor` does not list
+it and uninstall never touches it; delete it yourself if you want it gone. The
+template is `plugins/harness/files/instance/` in this repository.
 
 ### Update to a newer tag
 
@@ -300,7 +339,8 @@ this, and nothing else:
 | `.local/share/ledger` | the same |
 
 `.claude` itself stays when setup made it. An override file you edited also
-stays, and uninstall names it.
+stays, and uninstall names it. An instance folder you made is not in this table
+because setup never recorded it: it stays, untouched.
 
 If you skipped step 1, the two placed files and the record are still there, and
 this is the whole manual cleanup: delete `.claude/rules/harness.md`, delete

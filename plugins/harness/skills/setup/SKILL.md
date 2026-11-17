@@ -4,10 +4,12 @@ description: >
   Set up the default tier of the harness on this account, check it, or take it
   off. Run with no argument to set up (print every file and setting to be
   written, take a yes, apply, make the first ledger write, check the result),
-  with "doctor" to check an existing setup, or with "uninstall" to remove what
-  setup placed. Use when the person says "set up the harness", "check my
-  harness setup" or "uninstall the harness". Run by the person only.
-argument-hint: "[doctor | uninstall]"
+  with "doctor" to check an existing setup, with "uninstall" to remove what
+  setup placed, or with "instance" to make the optional instance folder of
+  plans and decisions. Use when the person says "set up the harness", "check my
+  harness setup", "uninstall the harness" or "make an instance folder". Run by
+  the person only.
+argument-hint: "[doctor | uninstall | instance]"
 disable-model-invocation: true
 ---
 
@@ -16,11 +18,11 @@ disable-model-invocation: true
 This skill drives one script, `setup.py`, which sits two folders above this
 file. The script does every write; this skill shows what it will do, asks, runs
 it and reports what it printed. Its verbs are `plan`, `apply`, `ledger-init`,
-`doctor` and `remove`.
+`doctor`, `remove`, `instance-plan` and `instance-create`.
 
 Read the argument. No argument means **Set up**; `doctor` means **Doctor**;
-`uninstall` means **Uninstall**. Any other argument: say which three are
-accepted and stop.
+`uninstall` means **Uninstall**; `instance` means **Instance folder**. Any
+other argument: say which four are accepted and stop.
 
 Rules that hold in every mode:
 
@@ -31,13 +33,13 @@ Rules that hold in every mode:
   nothing was changed beyond what it names, and stop. Do not retry, do not edit
   `settings.json` or any file by hand, and do not work around the refusal.
 - Never pass `--approve-all`. Never write to the person's rules folder, the
-  settings file or the ledger yourself.
+  settings file, the ledger or an instance folder yourself.
 - Never ask for, print or store a credential.
-- Single-quote every value you put into a command: the operator, the harness
-  and each `--approve` id, exactly as the templates below show. The deny ids
-  contain parentheses (`deny:Read(.env)`), which the shell reads as syntax, so
-  an unquoted id stops the command before the script runs. If a value itself
-  holds a single quote, write that quote as `'\''`.
+- Single-quote every value you put into a command: the operator, the harness,
+  each `--approve` id and the instance folder's path, exactly as the templates
+  below show. The deny ids contain parentheses (`deny:Read(.env)`), which the
+  shell reads as syntax, so an unquoted id stops the command before the script
+  runs. If a value itself holds a single quote, write that quote as `'\''`.
 
 ## Set up
 
@@ -98,10 +100,62 @@ Rules that hold in every mode:
    each, from what it printed. Any line starting `FAIL` is a problem: show it
    and what it names. Do not fix it by hand.
 
-7. **End by telling the person to start a new session.** The ledger's options
+7. **Offer an instance folder.** Say in a sentence or two that setup can also
+   make an instance folder: a new folder of their choosing, made a local git
+   repository, for plans and decisions in markdown, that setup records nothing
+   about and uninstall never touches. Ask once whether they want one. On yes,
+   do the **Instance folder** steps below, then go on. On no, or when they do
+   not answer, do not run it and do not ask again. Never run it without a yes.
+
+8. **End by telling the person to start a new session.** The ledger's options
    reach a session's commands only when a session starts, so the rules default
    and the ledger are in force from the next session, not this one. Say that,
-   and that `/harness:setup doctor` checks the setup again at any time.
+   and that `/harness:setup doctor` checks the setup again at any time, and
+   that `/harness:setup instance` makes an instance folder later if they change
+   their mind.
+
+## Instance folder
+
+An optional extra, run only when the person asks for it: from the offer at the
+end of **Set up**, or as `/harness:setup instance`. It makes a new folder of
+the person's choosing a local git repository holding a short README, a
+`.gitignore` and a README for each of `roadmaps/`, `decisions/` and
+`standards/`. It holds markdown only: no ledger database and no settings
+change. The folder is the person's own: setup records nothing about it, and
+`doctor` and `uninstall` never touch it.
+
+1. **Ask where.** Ask for the folder as an absolute path to a folder that does
+   not exist yet, or exists and is empty. If they write a leading `~`, replace
+   it with their home folder. Never choose or suggest a path for them. The
+   folder cannot be inside their `.claude` folder.
+
+2. **Print the plan.** Nothing is written by this step:
+
+   ```text
+   python3 "${CLAUDE_SKILL_DIR}/../../setup.py" instance-plan --home "$HOME" --path '<path>'
+   ```
+
+   Show the whole output: the folder, each file with its text, and the `git`
+   command. A refusal names the problem (the folder is not empty, a symlink,
+   a file, under `.claude`, or `git` is not on PATH): show it and stop.
+
+3. **Take the yes.** Ask one yes or no to create exactly what the plan shows.
+   On no, stop: nothing was written.
+
+4. **Create it.**
+
+   ```text
+   python3 "${CLAUDE_SKILL_DIR}/../../setup.py" instance-create --home "$HOME" --path '<path>'
+   ```
+
+   Show the output. If it refuses, it has already removed what it made; say so
+   and do not retry or create anything by hand.
+
+5. **Tell the person what is theirs.** The folder is a git repository with no
+   commit and no remote; they commit with their own git identity when they
+   choose (`git add -A`, then `git commit`), and you never do it for them. It
+   is not in the setup record, so `/harness:setup doctor` does not list it and
+   uninstall leaves it: to remove it they delete the folder themselves.
 
 ## Doctor
 
@@ -119,7 +173,8 @@ themselves, after this one, because no hook runs when a plugin is uninstalled.
    the `files` lines (a file marked unchanged is removed; a file marked changed
    is kept and named) and the `settings` lines (an item marked in place is
    removed; one marked moved, changed or gone is kept or skipped and named).
-   Say the ledger database at its path is kept, because it is their data.
+   Say the ledger database at its path is kept, because it is their data, and
+   that an instance folder, if they made one, is theirs and is not touched.
 2. Ask one yes or no to remove them. On no, stop.
 3. Run:
 

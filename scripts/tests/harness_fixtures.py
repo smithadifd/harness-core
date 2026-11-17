@@ -15,6 +15,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -88,6 +89,10 @@ PYTHON_STUB = """#!/bin/sh
 exec PYTHON "$@"
 """
 
+GIT_STUB = """#!/bin/sh
+exec GIT "$@"
+"""
+
 
 def put_stub(bin_dir: Path, name: str, body: str) -> Path:
     path = bin_dir / name
@@ -97,8 +102,9 @@ def put_stub(bin_dir: Path, name: str, body: str) -> Path:
 
 
 def make_bin(folder: Path, *, claude: bool = True, ledger: bool = True,
-             python: bool = True) -> Path:
-    """The stub folder, the whole PATH of a run."""
+             python: bool = True, git: bool = False) -> Path:
+    """The stub folder, the whole PATH of a run. With git, a `git` that runs
+    the real git of the machine running the tests."""
     bin_dir = folder / "bin"
     bin_dir.mkdir(exist_ok=True)
     if claude:
@@ -108,6 +114,10 @@ def make_bin(folder: Path, *, claude: bool = True, ledger: bool = True,
                  LEDGER_STUB.replace("PYTHON", sys.executable).replace("LIBS", str(VENDORED_LIBS)))
     if python:
         put_stub(bin_dir, "python3", PYTHON_STUB.replace("PYTHON", sys.executable))
+    if git:
+        real = shutil.which("git")
+        assert real, "the tests need git on the PATH of the machine that runs them"
+        put_stub(bin_dir, "git", GIT_STUB.replace("GIT", real))
     return bin_dir
 
 
