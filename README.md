@@ -223,17 +223,24 @@ guard, a `PreToolUse` hook on every Bash call.
 
 - **What it denies.** An explicit `rm` whose targets are not literal paths
   strictly below the current worktree (or a session scratchpad): `/`, `.`,
-  home-folder spellings, `..`, `.git` paths, symlinks, globs, variables,
-  substitutions, `xargs`-fed targets, a plain `rm` with no option, an `rm`
-  that carries a redirection, and an `rm` beside a `cd`, `mv`, `ln` or
-  subshell on the same line. A
+  home-folder spellings, `..`, `.git` paths, symlinks, globs, variables, a
+  plain `rm` with no option, an `rm` that carries a redirection, and an `rm`
+  beside a `cd`, `mv`, `ln` or subshell on the same line. A
   `git worktree remove` with `--force`, or of a tree that no registry or
   authorization accepts; a linked tree below a temp folder is accepted. An
-  output redirection into an existing path reached through a symlink. It
-  looks through `sudo`, `env`, `bash -c`, `eval`, `find -exec` and similar
-  wrappers, to a depth of six, and past redirections, control words (`if`,
-  `then`, `do`, `else`), groups, subshells, case arms, function bodies and
-  process substitutions, recursive `rm` or not.
+  output redirection into an existing path reached through a symlink. Any rm
+  or `git worktree remove` that shares the command with a `$(...)` or
+  backtick substitution, a process substitution, a heredoc or here-string,
+  `eval`, `source` or `.`, `trap`, `alias`, `xargs`, `find -exec`, `env -S`,
+  a shell (`bash -c` and the like) or a command word built from a variable is
+  denied as `removal_beside_<construct>`, without the guard reading inside
+  it; run the removal as its own plain command. A commit or PR message
+  written by a heredoc that mentions rm denies the same way; write the
+  message to a file and use `git commit -F` or `gh … --body-file`. A removal
+  is judged only as a plain command, after `if`, `then`, `do`, groups,
+  subshells and the prefixes `sudo`, `env`, `command`, `exec`, `builtin`,
+  `nice`, `nohup`, `timeout`, `time`, `setsid`, `stdbuf`, `noglob` and
+  `nocorrect`, each also spelled with a directory part (`/usr/bin/env`).
 - **Deny only.** It never allows and never asks. For a command it judged and
   accepted, or one it has no opinion on, it exits 0 with no output, and
   Claude Code's own permission flow decides as it would without the plugin.
@@ -255,10 +262,13 @@ guard, a `PreToolUse` hook on every Bash call.
   (`LANE_ROOTS_REGISTRY`, `CLEANUP_ITEMS_REGISTRY`, `SEAT_SCRATCH`) are set;
   set to a registry that is absent, untrusted or malformed, they deny every
   removal by name.
-- **What it does not claim.** It is detection, not prevention: an unlisted
-  wrapper, an interpreter (`python3 -c`), a sourced script, a git alias, or
-  `find -delete`, `rsync --delete` and `git clean` are outside it. Changes
-  between its check and the command running are not seen.
+- **What it does not claim.** It is detection, not prevention. It does not
+  see a removal whose name is built indirectly (`$CMD -rf /`), a wrapper it
+  does not list (`chronic`, `ssh`), an interpreter (`python3 -c`), a script
+  file, a git alias, or other deleters (`find -delete`, `rsync --delete`,
+  `git clean`). Its list of commands that repoint a later path is closed and
+  best-effort. Changes between its check and the command running are not
+  seen.
 
 A deny reads `Destructive command guard denied the command (reason=CODE):
 HINT.` The code names the rule or the fault (`unsafe_rm`,

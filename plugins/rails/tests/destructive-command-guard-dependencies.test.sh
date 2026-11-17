@@ -278,7 +278,9 @@ if [ "$(grep -c '^ROOTS_HINT=' "$GUARD")" -eq 1 ] && grep -qxF "$WANT_HINT" "$GU
 else
   fail "J0 the hint line is not exactly: $WANT_HINT"
 fi
-if [ "$(grep -c 'resolve_tool ' "$GUARD")" -eq 1 ] && ! grep -v '^[[:space:]]*#' "$GUARD" | grep -qE 'command -v|type -P|hash -t|which '; then
+# which counts only as a command word: the carrier hints say "which the guard
+# does not read inside".
+if [ "$(grep -c 'resolve_tool ' "$GUARD")" -eq 1 ] && ! grep -v '^[[:space:]]*#' "$GUARD" | grep -qE 'command -v|type -P|hash -t|(^|[;&|({`]|\$\()[[:space:]]*which[[:space:]]'; then
   pass "J0 one resolver, and no PATH lookup anywhere in the guard"
 else
   fail "J0 the guard has a second resolver or a PATH lookup"
@@ -512,9 +514,6 @@ for number, line in enumerate(code, 1):
     for m in re.finditer(r"(?<![A-Za-z0-9_./~-])/(?:usr/)?s?bin/[A-Za-z0-9_.-]+", line):
         path = m.group(0)
         if path in listed_paths or path in stat or path in EXEMPT:
-            continue
-        # The delegated-shell pattern of the parser names shells as data.
-        if "sh|bash|zsh|dash|ksh|" in line:
             continue
         problems.append("unlisted program %s: %s" % (path, line.strip()[:120]))
 resolved = set(re.findall(r"^\s*(jq|wc|tr|git|grep)\) [A-Z]+_BIN=\"\$RESOLVED_TOOL\" ;;", body, re.M))

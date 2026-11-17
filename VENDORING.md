@@ -71,6 +71,7 @@ the text itself.
 | `plugins/rails/hooks/destructive-command-guard.sh` | the destructive-command guard: denies an unsafe rm, git worktree remove or symlinked redirect, or stays silent; never allows |
 | `plugins/rails/tests/test_destructive_guard_suites.py` | runs every guard suite under pytest and checks the plugin's manifest and hooks fields |
 | `plugins/rails/tests/destructive-command-guard.test.sh` | the guard's main suite: containment, wrappers, protocol faults, reason codes, redaction |
+| `plugins/rails/tests/destructive-command-guard-carriers.test.sh` | tests, through the real hook form, of the removal-word rule: a removal word beside a code-carrying construct denies without the guard reading inside it, and a removal with none is judged as a plain top-level command |
 | `plugins/rails/tests/destructive-command-guard-cleanup-worktree.test.sh` | tests of the seat-bound cleanup-registry removal and its mutation audit |
 | `plugins/rails/tests/destructive-command-guard-compound.test.sh` | tests, through the real hook form, of a redirection before the command word and of an rm in a compound command or delegated shell |
 | `plugins/rails/tests/destructive-command-guard-dependencies.test.sh` | tests that a missing program denies by name, that programs are found only in the trusted roots, the crash and signal traps, the hook entry, inherited git variables and interpreter startup state |

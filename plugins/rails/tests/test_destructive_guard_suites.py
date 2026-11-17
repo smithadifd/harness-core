@@ -27,6 +27,7 @@ TESTS = Path(__file__).resolve().parent
 PLUGIN = TESTS.parent
 SUITES = [
     "destructive-command-guard.test.sh",
+    "destructive-command-guard-carriers.test.sh",
     "destructive-command-guard-cleanup-worktree.test.sh",
     "destructive-command-guard-compound.test.sh",
     "destructive-command-guard-dependencies.test.sh",

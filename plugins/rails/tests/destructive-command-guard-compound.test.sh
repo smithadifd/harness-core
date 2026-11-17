@@ -3,13 +3,16 @@
 # whose command word is not the segment's first word:
 #   R  a redirection before (or glued to) the command word, in every place a
 #      check finds that word: the rm scan, the worktree-removal patterns, the
-#      repointing classes, the delegated-text walk, and the command splitter
-#      (`>&N` and `&>FILE` are not separators);
+#      repointing classes and the command splitter (`>&N` and `&>FILE` are not
+#      separators);
 #   G  an rm, recursive or not, after a control word or grouping opener, in a
-#      case arm, a function body, a process substitution or a delegated
-#      shell, judged the way a top-level rm is;
+#      case arm or a function body, judged the way a top-level rm is; an rm
+#      beside a shell, a substitution, a process substitution, a here-string
+#      or xargs denies as removal_beside_<construct> without the guard
+#      reading inside it;
 #   S  controls: ordinary commands with redirections and compound commands
-#      stay silent, and an accepted rm in a compound stays silent.
+#      stay silent, and an accepted rm in a compound stays silent; an rm
+#      inside bash -c or eval denies even when its target is safe.
 # Each row runs the hook exactly as hooks.json does (env -u BASH_ENV -u ENV
 # /bin/bash --noprofile --norc -p GUARD) with a PreToolUse JSON on stdin,
 # from the worktree. Command strings are inert JSON data and never run.
@@ -72,8 +75,8 @@ deny R9 unsafe_worktree_remove '2>/dev/null git worktree remove /tmp/x'
 deny R10 unsupported_syntax '>&2 rm -rf /'
 deny R11 unsupported_syntax '&>/dev/null rm -rf /'
 deny R12 path_repointing_cd '2>/dev/null cd / && rm -rf etc'
-deny R13 unsafe_rm 'bash -c "2>/dev/null rm -f /etc/hosts"'
-deny R14 unsafe_rm '2>/dev/null bash -c "rm -f /etc/hosts"'
+deny R13 removal_beside_shell 'bash -c "2>/dev/null rm -f /etc/hosts"'
+deny R14 removal_beside_shell '2>/dev/null bash -c "rm -f /etc/hosts"'
 deny R15 unsafe_redirect 'echo x &> lnk'
 deny R16 unsafe_redirect 'echo x >| lnk'
 
@@ -82,24 +85,28 @@ deny G1 unsafe_rm '{ rm -f /etc/hosts; }'
 deny G2 unsafe_rm '(rm -f /etc/hosts)'
 deny G3 unsafe_rm 'if true; then rm -f /etc/hosts; fi'
 deny G4 unsafe_rm 'for f in a; do rm -f /etc/hosts; done'
-deny G5 unsafe_rm 'bash -c "rm -f /etc/hosts"'
+deny G5 removal_beside_shell 'bash -c "rm -f /etc/hosts"'
 deny G6 unsafe_rm 'if rm -f /etc/hosts; then :; fi'
 deny G7 unsafe_rm 'while rm -f /etc/hosts; do break; done'
 deny G8 unsafe_rm 'until rm -f /etc/hosts; do break; done'
 deny G9 unsafe_rm 'if false; then :; else rm -f /etc/hosts; fi'
 deny G10 unsafe_rm 'case x in a) :;; b) rm -f /etc/hosts;; esac'
 deny G11 unsafe_rm 'f() { rm -f /etc/hosts; }; f'
-deny G12 unsafe_rm 'cat <(rm -f /etc/hosts)'
+deny G12 removal_beside_process_substitution 'cat <(rm -f /etc/hosts)'
 deny G13 unsafe_rm 'time -p rm -f /etc/hosts'
 deny G14 unsafe_rm 'setsid rm -f /etc/hosts'
-deny G15 unsafe_rm 'echo "$(rm -f /etc/hosts)"'
+deny G15 removal_beside_substitution 'echo "$(rm -f /etc/hosts)"'
 deny G16 path_repointing_ln 'ln -s / l && rm -f l/etc/hosts'
-deny G17 non_literal_rm_targets 'echo /etc/hosts | xargs rm -f'
+deny G17 removal_beside_xargs 'echo /etc/hosts | xargs rm -f'
 deny G18 unsupported_rm_prefix 'sudo -X rm -f /etc/hosts'
-deny G19 unsafe_rm 'bash -c "cd / && rm -f etc/hosts"'
-deny G21 unsafe_rm 'bash <<< "rm -f /etc/hosts"'
-deny G22 path_repointing_mkdir 'bash -c "mkdir -p l; rm -f l/x"'
-deny G20 path_repointing_ln 'bash -c "ln -s / l; rm -f l/etc/hosts"'
+deny G19 removal_beside_shell 'bash -c "cd / && rm -f etc/hosts"'
+deny G21 removal_beside_heredoc 'bash <<< "rm -f /etc/hosts"'
+deny G22 removal_beside_shell 'bash -c "mkdir -p l; rm -f l/x"'
+deny G20 removal_beside_shell 'bash -c "ln -s / l; rm -f l/etc/hosts"'
+# A removal beside a shell or eval denies whatever its target: the guard does
+# not read inside them.
+deny S11 removal_beside_shell 'bash -c "rm -f ./build/x"'
+deny S14 removal_beside_eval 'eval "rm -f ./build/x"'
 
 printf '%s\n' '== S: controls stay silent =='
 silent S1 '2>/dev/null ls'
@@ -112,10 +119,8 @@ silent S7 'if true; then echo ok; fi'
 silent S8 'diff <(ls) <(ls -a)'
 silent S9 'rm -f ./build/x'
 silent S10 'if [ -d build ]; then rm -rf ./build; fi'
-silent S11 'bash -c "rm -f ./build/x"'
 silent S12 '2>/dev/null git status'
 silent S13 'echo x >| fresh-name.txt'
-silent S14 'eval "rm -f ./build/x"'
 
 if [ "$FAILURES" -eq 0 ]; then
   printf 'ALL COMPOUND TESTS PASSED\n'

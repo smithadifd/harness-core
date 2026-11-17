@@ -513,17 +513,18 @@ run_case "two qualifying trees on two lines" deny "$OTHER" \
   "git -C $PRIMARY worktree remove $PUSHED"$'\n'"git -C $PRIMARY worktree remove $MERGED_EQ" unsafe_worktree_remove
 run_case "two qualifying trees, plain form, joined by ;" deny "$PRIMARY" \
   "git worktree remove $PUSHED; git worktree remove $MERGED_EQ" unsafe_worktree_remove
-# A shell string is not judged as removals at all, so it is never allowed.
-run_case "two qualifying trees inside bash -c" no_opinion "$OTHER" \
-  "bash -c 'git -C $PRIMARY worktree remove $PUSHED; git -C $PRIMARY worktree remove $MERGED_EQ'"
-run_case "one qualifying tree inside bash -c" no_opinion "$OTHER" \
-  "bash -c 'git -C $PRIMARY worktree remove $PUSHED'"
+# A shell is a carrier: the removal words beside it deny without the guard
+# reading the shell's string.
+run_case "two qualifying trees inside bash -c" deny "$OTHER" \
+  "bash -c 'git -C $PRIMARY worktree remove $PUSHED; git -C $PRIMARY worktree remove $MERGED_EQ'" removal_beside_shell
+run_case "one qualifying tree inside bash -c" deny "$OTHER" \
+  "bash -c 'git -C $PRIMARY worktree remove $PUSHED'" removal_beside_shell
 run_case "a qualifying tree inside a subshell" deny "$OTHER" \
   "(git -C $PRIMARY worktree remove $PUSHED)" unsafe_worktree_remove
 run_case "a qualifying tree inside a command substitution" deny "$OTHER" \
-  "echo \$(git -C $PRIMARY worktree remove $PUSHED)" unsafe_worktree_remove
+  "echo \$(git -C $PRIMARY worktree remove $PUSHED)" removal_beside_substitution
 run_case "a qualifying tree carried by env -S" deny "$OTHER" \
-  "env -S 'git -C $PRIMARY worktree remove $PUSHED'" unsafe_worktree_remove
+  "env -S 'git -C $PRIMARY worktree remove $PUSHED'" removal_beside_env_split
 run_case "a qualifying tree followed by a harmless read" deny "$OTHER" \
   "git -C $PRIMARY worktree remove $PUSHED && git status" unsafe_worktree_remove
 run_case "a harmless read followed by a qualifying tree" deny "$OTHER" \

@@ -28,7 +28,7 @@ bad_args=""
 while IFS= read -r arg; do
   [ -n "$arg" ] || continue
   case "$arg" in
-    '"path_repointing_$REPOINT_CLASS"'|'"${LANE_REGISTRY_FAILURE:-unsafe_worktree_remove}"'|'"${CLEANUP_REGISTRY_FAILURE:-unsafe_worktree_remove}"'|'"$DEPENDENCY_CODE"') ;;
+    '"path_repointing_$REPOINT_CLASS"'|'"removal_beside_$CARRIER_CLASS"'|'"${LANE_REGISTRY_FAILURE:-unsafe_worktree_remove}"'|'"${CLEANUP_REGISTRY_FAILURE:-unsafe_worktree_remove}"'|'"$DEPENDENCY_CODE"') ;;
     *) [[ "$arg" =~ ^[a-z_]+$ ]] || bad_args="$bad_args $arg" ;;
   esac
 done <<EOF
@@ -39,7 +39,7 @@ if [ -z "$bad_args" ]; then
 else
   fail "C5 policy_deny takes a non-literal argument:$bad_args"
 fi
-for var in REPOINT_CLASS LANE_REGISTRY_FAILURE CLEANUP_REGISTRY_FAILURE DEPENDENCY_CODE; do
+for var in REPOINT_CLASS CARRIER_CLASS LANE_REGISTRY_FAILURE CLEANUP_REGISTRY_FAILURE DEPENDENCY_CODE; do
   values="$(printf '%s\n' "$CODE" | grep -oE "(^|[^A-Za-z_])$var=[^ ;}]*" | sed "s/^.*$var=//")"
   bad=""
   while IFS= read -r v; do
@@ -63,9 +63,11 @@ fi
 
 printf '%s\n' '== C6 every engine and adapter code has a hint =='
 CLASSES="$(printf '%s\n' "$CODE" | grep -oE 'REPOINT_CLASS="?[a-z_]+"?' | sed 's/^REPOINT_CLASS=//; s/"//g' | sort -u)"
+CARRIERS="$(printf '%s\n' "$CODE" | grep -oE 'CARRIER_CLASS="?[a-z_]+"?' | sed 's/^CARRIER_CLASS=//; s/"//g' | sort -u)"
 ENGINE_CODES="$({
   printf '%s\n' "$DENY_ARGS" | grep -E '^[a-z_]+$'
   printf '%s\n' "$CLASSES" | sed 's/^/path_repointing_/'
+  printf '%s\n' "$CARRIERS" | sed 's/^/removal_beside_/'
   for var in LANE_REGISTRY_FAILURE CLEANUP_REGISTRY_FAILURE DEPENDENCY_CODE; do
     printf '%s\n' "$CODE" | grep -oE "(^|[^A-Za-z_])$var=[a-z_]+" | sed "s/^.*$var=//"
   done
@@ -91,7 +93,22 @@ if [ -n "$ENGINE_CODES" ] && [ -n "$ADAPTER_CODES" ] && [ -z "$missing" ]; then
 else
   fail "C6 codes without a hint:$missing"
 fi
-for code in lane_registry_absent_armed cleanup_registry_absent_armed cleanup_registry_untrusted cleanup_registry_malformed cleanup_seat_missing inherited_git_environment; do
+# The carrier family: the seventeen members, each with its own hint, and no
+# hint for a retired code.
+WANT_CARRIERS="alias backtick env_split eval find_exec flock git_bisect_run git_foreach git_rebase_exec heredoc process_substitution shell source substitution trap variable_command xargs"
+if [ "$(printf '%s\n' $CARRIERS | tr '\n' ' ' | sed 's/ $//')" = "$WANT_CARRIERS" ]; then
+  pass "C6 CARRIER_CLASS takes exactly the seventeen carrier classes"
+else
+  fail "C6 CARRIER_CLASS classes differ: $(printf '%s\n' $CARRIERS | tr '\n' ' ')"
+fi
+for code in non_literal_rm_targets path_repointing_substitution path_repointing_eval; do
+  if printf '%s\n' "$BASH_KEYS" | grep -qx "$code"; then
+    fail "C6 the retired code $code still has a hint label"
+  else
+    pass "C6 the retired code $code has no hint label"
+  fi
+done
+for code in $(printf '%s\n' $CARRIERS | sed 's/^/removal_beside_/') path_repointing_popd lane_registry_absent_armed cleanup_registry_absent_armed cleanup_registry_untrusted cleanup_registry_malformed cleanup_seat_missing inherited_git_environment; do
   if printf '%s\n' "$BASH_KEYS" | grep -qx "$code"; then
     pass "C6 the new code $code has its own hint"
   else

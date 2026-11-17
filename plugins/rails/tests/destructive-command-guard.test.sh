@@ -272,10 +272,12 @@ run_command "tilde expansion" deny 'rm -rf ~/build'
 run_command "quoted HOME marker" deny "rm -rf '\$HOME'"
 run_command "quoted tilde marker" deny "rm -rf '~'"
 run_command "glob target" deny 'rm -rf ./build/*'
-run_policy_command "pipeline xargs targets are non-literal" deny non_literal_rm_targets \
+# xargs is a carrier: an rm beside it denies removal_beside_xargs (the
+# non_literal_rm_targets code is retired).
+run_policy_command "pipeline xargs targets are non-literal" deny removal_beside_xargs \
   'printf ./build | xargs rm -rf'
-run_policy_command "xargs stdin targets are non-literal" deny non_literal_rm_targets 'xargs rm -rf'
-run_policy_command "find null-delimited xargs targets are non-literal" deny non_literal_rm_targets \
+run_policy_command "xargs stdin targets are non-literal" deny removal_beside_xargs 'xargs rm -rf'
+run_policy_command "find null-delimited xargs targets are non-literal" deny removal_beside_xargs \
   'find ./build -print0 | xargs -0 rm -rf'
 run_command "stdin redirection target" deny 'rm -rf < targets.txt'
 run_policy_command "symlink creation can repoint a later rm target" deny path_repointing_ln \
@@ -294,11 +296,13 @@ run_policy_command "mount can repoint a later rm target" deny path_repointing_mo
   'mount / ./future; rm -rf ./future/etc'
 run_policy_command "sibling assignment makes rm resolution stateful" deny path_repointing_assignment \
   'DEST=./future; rm -rf ./build'
-run_policy_command "eval can repoint a later rm target" deny path_repointing_eval \
+# eval is a carrier (the path_repointing_eval code is retired).
+run_policy_command "eval can repoint a later rm target" deny removal_beside_eval \
   "eval 'ln -s / ./future'; rm -rf ./future/etc"
 run_policy_command "subshell can repoint a later rm target" deny path_repointing_subshell \
   '(cd /); rm -rf ./build'
-run_policy_command "command substitution feeding rm target" deny path_repointing_substitution \
+# A substitution is a carrier (the path_repointing_substitution code is retired).
+run_policy_command "command substitution feeding rm target" deny removal_beside_substitution \
   'rm -rf "$(pwd)/build"'
 # An accepted removal cannot authorize another segment in the same command.
 run_command "conditional compound reaches explicit rm" none 'true && rm -rf ./build'
@@ -308,7 +312,9 @@ run_command "continued literal rm" none $'rm -rf \\\n./build'
 run_command "tab-separated literal rm" none $'rm\t-rf\t./build'
 run_command "ordinary chain across lines" none $'printf hi &&\nprintf bye'
 run_command "heredoc writes data" none $'cat > output.txt <<EOF\nordinary data\nEOF'
-run_command "rm only in quoted heredoc body" none $'cat <<\'EOF\'\nrm -rf ~\nEOF'
+# A heredoc is a carrier: a body that holds rm denies, quoted or not.
+run_command "rm only in quoted heredoc body" deny $'cat <<\'EOF\'\nrm -rf ~\nEOF'
+expect_reason "-" "rm only in quoted heredoc body" removal_beside_heredoc
 run_command "leading negation operator with literal descendant" none '! rm -rf ./build'
 run_command "leading negation operator with home target" deny '! rm -rf ~'
 run_command "single ampersand terminates protected rm" deny 'rm -rf ~ &'
@@ -329,7 +335,8 @@ run_command "timeout foreground argument with home target" deny 'timeout --foreg
 run_command "nohup with home target" deny 'nohup rm -rf ~'
 run_policy_command "unknown sudo option fails closed" deny unsupported_rm_prefix \
   'sudo --preserve-env=PATH rm -rf ~'
-run_policy_command "unknown env option fails closed" deny unsupported_rm_prefix \
+# env -S carries a command string: a carrier.
+run_policy_command "unknown env option fails closed" deny removal_beside_env_split \
   "env -S 'rm -rf ~'"
 run_command "doas with home target" deny 'doas rm -rf ~'
 run_command "doas option with home target" deny 'doas -n rm -rf ~'
@@ -337,13 +344,13 @@ run_command "doas user option with home target" deny 'doas -u root rm -rf ~'
 run_command "caffeinate option with home target" deny 'caffeinate -i rm -rf ~'
 run_command "caffeinate sleep option with home target" deny 'caffeinate -s rm -rf ~'
 run_command "caffeinate display option with home target" deny 'caffeinate -d rm -rf ~'
-run_policy_command "xargs zero-delimited targets are non-literal" deny non_literal_rm_targets \
+run_policy_command "xargs zero-delimited targets are non-literal" deny removal_beside_xargs \
   'xargs -0 rm -rf'
-run_policy_command "xargs no-run-if-empty targets are non-literal" deny non_literal_rm_targets \
+run_policy_command "xargs no-run-if-empty targets are non-literal" deny removal_beside_xargs \
   'xargs -r rm -rf'
-run_policy_command "xargs bounded targets are non-literal" deny non_literal_rm_targets \
+run_policy_command "xargs bounded targets are non-literal" deny removal_beside_xargs \
   'xargs -n 1 rm -rf'
-run_policy_command "xargs replacement targets are non-literal" deny non_literal_rm_targets \
+run_policy_command "xargs replacement targets are non-literal" deny removal_beside_xargs \
   'xargs -I{} rm -rf'
 run_command "nested supported prefixes with literal descendant" none \
   'sudo -n env NAME=value command -p rm -rf ./build'
@@ -573,7 +580,7 @@ run_command "ordinary ls" none 'ls ./build'
 run_command "rm word as echo data" none 'echo rm'
 run_command "rm word as grep pattern" none 'grep rm file'
 run_command "non-recursive xargs rm targets are non-literal too" deny 'xargs rm -f'
-expect_reason S1 "non-recursive xargs rm" non_literal_rm_targets
+expect_reason S1 "non-recursive xargs rm" removal_beside_xargs
 run_command "unsupported ordinary Git command" none 'git status --short'
 run_command "remote Git command" none 'git push origin feature'
 
@@ -596,15 +603,15 @@ case "$LAST_TEXT" in
   *"over 6000 bytes"*) pass "A5 hint names the 6000-byte cap" ;;
   *) fail "A5 hint does not name the 6000-byte cap: $LAST_TEXT" ;;
 esac
-run_command "A6 deny_names_path_repointing_substitution" deny 'rm -rf $(pwd)/build'
-expect_reason A6 deny_names_path_repointing_substitution path_repointing_substitution
+run_command "A6 deny_names_removal_beside_substitution" deny 'rm -rf $(pwd)/build'
+expect_reason A6 deny_names_removal_beside_substitution removal_beside_substitution
 run_command "A7 deny_names_path_repointing_cd" deny 'cd build; rm -rf ./cache'
 expect_reason A7 deny_names_path_repointing_cd path_repointing_cd
 printf '%s\n' existing >"$OUTSIDE/file"
 run_command "A8 deny_names_unsafe_redirect" deny "printf x > $WORKTREE/build/escape/file"
 expect_reason A8 deny_names_unsafe_redirect unsafe_redirect
-run_command "A9 deny_names_non_literal_rm_targets" deny 'find . -name x | xargs rm -rf'
-expect_reason A9 deny_names_non_literal_rm_targets non_literal_rm_targets
+run_command "A9 deny_names_removal_beside_xargs" deny 'find . -name x | xargs rm -rf'
+expect_reason A9 deny_names_removal_beside_xargs removal_beside_xargs
 standin future-code-policy.sh "printf '%s\\n' '{\"decision\":\"deny\",\"reason\":\"some_future_code\"}'"
 standin allow-foreign-policy.sh "printf '%s\\n' '{\"decision\":\"allow\",\"reason\":\"unsafe_rm\"}'"
 standin no-opinion-foreign-policy.sh "printf '%s\\n' '{\"decision\":\"no_opinion\",\"reason\":\"unsafe_rm\"}'"
@@ -716,7 +723,7 @@ run_policy_command "E11 chained_line_with_outside_rm_still_denied policy" deny u
 run_command "E11 chained_line_with_outside_rm_still_denied" deny "ls $SCRATCHPAD; rm -rf $OUTSIDE/x; echo done"
 expect_reason E11 chained_line_with_outside_rm_still_denied unsafe_rm
 run_command "E12 quoted_command_string_is_not_data" deny "sh -c 'rm -rf $OUTSIDE/x'"
-expect_reason E12 quoted_command_string_is_not_data unsafe_rm
+expect_reason E12 quoted_command_string_is_not_data removal_beside_shell
 run_command "E13 bare_outside_rm_still_denied" deny "rm -rf $OUTSIDE/x"
 expect_reason E13 bare_outside_rm_still_denied unsafe_rm
 # The scratchpad is a temp folder; its own rule still allows a strict
@@ -745,9 +752,6 @@ chain_of() { # N: "echo a1 && echo a2 && ... && echo aN"
 # MAX_FRAGMENTS when each of them was counted as a wrapped fragment.
 run_policy_command "H1 seventeen_distinct_segments_are_not_fragments" no_opinion not_explicit_operation "$(chain_of 18)"
 run_policy_command "H2 sixteen_segments_pass_as_before" no_opinion not_explicit_operation "$(chain_of 17)"
-H3_CMD="echo"
-for n in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17; do H3_CMD="$H3_CMD \$(echo n$n)"; done
-run_policy_command "H3 seventeen_substitutions_still_capped" deny unsupported_syntax "$H3_CMD"
 # The shape of the 2026-10-23 refused chain: 16 &&-joined parts, three of them
 # pipelines, 19 segments in all.
 run_policy_command "H4 incident_chain_passes" no_opinion not_explicit_operation \
@@ -755,9 +759,9 @@ run_policy_command "H4 incident_chain_passes" no_opinion not_explicit_operation 
 run_policy_command "H5 padded_segments_plus_outside_rm_still_denied" deny unsafe_rm "$(chain_of 18) && rm -rf $OUTSIDE/x"
 run_policy_command "H6 subshell_and_brace_openers_still_queue rm subshell" deny unsafe_rm "(rm -rf $OUTSIDE/x)"
 run_policy_command "H6 subshell_and_brace_openers_still_queue rm group" deny unsafe_rm "{ rm -rf $OUTSIDE/x; }"
-# A worktree removal inside a subshell or group is judged only through the
-# fragment queue, so these two rows are the ones an opener strip that stops
-# queueing turns into no_opinion.
+# A worktree removal inside a subshell or group is judged by the top-level
+# loop on the segment with its opener stripped, so these two rows are the
+# ones a loop that stops stripping turns into no_opinion.
 run_policy_command "H6 subshell_and_brace_openers_still_queue worktree subshell" deny unsafe_worktree_remove "(git worktree remove $OUTSIDE/w)"
 run_policy_command "H6 subshell_and_brace_openers_still_queue worktree group" deny unsafe_worktree_remove "{ git worktree remove $OUTSIDE/w; }"
 
@@ -782,17 +786,15 @@ run_policy_bounded "H7 quoted_word_before_nested_substitution_terminates" no_opi
   "echo 'a' \"\$(echo \"x\")\""
 run_policy_bounded "H8 incident_hang_line_terminates" no_opinion not_explicit_operation \
   "for s in a b; do printf '%s=%s ' \"\$s\" \"\$(grep -c \"^\\| \$s[0-9]\" $SCRATCHPAD/f)\"; done"
-run_policy_bounded "H9 removal_inside_the_substitution_still_seen rm" deny unsafe_rm \
+run_policy_bounded "H9 removal_inside_the_substitution_still_seen rm" deny removal_beside_substitution \
   "echo 'a' \"\$(rm -rf $OUTSIDE/x)\""
-run_policy_bounded "H9 removal_inside_the_substitution_still_seen worktree" deny unsafe_worktree_remove \
+run_policy_bounded "H9 removal_inside_the_substitution_still_seen worktree" deny removal_beside_substitution \
   "echo 'a' \"\$(git worktree remove --force $OUTSIDE/w)\""
 run_policy_bounded "H10 backtick_branch_terminates" no_opinion not_explicit_operation \
   "echo 'a' \"\`echo \"x\"\`\""
-# After the substitution the scan must stand where the substitution ended:
-# the single-quoted word is data. Resuming from the inner parse's cursor
-# landed inside the inner quotes, flipped the quoting, and read the quoted
-# $(...) as a substitution to run.
-run_policy_bounded "H11 scan_state_after_substitution_is_right" no_opinion not_explicit_operation \
+# The rm word and the $( beside it are read from the text, quoted or not:
+# a removal word beside a substitution denies.
+run_policy_bounded "H11 scan_state_after_substitution_is_right" deny removal_beside_substitution \
   "echo \"\$(echo \"xxxxxxxxxx\")\" '\$(rm -rf $OUTSIDE/x)'"
 
 printf '%s\n' '== redacted denial audit =='

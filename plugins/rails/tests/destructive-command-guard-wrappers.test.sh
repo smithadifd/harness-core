@@ -130,6 +130,9 @@ run_case() {
     [ "$reason" = accepted ] || decision="$decision (reason $reason)"
     expect=no_opinion
   fi
+  if [[ "$expect" == */* ]]; then
+    [ "$decision/$reason" != "$expect" ] || decision="$expect"
+  fi
   if [ "$decision" = "$expect" ] || { [ "$expect" = nonallow ] && [ "$decision" != allow ] && [ "$decision" != invalid ]; }; then
     pass "$label -> $decision/$reason"
   else
@@ -201,9 +204,12 @@ done
 for w in exec time builtin nice '/usr/bin/time' '\exec' 'env exec'; do
   run_case "$w git, registered worktree, no force (same as plain)" accepted "$PRIMARY" "$w git worktree remove $WT" "$GUARD_NOROOTS"
 done
-for w in 'sudo' 'nice -n 5' 'time -p' 'exec -a name'; do
+for w in 'sudo' 'nice -n 5' 'exec -a name'; do
   run_case "$w git, registered worktree, no force (options and sudo are refused)" deny "$PRIMARY" "$w git worktree remove $WT" "$GUARD_NOROOTS"
 done
+# The reserved word time and its -p are stripped with the control openers, so
+# the removal is judged as the plain command and the registry accepts it.
+run_case "time -p git, registered worktree, no force (time -p is a control opener)" accepted "$PRIMARY" "time -p git worktree remove $WT" "$GUARD_NOROOTS"
 for w in exec time builtin nice sudo; do
   run_case "$w echo of a forced removal is a mention" no_opinion "$PRIMARY" "$w echo git worktree remove --force $WT"
   run_case "echo $w git is a mention" no_opinion "$PRIMARY" "echo $w git worktree remove --force $WT"
@@ -259,18 +265,19 @@ run_case "nice env -S carrying a forced removal" deny "$PRIMARY" "nice env -S \"
 run_case "builtin env -S carrying a forced removal" deny "$PRIMARY" "builtin env -S \"git worktree remove --force $WT\""
 run_case "exec -a x env -S carrying a forced removal" deny "$PRIMARY" "exec -a x env -S \"git worktree remove --force $WT\""
 run_case "substitution, unlisted path, no force" deny "$PRIMARY" "echo \$(git worktree remove $TMP/scratch/nope)" "$GUARD_NOROOTS"
-run_case "substitution, registered worktree, no force, is not auto-allowed" no_opinion "$PRIMARY" "echo \$(git worktree remove $WT)" "$GUARD_NOROOTS"
+run_case "substitution, registered worktree, no force, is not auto-allowed" deny/removal_beside_substitution "$PRIMARY" "echo \$(git worktree remove $WT)" "$GUARD_NOROOTS"
 NESTED=""; CLOSERS=""
 for _ in $(seq 1 20); do NESTED="$NESTED\$("; CLOSERS="$CLOSERS)"; done
-run_case "runaway substitution nesting is refused" deny "$PRIMARY" "echo ${NESTED}true${CLOSERS}"
+# No removal word: no opinion, however deep the nesting (there is no depth bound).
+run_case "runaway substitution nesting has no removal word" no_opinion "$PRIMARY" "echo ${NESTED}true${CLOSERS}"
 run_case "repeated identical substitutions are not a runaway" no_opinion "$PRIMARY" "echo \$(date) \$(date) \$(date) \$(date) \$(date) \$(date) \$(date) \$(date) \$(date) \$(date) \$(date) \$(date) \$(date) \$(date) \$(date) \$(date) \$(date) \$(date)"
 run_case "duplicate after sixteen distinct fragments stays within cap" no_opinion "$PRIMARY" 'echo $(printf 1) $(printf 2) $(printf 3) $(printf 4) $(printf 5) $(printf 6) $(printf 7) $(printf 8) $(printf 9) $(printf 10) $(printf 11) $(printf 12) $(printf 13) $(printf 14) $(printf 15) $(printf 16) $(printf 1)'
-run_case "single-quoted substitution is a mention" no_opinion "$PRIMARY" "echo '\$(git worktree remove --force $WT)'"
+run_case "single-quoted substitution beside the words" deny/removal_beside_substitution "$PRIMARY" "echo '\$(git worktree remove --force $WT)'"
 run_case "single-quoted subshell is a mention" no_opinion "$PRIMARY" "echo '(git worktree remove --force $WT)'"
-run_case "escaped substitution is a mention" no_opinion "$PRIMARY" "echo \\\$(git worktree remove --force $WT)"
-run_case "substitution holding only a mention" no_opinion "$PRIMARY" 'git commit -m "$(echo worktree remove --force)"'
+run_case "escaped substitution beside the words" deny/removal_beside_substitution "$PRIMARY" "echo \\\$(git worktree remove --force $WT)"
+run_case "substitution holding only a mention" deny/removal_beside_substitution "$PRIMARY" 'git commit -m "$(echo worktree remove --force)"'
 run_case "subshell holding only an echo" no_opinion "$PRIMARY" "(echo git worktree remove --force $WT)"
-run_case "substitution holding only an echo" no_opinion "$PRIMARY" "echo \$(echo git worktree remove --force $WT)"
+run_case "substitution holding only an echo" deny/removal_beside_substitution "$PRIMARY" "echo \$(echo git worktree remove --force $WT)"
 
 printf '%s\n' '== unparseable removal without a force flag =='
 run_case "git wor''ktree" deny "$PRIMARY" "git wor''ktree remove $WT" "$GUARD_NOROOTS"
@@ -283,9 +290,11 @@ run_case "unbalanced quote" deny "$PRIMARY" "git wor''ktree remove $WT \"x" "$GU
 run_case "echo of an unparseable removal" no_opinion "$PRIMARY" "echo git wor''ktree remove $WT"
 run_case "git wor''ktree list" no_opinion "$PRIMARY" "git wor''ktree list"
 run_case "legit wor''ktree remove is not git" no_opinion "$PRIMARY" "legit wor''ktree remove $WT"
-run_case "git commit mentioning the words, unparseable" no_opinion "$PRIMARY" 'git commit -m "docs: worktree remove" $(date)'
+run_case "git commit mentioning the words, unparseable" deny/removal_beside_substitution "$PRIMARY" 'git commit -m "docs: worktree remove" $(date)'
 
 printf '%s\n' '== command splitter: operators, quoting, continuation, heredocs =='
+# A heredoc is a carrier: a body that holds the removal words denies
+# removal_beside_heredoc, data or not.
 F="git worktree remove --force $WT"
 run_case "after ;" deny "$PRIMARY" "true; $F"
 run_case "after &&" deny "$PRIMARY" "true && $F"
@@ -307,19 +316,19 @@ run_case "escaped quote does not open a string" deny "$PRIMARY" "echo \\\"; $F"
 run_case "removal after a closed quote pair" deny "$PRIMARY" "echo 'a' \"b\"; $F"
 run_case "escaped quote inside double quotes before forced removal" deny "$PRIMARY" "echo \"a\\\"b\"; $F"
 run_case "escaped quote inside ANSI-C quotes before forced removal" deny "$PRIMARY" "echo \$'\\''; $F"
-run_case "heredoc body is data" no_opinion "$PRIMARY" $'cat <<EOF\n'"$F"$'\nEOF'
-run_case "heredoc, quoted delimiter" no_opinion "$PRIMARY" $'cat <<\'EOF\'\n'"$F"$'\nEOF'
-run_case "heredoc, double-quoted delimiter" no_opinion "$PRIMARY" $'cat <<"EOF"\n'"$F"$'\nEOF'
-run_case "heredoc, backslash delimiter" no_opinion "$PRIMARY" $'cat <<\\EOF\n'"$F"$'\nEOF'
-run_case "heredoc, spaced delimiter" no_opinion "$PRIMARY" $'cat << EOF\n'"$F"$'\nEOF'
-run_case "heredoc, <<- with a tab-indented terminator" no_opinion "$PRIMARY" $'cat <<-EOF\n'"$F"$'\n\tEOF'
+run_case "heredoc body holds the words" deny/removal_beside_heredoc "$PRIMARY" $'cat <<EOF\n'"$F"$'\nEOF'
+run_case "heredoc, quoted delimiter" deny/removal_beside_heredoc "$PRIMARY" $'cat <<\'EOF\'\n'"$F"$'\nEOF'
+run_case "heredoc, double-quoted delimiter" deny/removal_beside_heredoc "$PRIMARY" $'cat <<"EOF"\n'"$F"$'\nEOF'
+run_case "heredoc, backslash delimiter" deny/removal_beside_heredoc "$PRIMARY" $'cat <<\\EOF\n'"$F"$'\nEOF'
+run_case "heredoc, spaced delimiter" deny/removal_beside_heredoc "$PRIMARY" $'cat << EOF\n'"$F"$'\nEOF'
+run_case "heredoc, <<- with a tab-indented terminator" deny/removal_beside_heredoc "$PRIMARY" $'cat <<-EOF\n'"$F"$'\n\tEOF'
 run_case "removal after a <<- heredoc with a tab-indented terminator" deny "$PRIMARY" $'cat <<-EOF\ndata\n\tEOF\n'"$F"
-run_case "heredoc, plain << needs an exact terminator" no_opinion "$PRIMARY" $'cat <<EOF\n'"$F"$'\n\tEOF\n'"$F"$'\nEOF'
-run_case "two heredocs on one line" no_opinion "$PRIMARY" $'cat <<A <<B\n'"$F"$'\nA\n'"$F"$'\nB'
+run_case "heredoc, plain << needs an exact terminator" deny/removal_beside_heredoc "$PRIMARY" $'cat <<EOF\n'"$F"$'\n\tEOF\n'"$F"$'\nEOF'
+run_case "two heredocs on one line" deny/removal_beside_heredoc "$PRIMARY" $'cat <<A <<B\n'"$F"$'\nA\n'"$F"$'\nB'
 run_case "removal after a heredoc" deny "$PRIMARY" $'cat <<EOF\ndata\nEOF\n'"$F"
 run_case "removal on the heredoc header line" deny "$PRIMARY" $'cat <<EOF; '"$F"$'\ndata\nEOF'
 run_case "removal after two heredocs" deny "$PRIMARY" $'cat <<A <<B\na\nA\nb\nB\n'"$F"
-run_case "unterminated heredoc swallows the rest" no_opinion "$PRIMARY" $'cat <<EOF\n'"$F"
+run_case "unterminated heredoc swallows the rest" deny/removal_beside_heredoc "$PRIMARY" $'cat <<EOF\n'"$F"
 run_case "here-string is not a heredoc" deny "$PRIMARY" $'cat <<< x\n'"$F"
 run_case "heredoc delimiter in a pipeline header" deny "$PRIMARY" $'cat <<EOF | cat\ndata\nEOF\n'"$F"
 

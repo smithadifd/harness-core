@@ -247,6 +247,8 @@ run_case() {
   reason="$(printf '%s' "$output" | "$JQ" -er '.reason' 2>/dev/null || printf invalid)"
   if [ "$expect" = "nonallow" ] && [ "$decision" != "allow" ] && [ "$decision" != "invalid" ]; then
     pass "$label -> $decision/$reason (not allowed)"
+  elif [[ "$expect" == */* ]] && [ "$decision/$reason" = "$expect" ]; then
+    pass "$label -> $decision/$reason"
   elif [ "$expect" = accepted ] && [ "$decision/$reason" = no_opinion/accepted ]; then
     pass "$label -> $decision/$reason"
   elif [ "$expect" != accepted ] && [ "$decision" = "$expect" ]; then
@@ -348,17 +350,19 @@ run_case "git -c k=\"\$(echo v w)\", forced" deny "$PRIMARY" "git -c k=\"\$(echo
 run_case "git -c \$'..' value with a space, wor''ktree" deny "$PRIMARY" "git -c \$'k=v w' wor''ktree remove --force $WT"
 run_case "git -c nested parens in value, wor''ktree" deny "$PRIMARY" "git -c k=\$(echo \$(echo \"a b\")) wor''ktree remove --force $WT"
 run_case "env git -c quoted space, wor''ktree, -f" deny "$PRIMARY" "env git -c \"k=v w\" wor''ktree remove -f $WT"
-run_case "git -c quoted space, mention only (commit)" no_opinion "$PRIMARY" "git -c \"k=v w\" commit -m \"worktree remove --force\" \$(date)"
+run_case "git -c quoted space, mention only (commit)" deny/removal_beside_substitution "$PRIMARY" "git -c \"k=v w\" commit -m \"worktree remove --force\" \$(date)"
 run_case "commit -m value holds the words with a space token" no_opinion "$PRIMARY" 'git commit -m "k=v w worktree remove --force"'
 run_case "commit -m value, single quotes, space token" no_opinion "$PRIMARY" "git commit -m 'k=v w worktree remove --force'"
-run_case "log --grep with a substitution" no_opinion "$PRIMARY" 'git log --grep "$(echo worktree remove --force)"'
-run_case "log --grep with a backtick substitution" no_opinion "$PRIMARY" 'git log --grep "`echo worktree remove --force`"'
-run_case "commit -m with a substitution holding the words" no_opinion "$PRIMARY" 'git commit -m "x" -m "$(echo a; worktree remove --force)"'
+run_case "log --grep with a substitution" deny/removal_beside_substitution "$PRIMARY" 'git log --grep "$(echo worktree remove --force)"'
+run_case "log --grep with a backtick substitution" deny/removal_beside_backtick "$PRIMARY" 'git log --grep "`echo worktree remove --force`"'
+run_case "commit -m with a substitution holding the words" deny/removal_beside_substitution "$PRIMARY" 'git commit -m "x" -m "$(echo a; worktree remove --force)"'
 run_case "echo of a quoted-space forced removal" no_opinion "$PRIMARY" "echo git -c \"k=v w\" wor''ktree remove --force $WT"
 run_case "unbalanced trailing quote, wor''ktree, falls back to stripped words" deny "$PRIMARY" "git wor''ktree remove --force $WT \"x"
 run_case "unbalanced quote falls back to the stripped words" deny "$PRIMARY" "git -c \"unbalanced worktree remove --force $WT"
 
 printf '%s\n' '== env -S carries a command string =='
+# env -S is a carrier: every row here denies removal_beside_env_split, a
+# registered tree included; env's own command word ends its option list.
 run_case "env -S double quotes, --force" deny "$PRIMARY" "env -S \"git worktree remove --force $WT\""
 run_case "env -S single quotes, --force" deny "$PRIMARY" "env -S 'git worktree remove --force $WT'"
 run_case "env -C P -S, --force" deny "$PRIMARY" "env -C $PRIMARY -S \"git worktree remove --force $WT\""
@@ -372,10 +376,10 @@ run_case "env -S, force given as a trailing word" deny "$PRIMARY" "env -S \"git 
 run_case "env -S inside env -S" deny "$PRIMARY" "env -S \"env -S 'git worktree remove --force $WT'\""
 run_case "env -S with an unbalanced inner quote, forced" deny "$PRIMARY" "env -S \"git worktree remove --force '$WT\""
 run_case "env -S, unlisted path, no force" deny "$PRIMARY" "env -S \"git worktree remove $TMP/scratch/nope\""
-run_case "env -S, registered lane, no force (same as plain)" accepted "$PRIMARY" "env -S \"git worktree remove $WT\""
+run_case "env -S, registered lane, no force, is a carrier" deny/removal_beside_env_split "$PRIMARY" "env -S \"git worktree remove $WT\""
 run_case "env -S of an unrelated command" no_opinion "$PRIMARY" "env -S \"echo hi\""
 run_case "env echo -S of the words is a mention" no_opinion "$PRIMARY" "env echo -S \"git worktree remove --force $WT\""
-run_case "echo env -S of the words is a mention" no_opinion "$PRIMARY" "echo env -S \"git worktree remove --force $WT\""
+run_case "echo env -S of the words: an env word anywhere carries its option list" deny/removal_beside_env_split "$PRIMARY" "echo env -S \"git worktree remove --force $WT\""
 
 printf '%s\n' '== commands that only mention a forced removal stay out of scope =='
 run_case "commit message, double quotes" no_opinion "$PRIMARY" 'git commit -m "docs: guard worktree remove --force"'
@@ -394,13 +398,14 @@ run_case "git grep, double quotes" no_opinion "$PRIMARY" 'git grep "worktree rem
 run_case "git grep, single quotes, pathspec" no_opinion "$PRIMARY" "git grep -n 'worktree remove -f' -- docs"
 run_case "git show with the words as operands" no_opinion "$PRIMARY" 'git show worktree remove --force'
 run_case "commit with an unquoted message" no_opinion "$PRIMARY" 'git commit -m worktree remove --force'
-# These do not parse as a simple command (substitution, glob), so they reach the
-# stripped-words check: `worktree` is not the first word after git here.
-run_case "unparseable commit message mention" no_opinion "$PRIMARY" 'git commit -m "docs: worktree remove --force" $(date)'
-run_case "unparseable commit, -C P, mention" no_opinion "$PRIMARY" "git -C $PRIMARY commit -m \"worktree remove -f\" \$(date)"
+# A substitution beside the words denies removal_beside_substitution; a glob
+# does not parse as a simple command, so it reaches the stripped-words check,
+# where `worktree` is not the first word after git.
+run_case "unparseable commit message mention" deny/removal_beside_substitution "$PRIMARY" 'git commit -m "docs: worktree remove --force" $(date)'
+run_case "unparseable commit, -C P, mention" deny/removal_beside_substitution "$PRIMARY" "git -C $PRIMARY commit -m \"worktree remove -f\" \$(date)"
 run_case "unparseable git grep mention" no_opinion "$PRIMARY" "git grep -n 'worktree remove -f' -- docs/*"
 run_case "unparseable log --grep mention" no_opinion "$PRIMARY" 'git log --grep "worktree remove --force" *.md'
-run_case "unparseable unquoted commit message mention" no_opinion "$PRIMARY" 'git commit -m worktree remove --force $(date)'
+run_case "unparseable unquoted commit message mention" deny/removal_beside_substitution "$PRIMARY" 'git commit -m worktree remove --force $(date)'
 run_case "unparseable git show operands mention" no_opinion "$PRIMARY" 'git show worktree remove -f *.md'
 run_case "unparseable log --grep with loose words" no_opinion "$PRIMARY" 'git log --grep x worktree remove --force *.md'
 run_case "env echo of a plain removal" no_opinion "$PRIMARY" "env echo git worktree remove $WT"
@@ -410,22 +415,29 @@ run_case "bare echo of a plain removal" no_opinion "$PRIMARY" "echo git worktree
 
 printf '%s\n' '== git spelled with a backslash, a path or quotes =='
 GIT_SPELLINGS=('\git' '/bin/git' '/usr/bin/git' '/opt/homebrew/bin/git' '/opt/local/bin/git' '~/bin/git' '$HOME/bin/git' '${HOME}/bin/git' '"/usr/bin/git"' "'/usr/bin/git'" '"$HOME/bin/git"' '\/bin/git')
+# A git word that holds $ is a command word built from a variable, a carrier:
+# beside the removal words it denies removal_beside_variable_command.
 for g in "${GIT_SPELLINGS[@]}"; do
+  case "$g" in *'$'*) plain_verdict=deny/removal_beside_variable_command ;; *) plain_verdict=accepted ;; esac
   run_case "$g, --force" deny "$PRIMARY" "$g worktree remove --force $WT"
   run_case "$g, -f after path" deny "$PRIMARY" "$g worktree remove $WT -f"
   run_case "$g -C P, --force" deny "$OTHER" "$g -C $PRIMARY worktree remove --force $WT"
   run_case "$g -c k=v, --force" deny "$PRIMARY" "$g -c k=v worktree remove --force $WT"
   run_case "env $g, --force" deny "$PRIMARY" "env $g worktree remove --force $WT"
   run_case "command $g, --force" deny "$PRIMARY" "command $g worktree remove --force $WT"
-  run_case "$g, registered lane, no force" accepted "$PRIMARY" "$g worktree remove $WT"
+  run_case "$g, registered lane, no force" "$plain_verdict" "$PRIMARY" "$g worktree remove $WT"
   run_case "$g, unlisted path" deny "$PRIMARY" "$g worktree remove $TMP/scratch/nope"
 done
 
 printf '%s\n' '== words that only look like git are not git =='
-for g in gitx /bin/git-foo legit /bin/gitx 'git-foo' '$GIT' '/bin/git/x'; do
+for g in gitx /bin/git-foo legit /bin/gitx 'git-foo' '/bin/git/x'; do
   run_case "$g is not git, --force" no_opinion "$PRIMARY" "$g worktree remove --force $WT"
   run_case "env $g is not git, --force" no_opinion "$PRIMARY" "env $g worktree remove --force $WT"
 done
+# $GIT is not git either, but a command word built from a variable is a
+# carrier: beside the removal words it denies.
+run_case '$GIT is not git, --force' deny/removal_beside_variable_command "$PRIMARY" "\$GIT worktree remove --force $WT"
+run_case 'env $GIT is not git, --force' deny/removal_beside_variable_command "$PRIMARY" "env \$GIT worktree remove --force $WT"
 run_case "rm operand spelled like git is still judged as rm" deny "$PRIMARY" "env rm -rf /bin/git"
 
 printf '%s\n' '== wrapped spellings get the verdict of the canonical command =='
@@ -459,6 +471,9 @@ for row in "${EQUIV_ROWS[@]}"; do
   for tail in "worktree remove --force $WT" "worktree remove -f $WT" "worktree remove $WT" "worktree remove $WT_B" \
               "worktree remove $TMP/scratch/nope" "worktree remove $WT $WT_B" "worktree remove --force" "worktree remove $PRIMARY"; do
     want="$(verdict "$r_cwd" "$r_canon $tail")"
+    # A git word built from a variable is a carrier, whatever the canonical
+    # command's verdict.
+    case "$r_wrapped" in *'$'*) want=deny/removal_beside_variable_command ;; esac
     got="$(verdict "$r_cwd" "$r_wrapped $tail")"
     if [ "$got" = "$want" ]; then
       pass "equivalence [$r_wrapped] $tail -> $got"
