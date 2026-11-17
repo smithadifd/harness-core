@@ -75,11 +75,25 @@ the text itself.
 | `plugins/harness/files/instance/standards/README.md` | the instance folder template: what belongs in standards/ |
 | `plugins/harness/setup.py` | plan, apply, remove, doctor and ledger-init for the default-tier files and settings proposals, and instance-plan and instance-create for the optional instance folder |
 | `plugins/harness/skills/setup/SKILL.md` | the setup skill: sets up, checks and uninstalls by driving the script |
-| `plugins/rails/.claude-plugin/plugin.json` | the rails plugin's manifest: name, version, description, license |
-| `plugins/rails/hooks/hooks.json` | the rails plugin's hook registration: the destructive-command guard on every Bash call, exec form, onFailure block |
+| `plugins/rails/.claude-plugin/plugin.json` | the rails plugin's manifest: name, version, description, license and the git guard's three options |
+| `plugins/rails/hooks/hooks.json` | the rails plugin's hook registration: the destructive-command guard and the git guard on every Bash call, exec form, onFailure block |
 | `plugins/rails/hooks/destructive-command-guard.sh` | the destructive-command guard: denies an unsafe rm, git worktree remove or symlinked redirect, or stays silent; never allows |
-| `plugins/rails/tests/test_destructive_guard_suites.py` | runs every guard suite under pytest and checks the plugin's manifest and hooks fields |
+| `plugins/rails/hooks/git-guard.sh` | the git guard: asks before a push to main or a force-push, checks commit style when that option is on, denies by name when it cannot judge, or stays silent; never allows |
+| `plugins/rails/tests/test_destructive_guard_suites.py` | runs every destructive-command guard suite |
+| `plugins/rails/tests/test_git_guard_suites.py` | runs every git guard suite under pytest |
+| `plugins/rails/tests/test_rails_manifest.py` | checks the plugin's manifest, the git guard's three options and the two hook entries |
 | `plugins/rails/tests/destructive-command-guard.test.sh` | the guard's main suite: containment, wrappers, protocol faults, reason codes, redaction |
+| `plugins/rails/tests/git-guard-carriers.test.sh` | tests of the git guard's presumptions: a push beside a construct it does not read, rule G outside plain text, the data-consumer heredoc exemption and configuration on the command line, with the source suite's rows moved here |
+| `plugins/rails/tests/git-guard-commit.test.sh` | tests of the git guard's commit style check, with the source suite's commit rows moved here |
+| `plugins/rails/tests/git-guard-dependencies.test.sh` | tests that a missing program denies by name, that programs are found only in the trusted roots, the crash and signal traps, the hook entry, engine stand-ins, git's environment and interpreter startup state |
+| `plugins/rails/tests/git-guard-never-allow.test.sh` | tests that the git guard never allows: static, under every option combination, and against an engine that prints one |
+| `plugins/rails/tests/git-guard-options.test.sh` | tests of the git guard's three options: defaults, values, invalid values and that only the hook arguments set them |
+| `plugins/rails/tests/git-guard-pins.test.sh` | pins the lexer the git guard copies from the destructive-command guard, byte for byte |
+| `plugins/rails/tests/git-guard-push.test.sh` | tests of the git guard's main and force gates and its push grammar, with the source suite's push rows moved here |
+| `plugins/rails/tests/git-guard-reasons.test.sh` | static checks of the git guard's reason codes, hints, templates and time budget |
+| `plugins/rails/tests/git-guard-scope.test.sh` | the source suite's rows the git guard does not judge, each silent |
+| `plugins/rails/tests/git-guard-target.test.sh` | tests of the git guard's current-branch reads against real fixture repositories |
+| `plugins/rails/tests/git-guard-unattended.test.sh` | tests of the git guard's dormant loop layer: the unattended deny, the owed record and the guard log |
 | `plugins/rails/tests/destructive-command-guard-carriers.test.sh` | tests, through the real hook form, of the removal-word rule: a removal word beside a code-carrying construct denies without the guard reading inside it, and a removal with none is judged as a plain top-level command |
 | `plugins/rails/tests/destructive-command-guard-cleanup-worktree.test.sh` | tests of the seat-bound cleanup-registry removal and its mutation audit |
 | `plugins/rails/tests/destructive-command-guard-compound.test.sh` | tests, through the real hook form, of a redirection before the command word and of an rm in a compound command or delegated shell |
@@ -100,6 +114,9 @@ the text itself.
 | `plugins/rails/tests/fixtures/destructive-command-guard/incident-call-1.json` | a recorded hook input the main suite replays |
 | `plugins/rails/tests/fixtures/destructive-command-guard/incident-call-2.json` | a recorded hook input the main suite replays |
 | `plugins/rails/tests/fixtures/destructive-command-guard/warn-then-exec.sh` | a stand-in engine that writes one stderr line, then runs the real engine |
+| `plugins/rails/tests/fixtures/git-guard/allow-engine.sh` | a stand-in engine that prints an allow verdict, for the never-allow suite |
+| `plugins/rails/tests/fixtures/git-guard/harness.sh` | the git guard suites' shared harness: the real hook form, a cleared environment and fixture repositories |
+| `plugins/rails/tests/fixtures/git-guard/warn-engine.sh` | a stand-in engine that writes one stderr line, then prints the verdict a test names |
 | `scripts/check-core-manifest.py` | checks that every tracked file is vendored or repository-only |
 | `scripts/check-ledger-vendor.py` | the vendored ledger's drift check |
 | `scripts/check-marketplace.py` | checks the marketplace and the harness plugin's manifest: folders, manifests, each external plugin bound to its expected source, full-commit pins, and, with the source option, each tag against its pin through the GitHub REST API, with no credential |
@@ -316,6 +333,19 @@ merged-or-pushed removal route and the home work-folder rule are removed, and
 owner-specific paths are scrubbed. No file of the plugin is a `cmp`-equal
 copy of its source. Three suites are new: never-allow, dependencies and
 dormant.
+
+The git guard (`plugins/rails/hooks/git-guard.sh`) and its moved suite were
+carved the same way, without history, from the same private repository at
+`d5eb2b4`, and rewritten: it never allows and reads no settings file (three
+plugin options take its place, read only from the hook's own arguments),
+every program it runs by name comes only from the trusted roots, a missing
+program, a fault or an invalid option denies by name, the scope grant and the
+interactive allow are removed, the source's pipeline-to-shell review and its
+date-only data exemption are not carried, and owner names and paths are
+scrubbed. No file is a `cmp`-equal copy. The lexer functions it copies from the
+destructive-command guard are pinned to that file, byte for byte, by
+`git-guard-pins.test.sh`. The source suite's rows keep their labels and
+commands (scrubbed) in the new suites, each marked with its source line.
 
 ## Pin moves
 

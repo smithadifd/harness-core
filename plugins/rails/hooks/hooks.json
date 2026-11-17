@@ -1,5 +1,5 @@
 {
-  "description": "The destructive-command guard: denies, or stays silent.",
+  "description": "The destructive-command guard denies or stays silent; the git guard asks, denies or stays silent. Neither hook ever returns an allow.",
   "hooks": {
     "PreToolUse": [
       {
@@ -12,6 +12,17 @@
             "timeout": 10,
             "onFailure": "block",
             "statusMessage": "Checking destructive command guardrails..."
+          },
+          {
+            "type": "command",
+            "command": "/usr/bin/env",
+            "args": ["-u", "BASH_ENV", "-u", "ENV", "/bin/bash", "--noprofile", "--norc", "-p", "${CLAUDE_PLUGIN_ROOT}/hooks/git-guard.sh",
+                     "--push-to-main", "${user_config.push_to_main}",
+                     "--force-push", "${user_config.force_push}",
+                     "--commit-style", "${user_config.commit_style}"],
+            "timeout": 10,
+            "onFailure": "block",
+            "statusMessage": "Checking git guardrails..."
           }
         ]
       }

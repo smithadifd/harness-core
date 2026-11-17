@@ -1,10 +1,33 @@
 {
   "name": "rails",
   "version": "0.1.0",
-  "description": "Guard hooks that deny destructive shell commands. Deny only: no hook in this plugin ever allows.",
+  "description": "Guard hooks for shell commands: deny destructive commands, ask before a push to main or a force-push. No hook in this plugin ever allows.",
   "author": {
     "name": "harness-core maintainers"
   },
   "license": "MIT",
-  "keywords": ["guard", "hooks", "deny"]
+  "keywords": ["guard", "hooks", "deny", "ask"],
+  "userConfig": {
+    "push_to_main": {
+      "type": "string",
+      "title": "Push to main",
+      "description": "What the git guard does before a push that updates main or master: ask, deny, or off.",
+      "options": ["ask", "deny", "off"],
+      "default": "ask"
+    },
+    "force_push": {
+      "type": "string",
+      "title": "Force-push",
+      "description": "What the git guard does before a force, delete, mirror or prune push: ask, deny, or off.",
+      "options": ["ask", "deny", "off"],
+      "default": "ask"
+    },
+    "commit_style": {
+      "type": "string",
+      "title": "Commit style",
+      "description": "What the git guard does when a git commit -m subject is not conventional (feat:, fix:, docs: and the rest): off, ask, or deny.",
+      "options": ["off", "ask", "deny"],
+      "default": "off"
+    }
+  }
 }

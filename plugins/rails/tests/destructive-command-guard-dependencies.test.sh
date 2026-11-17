@@ -403,7 +403,7 @@ H1="$("$JQ" -r '
     elif $g[0].args != ["-u","BASH_ENV","-u","ENV","/bin/bash","--noprofile","--norc","-p","${CLAUDE_PLUGIN_ROOT}/hooks/destructive-command-guard.sh"] then "args \($g[0].args | tostring)"
     elif $g[0].timeout != 10 then "timeout \($g[0].timeout)"
     elif $g[0].onFailure != "block" then "onFailure \($g[0].onFailure)"
-    elif ($all | length) != 1 then "hooks: \($all | length)"
+    elif ($all | length) != 2 or ($all[1].args // [] | map(tostring) | any(endswith("/hooks/git-guard.sh")) | not) then "hooks: \($all | length), the second not the git guard"
     else "ok" end' "$HOOKS" 2>&1)"
 if [ "$H1" = ok ]; then pass "H1 one PreToolUse Bash command hook: /usr/bin/env, the exact args, timeout 10, onFailure block"; else fail "H1 hooks.json: $H1"; fi
 
