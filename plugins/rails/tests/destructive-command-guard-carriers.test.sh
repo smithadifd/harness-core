@@ -25,6 +25,8 @@
 #      other than as a delimiter (inside quotes, after a backslash, as a line
 #      continuation) denies as hidden_separator; redirection operators are not
 #      separators
+#   U  R1 and R2 read both segmenters: text the comment-skipping copy drops
+#      hides no command word and no top-level reading
 # Each row runs the hook exactly as hooks.json does (env -u BASH_ENV -u ENV
 # /bin/bash --noprofile --norc -p GUARD) with a PreToolUse JSON on stdin, from
 # a worktree with a build folder. X is an absolute path outside the worktree.
@@ -394,8 +396,8 @@ deny H24t unsafe_rm 'echo ${HOME// #/Z}; rm -rf /etc/hosts'
 deny H49t unsafe_rm $'shopt -s extglob\necho @(a)#x; rm -rf /etc/hosts'
 deny H68t unsafe_rm 'rm -rf /etc/hosts;# done'
 deny H69t unsafe_rm $'echo \'a\'#b; rm -rf /etc/hosts'
-# R1 (f) and R2 read their command words from the comment-skipping copy, so
-# a quote or a backslash in a comment hides no pattern command word.
+# R1 (f) and R2 read their command words from the comment-skipping copy too,
+# so a quote or a backslash in a comment hides no pattern command word.
 deny H74 removal_beside_variable_command $'# it\'s\n/bin/s? -c \'f=r; f=${f}m; $f -rf /etc/hosts\''
 deny H75 removal_beside_variable_command $'# it\'s\n/bin/s? -c x'
 deny H76 removal_beside_variable_command $'# x\\\n/bin/s? -c x'
@@ -495,6 +497,23 @@ deny S44 hidden_separator 'docker rm c1 && echo "a;b"'
 # R2 also takes its tokens from the text with every backslash deleted, so a
 # carrier after an even run of backslashes is found without the line join.
 deny S45 removal_beside_eval $'echo a\\\\\neval rm -rf build'
+
+printf '%s\n' '== U: R1 and R2 read both segmenters =='
+# Every reader that decides a verdict reads the segmenter's segments (where #
+# is text) beside the comment-skipping copy's, so text the copy drops as a
+# comment, here a # that bash reads as text inside [[ ]], hides nothing bash
+# runs. The rule G rows for a hidden cd are S8 and S9.
+# collect_command_words: the variable command word and the source carrier's .
+deny U1 removal_beside_variable_command 'f=rm; [[ a]] =~ ( #) ]]; $f -rf /etc/hosts'
+deny U2 removal_beside_source '[[ a]] =~ ( #) ]]; . ./x.sh; rm -rf build'
+# top_level_text, read by R1: the heredoc ends at its E\ line and the next
+# two lines join into rm -rf /etc/hosts, which only the segmenter's top-level
+# reading sees.
+deny U3 removal_beside_heredoc $'[[ a]] =~ ( #) ]]; cat <<\'E\\\'\nhello\nE\\\nr\\\nm -rf /etc/hosts'
+# top_level_text, read by R1 and by R2's env split: the line continuation
+# joins e and nv into env -S, which only the segmenter's top-level reading
+# joins.
+deny U4 removal_beside_env_split $'[[ a]] =~ ( #) ]]; echo \'it\'; e\\\nnv -S\'rm\\_-rf\\_/etc/hosts\''
 
 if [ -d "$WORKTREE/build" ] && [ -f "$WORKTREE/build/x" ]; then pass "fixtures remained present"; else fail "a fixture was executed"; fi
 
