@@ -14,6 +14,8 @@
 #   E  kept findings (repointing, prefixes, redirections before the command)
 #   G  >&WORD read as a file target
 #   B3 commands that crashed bash 3.2 on an empty array (run with /bin/bash)
+#   H  shell comments: an unquoted # that begins a word runs to the end of
+#      its line and opens no quote and no line continuation
 # Each row runs the hook exactly as hooks.json does (env -u BASH_ENV -u ENV
 # /bin/bash --noprofile --norc -p GUARD) with a PreToolUse JSON on stdin, from
 # a worktree with a build folder. X is an absolute path outside the worktree.
@@ -270,6 +272,58 @@ silent B3 'echo $((1<<2))'
 silent B3 'echo $((2>1))'
 silent B3 'echo "$((1<<2))"'
 silent B3 '()'
+
+printf '%s\n' '== H: shell comments =='
+# H0a and H0b are the top-level codes the comment rows keep.
+deny H0a unsafe_rm 'rm -rf /etc/hosts'
+deny H0b unsafe_worktree_remove $'cd build\ngit worktree remove --force /etc'
+# A quote or a trailing backslash inside a comment opens nothing.
+deny H1 unsafe_rm $'# Clean the stale cache (it\'s regenerated)\nrm -rf /etc/hosts\n# Don\'t forget to rebuild'
+deny H2 unsafe_rm $'# a "quoted\nrm -rf /etc/hosts\n# word"'
+deny H3 unsafe_rm $'# see C:\\dir\\\nrm -rf /etc/hosts'
+deny H4 unsafe_worktree_remove $'cd build # it\'s here\ngit worktree remove --force /etc\n# that\'s it'
+deny H5 unsafe_rm $'echo start # it\'s time\nrm -rf /etc/hosts\necho done # that\'s all'
+deny H6 unsafe_rm $'true; # it\'s\nrm -rf /etc/hosts; # ok\''
+deny H7 unsafe_rm $'echo hi |# it\'s\nrm -rf /etc/hosts'
+deny H36 unsafe_rm $'true\n# it\'s regenerated\nrm -rf /etc/hosts'
+deny H37 unsafe_rm $'true;# it\'s\nrm -rf /etc/hosts'
+# A comment's own words are not judged.
+silent H8 '# rm -rf /etc/hosts is not needed here'
+silent H9 $'# don\'t rm the cache'
+silent H15 "x=1 # it's fine"
+silent H17 $'# it\'s stale\nrm -rf build'
+silent H19 $'echo x # $(\nls'
+deny H18 unsupported_syntax "rm -rf build # it's stale"
+# A # inside a word, after an escape or inside quotes is text.
+deny H10 unsafe_rm 'echo a#b; rm -rf /etc/hosts'
+deny H11 unsafe_rm "echo '#'; rm -rf /etc/hosts"
+deny H12 unsafe_rm 'echo \#; rm -rf /etc/hosts'
+deny H13 unsafe_rm 'echo ${#x}; rm -rf /etc/hosts'
+deny H14 unsafe_rm 'echo $#; rm -rf /etc/hosts'
+# R2 reads the raw text, comments included: a carrier in a comment counts.
+deny H16 removal_beside_substitution $'# see $(date) for timing\nrm -rf /etc/hosts'
+# Bash reads a # after a blank as text inside these constructs.
+deny H20 path_repointing_subshell '(( 1 # x )); rm -rf /etc/hosts'
+deny H21 unsafe_rm 'for (( i=0; i<0; # x )); do :; done; rm -rf /etc/hosts'
+deny H22 path_repointing_subshell $'shopt -s extglob\necho @(a|(b) # x); rm -rf /etc/hosts'
+deny H23 unsafe_rm 'echo ${HOME// #/Z}; rm -rf /etc/hosts'
+deny H24 unsupported_syntax 'echo ${HOME// #/Z}; rm -rf build'
+deny H25 unsafe_rm '[[ a =~ ( #) ]]; rm -rf /etc/hosts'
+deny H26 unsafe_rm 'echo $[ 1 # x ]; rm -rf /etc/hosts'
+deny H38 unsafe_rm $'shopt -s extglob\necho @(a)#x; rm -rf /etc/hosts'
+deny H39 path_repointing_assignment 'x=(a)#b; rm -rf /etc/hosts'
+# A comment that ends in a backslash joins no line, at the top level, in a
+# quoted string for another shell and in a heredoc body.
+deny H27 removal_beside_eval $'# x\\\neval rm -rf /etc/hosts'
+deny H28 removal_beside_shell $'# x\\\nsh -c \'rm -rf /etc/hosts\''
+deny H29 removal_beside_shell $'sh -c \'true # x\\\nrm -rf /etc/hosts\''
+deny H30 removal_beside_heredoc $'bash <<\'EOF\'\ntrue # x\\\nrm -rf /etc/hosts\nEOF'
+deny H31 unsafe_rm $'# c\\\nr\\\nm -rf /etc/hosts'
+# A quote or $' inside a comment pairs with nothing after it.
+deny H32 removal_beside_env_split $'# it\'s\nenv -S \'rm -rf /etc/hosts\''
+deny H33 removal_beside_env_split $'# it\'s\nenv -S\'rm\\_-rf\\_/etc/hosts\''
+deny H34 removal_beside_variable_command $'# $\'\n$\'\\x72\\x6d\' -rf /etc/hosts'
+deny H35 removal_beside_shell $'bash -c "# $\'\n$\'\\x72\\x6d\' -rf /etc/hosts"'
 
 if [ -d "$WORKTREE/build" ] && [ -f "$WORKTREE/build/x" ]; then pass "fixtures remained present"; else fail "a fixture was executed"; fi
 
