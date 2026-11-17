@@ -299,6 +299,13 @@ if [ "$OUT" = '{"decision":"deny","reason":"malformed_normalized_input"}' ]; the
 OUT="$(cd "$T" && "$JQ" -cn --arg cwd "$REPO_FEATURE" '{cwd:$cwd,command:"git push origin main",extra:1}' | /usr/bin/env -i HOME="$GG_HOME" PATH="$GG_PATH" \
   /bin/bash --noprofile --norc -p "$GUARD" --policy --push-to-main ask --force-push ask --commit-style off 2>/dev/null)"
 if [ "$OUT" = '{"decision":"deny","reason":"malformed_normalized_input"}' ]; then pass "D6 the engine refuses input with a key beyond command and cwd"; else fail "D6 the engine took an extra key: $OUT"; fi
+# A value of newlines only passes both strict filters and is empty once the
+# command substitution strips it: the engine's empty check denies by name.
+gg_row "D6 a command of one newline" deny:extraction_failure $'\n'
+gg_policy "$REPO_FEATURE" $'\n' --push-to-main ask --force-push ask --commit-style off
+if [ "$OUT" = '{"decision":"deny","reason":"extraction_failure"}' ]; then pass "D6 the engine: a command of one newline"; else fail "D6 the engine, a command of one newline: $OUT"; fi
+gg_policy $'\n' 'git status' --push-to-main ask --force-push ask --commit-style off
+if [ "$OUT" = '{"decision":"deny","reason":"extraction_failure"}' ]; then pass "D6 the engine: a cwd of one newline"; else fail "D6 the engine, a cwd of one newline: $OUT"; fi
 
 printf '%s\n' "== E git's environment =="
 for name in GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_CEILING_DIRECTORIES GIT_DISCOVERY_ACROSS_FILESYSTEM GIT_CONFIG GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_CONFIG_NOSYSTEM GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; do
