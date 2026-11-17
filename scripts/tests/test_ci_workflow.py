@@ -26,6 +26,13 @@ RUNS_ON = "${{ fromJSON(vars.CORE_CI_RUNNER || '[\"ubuntu-latest\"]') }}"
 # literal of labels. Anything else is unparsed and fails.
 RUNS_ON_SHAPE = re.compile(r"\$\{\{ fromJSON\(vars\.CORE_CI_RUNNER \|\| '(\[[^']*\])'\) \}\}")
 HOSTED_DEFAULT = ["ubuntu-latest"]
+# The one named per-job exception to the hosted default. The pytest job falls
+# back to ubuntu-24.04, whose stat is GNU coreutils: the rails guard reads a
+# worktree's birth time to the nanosecond, and the uutils stat ubuntu-latest
+# ships prints whole seconds. Every other job keeps the hosted default, and
+# any other exception fails.
+RUNNER_EXCEPTIONS = {CI: {"pytest": ["ubuntu-24.04"]}}
+PYTEST_RUNS_ON = "${{ fromJSON(vars.CORE_CI_RUNNER || '[\"ubuntu-24.04\"]') }}"
 JOBS = ["pytest", "core-manifest", "no-person", "ledger-drift", "plugin-validate"]
 # Every workflow file and its jobs; a workflow file not listed here fails.
 WORKFLOWS = {CI: JOBS, IDENTITY: ["commit-identity"]}
@@ -155,15 +162,90 @@ def runner_default(expression: str) -> list[str]:
     return value
 
 
+def runs_on_for(labels: list[str]) -> str:
+    """The one runs-on expression whose fallback is labels."""
+    return "${{ fromJSON(vars.CORE_CI_RUNNER || '" + json.dumps(labels) + "') }}"
+
+
+def expected_labels(path: Path, name: str) -> list[str]:
+    return RUNNER_EXCEPTIONS.get(path, {}).get(name, HOSTED_DEFAULT)
+
+
+def runner_problems(path: Path, text: str) -> list[str]:
+    """Each job of the workflow whose runs-on is not the override with its
+    expected fallback (the hosted default, or its named exception), by name."""
+    problems = []
+    for name, job in jobs(text).items():
+        want = runs_on_for(expected_labels(path, name))
+        found = field(job, "runs-on")
+        if found != [want]:
+            problems.append(f"{path.name}: {name}: runs-on is {found!r}, not [{want!r}]")
+    return problems
+
+
 # J9: every job runs on the CORE_CI_RUNNER override, else a GitHub-hosted runner.
 
 def test_j9_every_job_runs_on_the_runner_variable_with_the_hosted_default():
     for path in workflow_files():
-        found = jobs(path.read_text(encoding="utf-8"))
+        text = path.read_text(encoding="utf-8")
+        found = jobs(text)
         assert sorted(found) == sorted(WORKFLOWS[path]), path.name
+        assert runner_problems(path, text) == []
         for name, job in found.items():
-            assert field(job, "runs-on") == [RUNS_ON], (path.name, name)
-            assert runner_default(field(job, "runs-on")[0]) == HOSTED_DEFAULT, (path.name, name)
+            assert runner_default(field(job, "runs-on")[0]) == expected_labels(path, name), (
+                path.name, name)
+
+
+def test_j9_the_one_runner_exception_is_the_pytest_job_on_ubuntu_24_04():
+    """pytest is the only job off the hosted default, and its runs-on keeps the
+    override grammar; every other job, in every workflow, is on the default."""
+    assert RUNNER_EXCEPTIONS == {CI: {"pytest": ["ubuntu-24.04"]}}
+    assert HOSTED_DEFAULT == ["ubuntu-latest"]
+    assert runs_on_for(["ubuntu-24.04"]) == PYTEST_RUNS_ON
+    assert runs_on_for(HOSTED_DEFAULT) == RUNS_ON
+    for path in workflow_files():
+        for name, job in jobs(path.read_text(encoding="utf-8")).items():
+            want = PYTEST_RUNS_ON if (path, name) == (CI, "pytest") else RUNS_ON
+            assert field(job, "runs-on") == [want], (path.name, name)
+
+
+DEFAULT_LINE = "    runs-on: " + RUNS_ON + "\n"
+PINNED_LINE = "    runs-on: " + PYTEST_RUNS_ON + "\n"
+RUNNER_NEAR_MISSES = [
+    ("core-manifest-pinned", CI, lambda t: nth(t, DEFAULT_LINE, PINNED_LINE, 1),
+     "ci.yml: core-manifest: runs-on is"),
+    ("no-person-pinned", CI, lambda t: nth(t, DEFAULT_LINE, PINNED_LINE, 2),
+     "ci.yml: no-person: runs-on is"),
+    ("ledger-drift-pinned", CI, lambda t: nth(t, DEFAULT_LINE, PINNED_LINE, 3),
+     "ci.yml: ledger-drift: runs-on is"),
+    ("plugin-validate-pinned", CI, lambda t: nth(t, DEFAULT_LINE, PINNED_LINE, 4),
+     "ci.yml: plugin-validate: runs-on is"),
+    ("commit-identity-pinned", IDENTITY, lambda t: t.replace(DEFAULT_LINE, PINNED_LINE),
+     "commit-identity.yml: commit-identity: runs-on is"),
+    ("pytest-no-override", CI,
+     lambda t: t.replace(PINNED_LINE, "    runs-on: ${{ fromJSON('[\"ubuntu-24.04\"]') }}\n"),
+     "ci.yml: pytest: runs-on is"),
+    ("pytest-other-variable", CI,
+     lambda t: t.replace(PINNED_LINE, PINNED_LINE.replace("vars.CORE_CI_RUNNER", "vars.OTHER_RUNNER")),
+     "ci.yml: pytest: runs-on is"),
+    ("pytest-bare-label", CI, lambda t: t.replace(PINNED_LINE, "    runs-on: ubuntu-24.04\n"),
+     "ci.yml: pytest: runs-on is"),
+    ("pytest-back-to-latest", CI, lambda t: t.replace(PINNED_LINE, DEFAULT_LINE),
+     "ci.yml: pytest: runs-on is"),
+    ("pytest-other-image", CI,
+     lambda t: t.replace(PINNED_LINE, PINNED_LINE.replace("ubuntu-24.04", "ubuntu-22.04")),
+     "ci.yml: pytest: runs-on is"),
+]
+
+
+@pytest.mark.parametrize("path,change,expected", [case[1:] for case in RUNNER_NEAR_MISSES],
+                         ids=[case[0] for case in RUNNER_NEAR_MISSES])
+def test_j9_a_runner_near_miss_is_refused_by_name(path, change, expected):
+    text = path.read_text(encoding="utf-8")
+    changed = change(text)
+    assert changed != text, "the change did something"
+    problems = runner_problems(path, changed)
+    assert [problem for problem in problems if problem.startswith(expected)] == problems != [], problems
 
 
 def test_j9_no_job_falls_back_to_a_self_hosted_runner():
@@ -253,7 +335,7 @@ def test_each_gate_job_runs_its_check():
         "python3 -I scripts/check-no-person.py")
     no_person = steps(found["no-person"])[-1]
     assert DENY_FROM_SECRET in no_person
-    pytest_step = "\n".join(steps(found["pytest"])[-1])
+    pytest_step = "\n".join(named_step(found["pytest"], "Run every test suite"))
     for suite in ("skills/_lib/tests", "skills/_lib/recall/tests", "skills/_lib/ledger/tests",
                   "scripts/tests"):
         assert f'"{suite}"' in pytest_step, suite
@@ -275,6 +357,133 @@ def test_the_deny_list_reaches_ci_only_from_the_secret_and_no_step_echoes_it():
     no_person = steps(jobs(workflow())["no-person"])
     assert [DENY_FROM_SECRET in step for step in no_person] == [False] * (
         len(no_person) - 1) + [True]
+
+
+def named_step(job: list[str], title: str) -> list[str]:
+    """The one step of the job whose name is title."""
+    found = [step for step in steps(job) if step_keys(step).get("name", [""])[0] == title]
+    assert len(found) == 1, (title, len(found))
+    return found[0]
+
+
+# The rails plugin's guard suites: one step of the pytest job, right after the
+# existing suites, under python3 -I, in a fresh HOME, after a preflight that
+# looks for the guard's programs where the guard looks for them.
+
+RAILS_STEP = "Run the rails plugin's guard suites under python3 -I, in a fresh home"
+# As it reads in the step's body once the run block's own indent is removed.
+RAILS_COMMAND = ('command = [os.environ["CORE_PYTHON"], "-I", "-m", "pytest", "-q", "-ra",\n'
+                 '           "-p", "no:cacheprovider", "plugins/rails/tests"]')
+TRUSTED_ROOTS = '"/usr/bin", "/bin", "/usr/local/bin", "/opt/homebrew/bin", "/home" + "/linuxbrew/.linuxbrew/bin"'
+
+
+def rails_problems(text: str) -> list[str]:
+    """What is wrong with the rails step, by name."""
+    job = jobs(text)["pytest"]
+    found = [step for step in steps(job) if step_keys(step).get("name", [""])[0] == RAILS_STEP]
+    if len(found) != 1:
+        return [f"pytest: {len(found)} rails steps"]
+    step = found[0]
+    keys = step_keys(step)
+    body = "\n".join(line[10:] for line in keys.get("run", ["", ""])[1:])
+    problems = []
+    names = [step_keys(s).get("name", [""])[0] for s in steps(job)]
+    if names.index(RAILS_STEP) != names.index("Run every test suite") + 1:
+        problems.append("rails: the step does not follow the existing suites")
+    if keys.get("shell", [None])[0] != ISOLATED_SHELL:
+        problems.append("rails: the step's shell is not python3 -I")
+    if RAILS_COMMAND not in body:
+        problems.append("rails: pytest does not run plugins/rails/tests under -I")
+    if 'home = tempfile.mkdtemp(dir=os.environ["RUNNER_TEMP"])' not in body or "HOME=home" not in body:
+        problems.append("rails: HOME is not a fresh folder")
+    if f"roots = [{TRUSTED_ROOTS}]" not in body:
+        problems.append("rails: the preflight does not look in the guard's trusted roots")
+    if "command -v" in body or "shutil.which" in body or "PATH" in body:
+        problems.append("rails: the preflight looks on PATH")
+    for name in ('"jq"', '"git"', '"/usr/bin/perl"', '"import pytest"'):
+        if name not in body:
+            problems.append(f"rails: the preflight does not check {name}")
+    if "sys.exit(1)" not in body:
+        problems.append("rails: the preflight does not fail the step")
+    return problems
+
+
+def test_the_pytest_job_runs_the_rails_suites_isolated_after_a_trusted_roots_preflight():
+    assert rails_problems(workflow()) == []
+
+
+RAILS_NEAR_MISSES = [
+    ("not-isolated", lambda t: t.replace('[os.environ["CORE_PYTHON"], "-I", "-m", "pytest"', '[os.environ["CORE_PYTHON"], "-m", "pytest"'),
+     "rails: pytest does not run plugins/rails/tests under -I"),
+    ("preflight-on-path", lambda t: t.replace(f"roots = [{TRUSTED_ROOTS}]", 'roots = os.environ["PATH"].split(":")'),
+     "rails: the preflight does not look in the guard's trusted roots"),
+    ("home-not-fresh", lambda t: t.replace('env = dict(os.environ, HOME=home, PYTHONDONTWRITEBYTECODE="1")\n          command = [os.environ["CORE_PYTHON"], "-I"',
+                                            'env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")\n          command = [os.environ["CORE_PYTHON"], "-I"'),
+     "rails: HOME is not a fresh folder"),
+    ("step-missing", lambda t: t.replace("      - name: " + RAILS_STEP, "      - name: Something else"),
+     "pytest: 0 rails steps"),
+]
+
+
+@pytest.mark.parametrize("change,expected", [(case[1], case[2]) for case in RAILS_NEAR_MISSES],
+                         ids=[case[0] for case in RAILS_NEAR_MISSES])
+def test_a_rails_step_near_miss_is_refused_by_name(change, expected):
+    changed = change(workflow())
+    assert changed != workflow(), "the change did something"
+    assert expected in rails_problems(changed)
+
+
+# The plugin-validate job validates the marketplace and every plugin under
+# plugins/, each strict, in the job's fresh HOME, each exactly once.
+
+VALIDATE_TARGETS = [".", "plugins/harness", "plugins/rails"]
+VALIDATE_LINE = 'HOME="$home" "$claude" plugin validate --strict {0}'
+
+
+def validate_problems(text: str) -> list[str]:
+    """Each validate target that is not validated strict in the fresh HOME exactly once, by name."""
+    job = jobs(text).get("plugin-validate")
+    if job is None:
+        return ["plugin-validate: the job is missing"]
+    lines = [line.strip() for line in job if '"$claude" plugin validate' in line]
+    found = [f"plugin-validate: {target} is not validated strict in the fresh HOME"
+             for target in VALIDATE_TARGETS if lines.count(VALIDATE_LINE.format(target)) != 1]
+    if sorted(lines) != sorted(VALIDATE_LINE.format(target) for target in VALIDATE_TARGETS):
+        found.append(f"plugin-validate: the validate lines are {lines}")
+    return found
+
+
+def test_the_plugin_validate_job_validates_the_marketplace_and_every_plugin_strict():
+    plugins = sorted(f"plugins/{path.parent.parent.name}"
+                     for path in (ROOT / "plugins").glob("*/.claude-plugin/plugin.json"))
+    assert plugins == sorted(VALIDATE_TARGETS[1:])
+    assert validate_problems(workflow()) == []
+
+
+RAILS_VALIDATE = 'HOME="$home" "$claude" plugin validate --strict plugins/rails'
+VALIDATE_NEAR_MISSES = [
+    ("rails-not-validated", lambda t: t.replace("          " + RAILS_VALIDATE + "\n", ""),
+     "plugin-validate: plugins/rails is not validated strict in the fresh HOME"),
+    ("rails-not-strict", lambda t: t.replace(RAILS_VALIDATE, RAILS_VALIDATE.replace("--strict ", "")),
+     "plugin-validate: plugins/rails is not validated strict in the fresh HOME"),
+    ("rails-without-fresh-home", lambda t: t.replace(RAILS_VALIDATE, RAILS_VALIDATE.replace('HOME="$home" ', "")),
+     "plugin-validate: plugins/rails is not validated strict in the fresh HOME"),
+    ("rails-failure-allowed", lambda t: t.replace(RAILS_VALIDATE, RAILS_VALIDATE + " || true"),
+     "plugin-validate: plugins/rails is not validated strict in the fresh HOME"),
+    ("rails-twice", lambda t: t.replace("          " + RAILS_VALIDATE + "\n", ("          " + RAILS_VALIDATE + "\n") * 2),
+     "plugin-validate: plugins/rails is not validated strict in the fresh HOME"),
+    ("an-extra-target", lambda t: t.replace("          " + RAILS_VALIDATE + "\n",
+                                            "          " + RAILS_VALIDATE + "\n" + "          " + VALIDATE_LINE.format("plugins/other") + "\n"),
+     "plugin-validate: the validate lines are"),
+]
+
+
+@pytest.mark.parametrize("change,expected", [(case[1], case[2]) for case in VALIDATE_NEAR_MISSES],
+                         ids=[case[0] for case in VALIDATE_NEAR_MISSES])
+def test_a_plugin_validate_near_miss_is_refused_by_name(change, expected):
+    changed = change(workflow())
+    assert changed != workflow(), "the change did something"
+    assert any(problem.startswith(expected) for problem in validate_problems(changed)), validate_problems(changed)
 
 
 # J7 and J8: the ledger drift job runs both checks.
@@ -358,7 +567,10 @@ ISOLATION_NEAR_MISSES = [
      "has the python shell 'python3 {0}', not 'python3 -I {0}'"),
     ("pytest-run-shell", lambda t: nth(t, SHELL, "        shell: python3 {0}\n", 2),
      "pytest: step 'Run every test suite' has the python shell 'python3 {0}', not 'python3 -I {0}'"),
-    ("ledger-drift-shell", lambda t: nth(t, SHELL, "        shell: python3 {0}\n", 3),
+    ("pytest-rails-shell", lambda t: nth(t, SHELL, "        shell: python3 {0}\n", 3),
+     "pytest: step \"Run the rails plugin's guard suites under python3 -I, in a fresh home\" "
+     "has the python shell 'python3 {0}', not 'python3 -I {0}'"),
+    ("ledger-drift-shell", lambda t: nth(t, SHELL, "        shell: python3 {0}\n", 4),
      "ledger-drift: step 'ledger-vendor.pin matches the ledger repository at the pinned commit (--source)' "
      "has the python shell 'python3 {0}', not 'python3 -I {0}'"),
     ("gate-step-removed", lambda t: t.replace("        run: python3 -I scripts/check-core-manifest.py\n", "        run: true\n"),

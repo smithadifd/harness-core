@@ -11,6 +11,11 @@
       "source": "./plugins/harness"
     },
     {
+      "name": "rails",
+      "description": "Guard hooks that deny destructive shell commands. Deny only: no hook in this plugin ever allows.",
+      "source": "./plugins/rails"
+    },
+    {
       "name": "sdlc",
       "description": "The skills and agents of the harness, including the ticket skill.",
       "source": {

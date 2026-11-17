@@ -23,10 +23,17 @@ jobs:
   # Every vendored test and every repository-only test, run stand-alone in
   # this checkout, which holds only the vendored files and this repository's
   # own: a test that reaches a file outside that set fails here. HOME is a
-  # fresh folder, so no test reads the runner's own home folder.
+  # fresh folder, so no test reads the runner's own home folder. The rails
+  # plugin's guard suites run in a step of their own, under python3 -I.
   pytest:
     name: pytest (vendored and repository-only tests, stand-alone)
-    runs-on: ${{ fromJSON(vars.CORE_CI_RUNNER || '["ubuntu-latest"]') }}
+    # This job alone falls back to ubuntu-24.04, not ubuntu-latest. The rails
+    # guard reads a worktree's birth time to the nanosecond from GNU stat;
+    # ubuntu-latest ships the uutils coreutils stat (0.10.0), which prints
+    # whole seconds, so identity-checked removals deny there. CORE_CI_RUNNER
+    # still wins when it is set. The pin goes when DT-CP2-RAILS-UUTILS-IDENTITY1
+    # lands.
+    runs-on: ${{ fromJSON(vars.CORE_CI_RUNNER || '["ubuntu-24.04"]') }}
     timeout-minutes: 30
     steps:
       - name: Check out the repository
@@ -59,6 +66,35 @@ jobs:
                     "skills/_lib/ledger/tests", "scripts/tests"]
           command = [os.environ["CORE_PYTHON"], "-m", "pytest", "-q", "-ra",
                      "-p", "no:cacheprovider", *suites]
+          sys.exit(subprocess.run(command, env=env).returncode)
+      - name: Run the rails plugin's guard suites under python3 -I, in a fresh home
+        shell: python3 -I {0}
+        run: |
+          import os, subprocess, sys, tempfile
+          # Preflight: every program the destructive-command guard runs, where
+          # the guard itself looks for it, and pytest under -I. jq, wc, tr, git
+          # and grep must be in one of the guard's trusted roots (PATH is not
+          # what the guard reads); the rest are absolute paths. Nothing is
+          # installed or skipped: a missing one fails this step by name.
+          roots = ["/usr/bin", "/bin", "/usr/local/bin", "/opt/homebrew/bin", "/home" + "/linuxbrew/.linuxbrew/bin"]
+          def runnable(path):
+              return os.access(path, os.X_OK) and not os.path.isdir(path)
+          missing = [f"{tool} in a trusted root" for tool in ("jq", "wc", "tr", "git", "grep")
+                     if not any(runnable(os.path.join(root, tool)) for root in roots)]
+          missing += [path for path in ("/usr/bin/perl", "/usr/bin/git", "/usr/bin/env", "/usr/bin/find",
+                                        "/usr/bin/readlink", "/bin/cat", "/usr/bin/id", "/bin/date", "/bin/bash")
+                      if not runnable(path)]
+          if not (runnable("/usr/bin/stat") or runnable("/bin/stat")):
+              missing.append("/usr/bin/stat or /bin/stat")
+          if subprocess.run([os.environ["CORE_PYTHON"], "-I", "-c", "import pytest"]).returncode != 0:
+              missing.append("pytest under python3 -I")
+          if missing:
+              print("rails preflight: missing " + ", ".join(missing), file=sys.stderr)
+              sys.exit(1)
+          home = tempfile.mkdtemp(dir=os.environ["RUNNER_TEMP"])
+          env = dict(os.environ, HOME=home, PYTHONDONTWRITEBYTECODE="1")
+          command = [os.environ["CORE_PYTHON"], "-I", "-m", "pytest", "-q", "-ra",
+                     "-p", "no:cacheprovider", "plugins/rails/tests"]
           sys.exit(subprocess.run(command, env=env).returncode)
 
   # .core-manifest lists exactly the vendored files, each tracked at mode
@@ -203,7 +239,7 @@ jobs:
       - name: Install Claude Code at the pinned version into a folder of this job
         run: |
           npm install --prefix "$RUNNER_TEMP/claude-code" --no-audit --no-fund "@anthropic-ai/claude-code@2.1.325"
-      - name: Validate the marketplace and the harness plugin, strict, in a fresh home
+      - name: Validate the marketplace and the harness and rails plugins, strict, in a fresh home
         run: |
           set -euo pipefail
           home="$(mktemp -d "$RUNNER_TEMP/validate-home.XXXXXX")"
@@ -211,3 +247,4 @@ jobs:
           HOME="$home" "$claude" --version
           HOME="$home" "$claude" plugin validate --strict .
           HOME="$home" "$claude" plugin validate --strict plugins/harness
+          HOME="$home" "$claude" plugin validate --strict plugins/rails

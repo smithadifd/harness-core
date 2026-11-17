@@ -58,6 +58,7 @@ Two sibling repositories are published separately, and both are public:
 | `skills/_lib/recall/` | a local full-text index over agent session transcripts, with a guard that refuses private folders |
 | `skills/_lib/ledger/` | the item ledger, itself vendored from the public ledger repository (see below) |
 | `.claude-plugin/marketplace.json`, `plugins/harness/` | the plugin marketplace and the `harness` plugin, including its setup skill and the script behind it (see "Install the default tier") |
+| `plugins/rails/` | the `rails` plugin: the destructive-command guard hook and its tests (see "The rails plugin") |
 | `scripts/`, `install-profiles/` | two maintenance scripts and an install profile |
 | `skills/_lib/tests/`, `skills/_lib/recall/tests/`, `scripts/tests/` | the tests of the vendored modules |
 
@@ -100,18 +101,23 @@ consumer.
 ## Install the default tier (alpha)
 
 The marketplace in `.claude-plugin/marketplace.json` is named `harness-core`.
-At this tag it lists three plugins:
+At this tag it lists four plugins:
 
 - `harness`, a folder in this repository (`plugins/harness/`). It is the one
   plugin a person installs, and it depends on the other two. It carries the
   setup skill (`/harness:setup`, which also checks and uninstalls), the script
   behind it, the rules default, the override starter and the instance folder
-  template. The guard hooks (`rails`) come in a later change.
+  template.
 - `sdlc`, the skills, from the public skills repository.
 - `ledger-hooks`, the ledger's hooks, from the public ledger repository.
+- `rails`, a folder in this repository (`plugins/rails/`): the guard hooks.
+  `harness` does not depend on it yet, so installing `harness` does not bring
+  it; install it on its own with `claude plugin install rails@harness-core`.
+  See "The rails plugin" below.
 
-Each of the last two is fixed to one full commit id on a release tag, and
-`harness` is fixed by the tag of this repository you add the marketplace at. A
+`sdlc` and `ledger-hooks` are each fixed to one full commit id on a release
+tag, and `harness` and `rails` are fixed by the tag of this repository you add
+the marketplace at. A
 tag of this repository therefore names one tested set; nothing resolves to a
 branch or a range. CI validates both manifests with `claude plugin validate
 --strict` on a pinned Claude Code version (2.1.325), and a test fails when a
@@ -352,6 +358,67 @@ A user's copy of a folder plugin changes only when its `version` string does,
 so raise `version` in `plugins/harness/.claude-plugin/plugin.json` before each
 tag, and move an external plugin's pin (its `ref` and `sha` together) only in
 the marketplace file.
+
+## The rails plugin
+
+`rails` holds guard hooks. At this tag it has one: the destructive-command
+guard, a `PreToolUse` hook on every Bash call.
+
+- **What it denies.** An explicit `rm` whose targets are not literal paths
+  strictly below the current worktree (or a session scratchpad): `/`, `.`,
+  home-folder spellings, `..`, `.git` paths, symlinks, globs, variables, a
+  plain `rm` with no option, an `rm` that carries a redirection, and an `rm`
+  beside a `cd`, `mv`, `ln` or subshell on the same line. A
+  `git worktree remove` with `--force`, or of a tree that no registry or
+  authorization accepts; a linked tree below a temp folder is accepted. An
+  output redirection into an existing path reached through a symlink. Any rm
+  or `git worktree remove` that shares the command with a `$(...)` or
+  backtick substitution, a process substitution, a heredoc or here-string,
+  `eval`, `source` or `.`, `trap`, `alias`, `xargs`, `find -exec`, `env -S`,
+  a shell (`bash -c` and the like) or a command word built from a variable is
+  denied as `removal_beside_<construct>`, without the guard reading inside
+  it; run the removal as its own plain command. A commit or PR message
+  written by a heredoc that mentions rm denies the same way; write the
+  message to a file and use `git commit -F` or `gh … --body-file`. A removal
+  is judged only as a plain command, after `if`, `then`, `do`, groups,
+  subshells and the prefixes `sudo`, `env`, `command`, `exec`, `builtin`,
+  `nice`, `nohup`, `timeout`, `time`, `setsid`, `stdbuf`, `noglob` and
+  `nocorrect`, each also spelled with a directory part (`/usr/bin/env`).
+- **Deny only.** It never allows and never asks. For a command it judged and
+  accepted, or one it has no opinion on, it exits 0 with no output, and
+  Claude Code's own permission flow decides as it would without the plugin.
+  A worktree removal it denies is yours to run by hand, outside Claude Code.
+- **It fails closed.** A missing program, an engine crash, malformed engine
+  output, any engine stderr, an adapter fault or a signal is a deny with a
+  named reason, never silence. The hook runs with `"onFailure": "block"`, so
+  a hook that times out or cannot start also blocks the command (Claude Code
+  2.1.295 or later).
+- **What it needs.** `jq`, `wc`, `tr`, `git` and `grep` in one of
+  `/usr/bin`, `/bin`, `/usr/local/bin`, `/opt/homebrew/bin` or the Linuxbrew
+  bin folder (it never looks them up on `PATH`); `/usr/bin/perl`,
+  `/usr/bin/env` and `/bin/bash`; and, for a worktree removal,
+  `/usr/bin/git`, `/usr/bin/find`, `/usr/bin/readlink` and `/bin/cat`. A
+  missing one denies as `dependency_missing_<name>`, and the reason says where
+  it was looked for.
+- **Dormant unless armed.** Its lane-registry and cleanup-registry rules, and
+  its own log, act only when the delegation loop's variables
+  (`LANE_ROOTS_REGISTRY`, `CLEANUP_ITEMS_REGISTRY`, `SEAT_SCRATCH`) are set;
+  set to a registry that is absent, untrusted or malformed, they deny every
+  removal by name.
+- **What it does not claim.** It is detection, not prevention. It does not
+  see a removal whose name is built indirectly (`$CMD -rf /`), a wrapper it
+  does not list (`chronic`, `ssh`), an interpreter (`python3 -c`), a script
+  file, a git alias, or other deleters (`find -delete`, `rsync --delete`,
+  `git clean`). Its list of commands that repoint a later path is closed and
+  best-effort. Changes between its check and the command running are not
+  seen.
+
+A deny reads `Destructive command guard denied the command (reason=CODE):
+HINT.` The code names the rule or the fault (`unsafe_rm`,
+`unsafe_worktree_remove`, `inherited_git_environment`,
+`dependency_missing_jq`, `engine_timeout`, and so on), and the hint says what
+to do. It never carries the command or a path from it. Known limits are in
+[KNOWN-LIMITS.md](KNOWN-LIMITS.md).
 
 ## The default-tier load probe
 
