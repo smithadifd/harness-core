@@ -5,6 +5,17 @@ and any pin move of the vendored ledger.
 
 ## Unreleased
 
+- The setup skill in the `harness` plugin (`/harness:setup`, with `doctor` and
+  `uninstall`), driving `plugins/harness/setup.py`, which gains two verbs:
+  `ledger-init` makes the first ledger write, which creates the database file
+  when it is absent, and `doctor` reports the placed files, the settings items,
+  the stored ledger options and the database file, and writes nothing. The plan
+  now also lists the lock file, the database and the first ledger write. The
+  ledger options are stored under the names the ledger plugin declares
+  (`ledger_db`, `ledger_operator`, `ledger_harness`); the earlier names would be
+  refused by Claude Code. The CI parts of the four install tests run in the
+  `scripts/tests` suite with no model, and the README now carries a newcomer
+  through install, setup, check and uninstall.
 - `plugins/harness/setup.py`, the plan, apply and remove script for the
   default-tier setup: places the rules default and the override starter,
   proposes deny rules and the sandbox switch, records each addition, and

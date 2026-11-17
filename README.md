@@ -8,9 +8,9 @@ until it is the job.
 This repository is the part of one person's harness that handles it. That
 harness grew over months of daily use. The core is the piece carved out of it so
 that other people can, in time, install a default tier into their own Claude
-Code setup in a safe and controlled way. That install path is being built:
-the marketplace below is its first part. This repository is the first step: the
-shared files, kept separate from everything that belongs to one person.
+Code setup in a safe and controlled way. The install path is described under
+"Install the default tier" below. The repository also holds the shared files,
+kept separate from everything that belongs to one person.
 
 ## Status: alpha
 
@@ -57,7 +57,7 @@ Two sibling repositories are published separately, and both are public:
 | `skills/_lib/*.py`, `skills/_lib/*.json`, `skills/_lib/*.tsv` | modules that resolve the harness root, configuration paths, overrides and model pool settings |
 | `skills/_lib/recall/` | a local full-text index over agent session transcripts, with a guard that refuses private folders |
 | `skills/_lib/ledger/` | the item ledger, itself vendored from the public ledger repository (see below) |
-| `.claude-plugin/marketplace.json`, `plugins/harness/` | the plugin marketplace and the `harness` plugin, including its plan, apply and remove script (see "Install the default tier") |
+| `.claude-plugin/marketplace.json`, `plugins/harness/` | the plugin marketplace and the `harness` plugin, including its setup skill and the script behind it (see "Install the default tier") |
 | `plugins/rails/` | the `rails` plugin: the destructive-command guard hook and its tests (see "The rails plugin") |
 | `scripts/`, `install-profiles/` | two maintenance scripts and an install profile |
 | `skills/_lib/tests/`, `skills/_lib/recall/tests/`, `scripts/tests/` | the tests of the vendored modules |
@@ -105,8 +105,8 @@ At this tag it lists four plugins:
 
 - `harness`, a folder in this repository (`plugins/harness/`). It is the one
   plugin a person installs, and it depends on the other two. It carries the
-  plan, apply and remove script the setup skill will call. The setup skill
-  and the guard hooks (`rails`) come in later changes.
+  setup skill (`/harness:setup`, which also checks and uninstalls), the script
+  behind it, the rules default and the override starter.
 - `sdlc`, the skills, from the public skills repository.
 - `ledger-hooks`, the ledger's hooks, from the public ledger repository.
 - `rails`, a folder in this repository (`plugins/rails/`): the guard hooks.
@@ -125,13 +125,22 @@ also asks the GitHub REST API, with no credential, which commit each external
 plugin's release tag names now, and fails when it is not the pinned commit
 (`scripts/check-marketplace.py --source`).
 
+**Status at this tag.** Setup stores three options on the ledger plugin and
+makes the first ledger write through the ledger plugin's `ledger` command. The
+ledger plugin pinned here (`v0.3.1`) declares no options and ships no `ledger`
+command; `v0.4.0` and later do. Until the pin moves, `/harness:setup` stops at
+its ledger options step with the refusal `claude plugin configure failed`.
+That step runs before any file is placed, so no placed file or setting changes;
+only the empty lock file may appear. Install, update and uninstall work as
+written below.
+
 You need Claude Code, `git`, network access to GitHub, and Python 3.11 or later
 for the ledger's command. The repository must be public or shared with your
-account. Run the commands in a shell, not in a session. Add the marketplace by
-its full URL with `#<tag>`: that form checks out exactly the tag's commit, while
-the bare `owner/repo` form follows the main branch whatever tag you meant. Do
-not add it from a local clone: a plugin installed from a clone is served from
-it, so the clone can never move.
+account. Run the install commands in a shell, not in a session. Add the
+marketplace by its full URL with `#<tag>`: that form checks out exactly the
+tag's commit, while the bare `owner/repo` form follows the main branch whatever
+tag you meant. Do not add it from a local clone: a plugin installed from a
+clone is served from it, so the clone can never move.
 
 ### Install
 
@@ -149,6 +158,73 @@ Claude Code, not this repository, writes the install's records: the
 marketplace's declaration and one `enabledPlugins` entry per plugin in your user
 `settings.json`, and a plugin cache in your Claude folder. Nothing is installed
 outside your Claude folder.
+
+### Set up
+
+In a session, run:
+
+```text
+/harness:setup
+```
+
+The skill asks for the operator name the ledger stamps on what you write, then
+prints a plan: every file it will create, the three ledger options, the command
+that makes the first ledger write, and each optional settings change as the
+exact text to be added. Nothing is written until you answer. You give one yes
+for the files, the ledger options and the first ledger write together, then
+one yes or no for each optional settings change on its own. Saying no to every
+optional change leaves a complete setup. Setup then applies the plan, makes the
+first ledger write, checks the result (the placed files, the stored options and
+the database file) and ends by telling you to start a new session: the ledger's
+options reach a session's commands, and the rules default is read, only when a
+session starts.
+
+If a file is already at the rules default's path, setup stops and writes
+nothing; it never overwrites or merges. If you already have an override file
+at its path, setup leaves it as it is and uninstall leaves it too.
+
+#### What setup writes
+
+These are the files the plan lists, under your home folder. Setup opens no file
+you already had. The plan lists exactly these and the checks in CI fail if a
+setup run writes another.
+
+| Path | What it is |
+|---|---|
+| `.claude/rules/harness.md` | the rules default, which every session and general-purpose subagent reads |
+| `.claude/rules/harness-local.md` | the override starter: HTML comments only, grants nothing, for your own rules |
+| `.claude/plugins/harness-core/harness/setup-record.jsonl` | the record of what setup wrote, which uninstall reads and deletes last |
+| `.claude/harness-setup.lock` | an empty lock file, so two setup runs cannot overlap |
+| `.local/share/ledger/ledger.db` | the ledger database, created by the first ledger write only when it is absent |
+
+Setup also asks Claude Code to store the ledger plugin's three options
+(`ledger_db`, `ledger_operator` and `ledger_harness`), which Claude Code keeps
+in your user `settings.json` and deletes when the plugin is uninstalled.
+
+The optional settings changes are the sandbox switch (`sandbox` set to
+`{"enabled": true}`) and six deny rules that stop the agent reading secret
+files: `Read(.env)`, `Read(.env.*)`, `Read(**/.env)`, `Read(**/.env.*)`,
+`Read(**/*.pem)` and `Read(**/*.key)`. Each is added only when absent, a deny
+rule is appended after the ones you have, nothing you have is changed, removed
+or reordered, and each addition is recorded so uninstall can take out exactly
+it. Setup never proposes anything that grants: no allow rule, no extra
+directory, no automatic permission for sandboxed commands.
+
+The built-in Explore and Plan agents do not read the rules folder, so the rules
+default does not reach them. They are read-only, and the guard hooks will apply
+inside them when `rails` arrives.
+
+### Check the setup
+
+```text
+/harness:setup doctor
+```
+
+It reads and writes nothing. It reports the placed files (unchanged, changed
+since setup, or missing), the settings items setup added, the stored ledger
+options, whether the ledger database file exists, and whether Python 3.11 or
+later and the `ledger` command are found. A line starting `FAIL` is a problem;
+`note` is information.
 
 ### Update to a newer tag
 
@@ -186,9 +262,13 @@ plugin id, for example `ledger-hooks@harness-core`. Start a new session, or run
 
 Three steps, in this order:
 
-1. When the setup skill exists, run its uninstall in a session first: it
-   removes the files setup placed, and no hook runs at uninstall. This
-   skeleton places no file, so there is nothing to remove yet.
+1. In a session, run `/harness:setup uninstall` first. It reads the record of
+   what setup wrote, shows what it will remove, and removes it: the two placed
+   files if they are unchanged since setup, and each settings change it added
+   that is still where it put it. A file you have edited, and a settings item
+   you have moved or changed, is kept and named. The ledger database is kept,
+   and its path is shown, because it is your data. No hook runs at uninstall,
+   which is why this comes first.
 2. In a terminal, uninstall the plugin and the dependencies its install pulled
    in: `claude plugin uninstall harness@harness-core --prune -y`. The `-y` is
    needed when the command is not run from an interactive terminal. Without
@@ -201,13 +281,37 @@ Three steps, in this order:
    dependencies included, and also a plugin you installed on its own.
 
 ```text
+/harness:setup uninstall
 claude plugin uninstall harness@harness-core --prune -y
 claude plugin marketplace remove harness-core
 claude plugin list
 ```
 
-The list then shows none of the three. These uninstall steps were confirmed on
-Claude Code 2.1.325.
+The list then shows none of the three. Steps 2 and 3 were confirmed on Claude
+Code 2.1.325.
+
+#### What is left after uninstall
+
+Claude Code leaves its own plugin cache until its sweep, its plugin
+bookkeeping folders, empty settings keys and session history. What is ours is
+this, and nothing else:
+
+| Path | Why it stays |
+|---|---|
+| `.claude/harness-setup.lock` | the empty lock file, which setup never deletes |
+| `.local/share/ledger/ledger.db` | the ledger database: your data, kept unless you ask for it to be deleted |
+| `.local` | made to hold the database, if it did not exist before |
+| `.local/share` | the same |
+| `.local/share/ledger` | the same |
+
+`.claude` itself stays when setup made it. An override file you edited also
+stays, and uninstall names it.
+
+If you skipped step 1, the two placed files and the record are still there, and
+this is the whole manual cleanup: delete `.claude/rules/harness.md`, delete
+`.claude/rules/harness-local.md` if you have not edited it, and delete the
+folder `.claude/plugins/harness-core/harness`. Any optional settings change
+you approved stays in your user `settings.json` until you remove it.
 
 ### For maintainers: cutting a tag
 

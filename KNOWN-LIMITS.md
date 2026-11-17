@@ -65,3 +65,12 @@ Advice, not a guarantee. The next apply or remove refuses, naming the record and
 - **Configure is not undone.** Its changes stay when apply fails after it, and the refusal says so.
 - **CI runs on Linux only.** No harness-core CI job runs on macOS. Setup uses only portable calls (`flock`, `mkstemp`, `fchmod`, `fsync`, `link`, `os.replace`, `O_NOFOLLOW`, `SIG_DFL`, and `F_FULLFSYNC` only where defined), but it is not tested on macOS in CI.
 - **Settings are re-serialized.** When apply adds an item, or remove takes one out, settings.json is written back as JSON with the indent it had (two spaces when none is found) and a final newline; key order and every value are kept, but other spacing is not.
+
+### Doctor and the first ledger write
+
+- **The first ledger write is not part of apply and is not rolled back.** Apply completes first; `ledger-init` runs after it. If `ledger-init` fails, setup stays applied, `doctor` reports the missing database file, and running `ledger-init` again finishes the job.
+- **An existing database is never written to.** `ledger-init` skips the write when anything is at the default database path, so `doctor` cannot tell a database setup made from one the person already had. It checks that the file exists, is a regular file and is not empty, not that it is sound.
+- **The database path is the person's.** `ledger-init` and `doctor` follow a symlink at the database path or above it, as the ledger command does; the no-symlink rules of apply and remove cover the Claude folder only.
+- **Stored options are read through Claude Code.** `doctor` runs `claude plugin configure ledger-hooks@harness-core --json` and reports what it answers; it does not read them from `settings.json`, and a Claude Code that changes that output makes `doctor` fail by name.
+- **The guards' tools are not checked yet.** `doctor` checks Python 3.11 or later and the `ledger` command; the guard hooks, when they ship, add the tools they need.
+- **Uninstall's preview is `doctor`'s.** It judges each settings item against the current file the way remove does, but a file changed between the two runs is judged again by remove, which keeps what it cannot match.

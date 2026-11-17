@@ -388,8 +388,8 @@ def test_plan_prints_two_files_options_and_items_as_exact_text(tmp_path):
     override = OVERRIDE_SOURCE.read_text(encoding="utf-8").rstrip("\n")
     assert f"FILE {mod.RULES_REL}\n----\n{rules}\n----\n" in done.out
     assert f"FILE {mod.OVERRIDE_REL}\n----\n{override}\n----\n" in done.out
-    values = {"database": str(home / ".local" / "share" / "ledger" / "ledger.db"),
-              "operator": OPERATOR, "harness": HARNESS}
+    values = {"ledger_db": str(home / ".local" / "share" / "ledger" / "ledger.db"),
+              "ledger_operator": OPERATOR, "ledger_harness": HARNESS}
     assert json.dumps(values, indent=2) in done.out
     assert f"claude plugin configure {mod.LEDGER_PLUGIN} --values-stdin" in done.out
     for ident, text in mod.optional_items():
@@ -513,8 +513,8 @@ def test_apply_places_both_files_adds_items_and_records_them(tmp_path):
     assert (bin_dir / "claude-argv").read_text().split() == [
         "plugin", "configure", mod.LEDGER_PLUGIN, "--values-stdin"]
     assert json.loads((bin_dir / "claude-stdin").read_text()) == {
-        "database": str(home / ".local" / "share" / "ledger" / "ledger.db"),
-        "operator": OPERATOR, "harness": HARNESS}
+        "ledger_db": str(home / ".local" / "share" / "ledger" / "ledger.db"),
+        "ledger_operator": OPERATOR, "ledger_harness": HARNESS}
 
 
 def test_apply_keeps_an_existing_override_and_does_not_list_it(tmp_path):
