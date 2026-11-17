@@ -308,7 +308,9 @@ run_policy_command "command substitution feeding rm target" deny removal_beside_
 run_command "conditional compound reaches explicit rm" none 'true && rm -rf ./build'
 run_command "protected rm after conditional" deny 'cd x && rm -rf ~'
 run_command "protected rm after newline" deny $'echo hi\nrm -rf "$HOME"'
-run_command "continued literal rm" none $'rm -rf \\\n./build'
+# A line continuation beside a removal word denies (rule G).
+run_command "continued literal rm" deny $'rm -rf \\\n./build'
+expect_reason "-" "continued literal rm" hidden_separator
 run_command "tab-separated literal rm" none $'rm\t-rf\t./build'
 run_command "ordinary chain across lines" none $'printf hi &&\nprintf bye'
 run_command "heredoc writes data" none $'cat > output.txt <<EOF\nordinary data\nEOF'

@@ -14,12 +14,17 @@
 #   E  kept findings (repointing, prefixes, redirections before the command)
 #   G  >&WORD read as a file target
 #   B3 commands that crashed bash 3.2 on an empty array (run with /bin/bash)
-#   H  shell comments: an unquoted # that begins a word runs to the end of
-#      its line and opens no quote and no line continuation; a # glued to a
-#      closer or an operator, beside a removal word, denies
+#   H  shell comments: the segmenter reads # as text, so a quote or a
+#      trailing backslash in a comment can swallow a separator, which rule G
+#      denies beside a removal word; R1 and R2 also read a comment-skipping
+#      copy, so a comment hides no removal word and no carrier from them
 #   L  line ends: a newline after an even run of backslashes ends the command
 #      (every backslash in the run is escaped); after an odd run it is a line
-#      continuation
+#      continuation, which rule G denies beside a removal word
+#   S  rule G: a removal word beside a ; & | or newline the segmenter consumed
+#      other than as a delimiter (inside quotes, after a backslash, as a line
+#      continuation) denies as hidden_separator; redirection operators are not
+#      separators
 # Each row runs the hook exactly as hooks.json does (env -u BASH_ENV -u ENV
 # /bin/bash --noprofile --norc -p GUARD) with a PreToolUse JSON on stdin, from
 # a worktree with a build folder. X is an absolute path outside the worktree.
@@ -278,25 +283,30 @@ silent B3 'echo "$((1<<2))"'
 silent B3 '()'
 
 printf '%s\n' '== H: shell comments =='
-# H0a and H0b are the top-level codes the comment rows keep.
+# H0a and H0b are the top-level codes. The segmenter reads # as text, so a
+# comment row keeps one only where the comment hides no separator.
 deny H0a unsafe_rm 'rm -rf /etc/hosts'
 deny H0b unsafe_worktree_remove $'cd build\ngit worktree remove --force /etc'
-# A quote or a trailing backslash inside a comment opens nothing.
-deny H1 unsafe_rm $'# Clean the stale cache (it\'s regenerated)\nrm -rf /etc/hosts\n# Don\'t forget to rebuild'
-deny H2 unsafe_rm $'# a "quoted\nrm -rf /etc/hosts\n# word"'
-deny H3 unsafe_rm $'# see C:\\dir\\\nrm -rf /etc/hosts'
-deny H4 unsafe_worktree_remove $'cd build # it\'s here\ngit worktree remove --force /etc\n# that\'s it'
-deny H5 unsafe_rm $'echo start # it\'s time\nrm -rf /etc/hosts\necho done # that\'s all'
-deny H6 unsafe_rm $'true; # it\'s\nrm -rf /etc/hosts; # ok\''
-deny H7 unsafe_rm $'echo hi |# it\'s\nrm -rf /etc/hosts'
-deny H36 unsafe_rm $'true\n# it\'s regenerated\nrm -rf /etc/hosts'
-deny H37 unsafe_rm $'true;# it\'s\nrm -rf /etc/hosts'
-# A comment's own words are not judged.
+# A quote or a trailing backslash inside a comment is read as text: the
+# newline it swallows is a hidden separator (rule G), or a quote that never
+# closes leaves words that cannot be read (unsupported_syntax).
+deny H1 hidden_separator $'# Clean the stale cache (it\'s regenerated)\nrm -rf /etc/hosts\n# Don\'t forget to rebuild'
+deny H2 hidden_separator $'# a "quoted\nrm -rf /etc/hosts\n# word"'
+deny H3 hidden_separator $'# see C:\\dir\\\nrm -rf /etc/hosts'
+deny H4 hidden_separator $'cd build # it\'s here\ngit worktree remove --force /etc\n# that\'s it'
+deny H5 hidden_separator $'echo start # it\'s time\nrm -rf /etc/hosts\necho done # that\'s all'
+deny H6 hidden_separator $'true; # it\'s\nrm -rf /etc/hosts; # ok\''
+deny H7 unsupported_syntax $'echo hi |# it\'s\nrm -rf /etc/hosts'
+deny H36 unsupported_syntax $'true\n# it\'s regenerated\nrm -rf /etc/hosts'
+deny H37 unsupported_syntax $'true;# it\'s\nrm -rf /etc/hosts'
+# A comment with no quote is a word list no validator accepts. An unbalanced
+# quote in one denies beside a removal word; H19 holds none, but its
+# unbalanced $( stops the segmenter, which denies.
 silent H8 '# rm -rf /etc/hosts is not needed here'
-silent H9 $'# don\'t rm the cache'
+deny H9 unsupported_syntax $'# don\'t rm the cache'
 silent H15 "x=1 # it's fine"
-silent H17 $'# it\'s stale\nrm -rf build'
-silent H19 $'echo x # $(\nls'
+deny H17 unsupported_syntax $'# it\'s stale\nrm -rf build'
+deny H19 unsupported_syntax $'echo x # $(\nls'
 deny H18 unsupported_syntax "rm -rf build # it's stale"
 # A # inside a word, after an escape or inside quotes is text.
 deny H10 unsafe_rm 'echo a#b; rm -rf /etc/hosts'
@@ -306,73 +316,91 @@ deny H13 unsafe_rm 'echo ${#x}; rm -rf /etc/hosts'
 deny H14 unsafe_rm 'echo $#; rm -rf /etc/hosts'
 # R2 reads the raw text, comments included: a carrier in a comment counts.
 deny H16 removal_beside_substitution $'# see $(date) for timing\nrm -rf /etc/hosts'
-# Bash reads a # after a blank as text inside these constructs.
+# Bash reads a # after a blank as text inside these constructs, and so does
+# the segmenter. H24's accepted rm is silent, as it is alone (H24t).
 deny H20 path_repointing_subshell '(( 1 # x )); rm -rf /etc/hosts'
 deny H21 unsafe_rm 'for (( i=0; i<0; # x )); do :; done; rm -rf /etc/hosts'
 deny H22 path_repointing_subshell $'shopt -s extglob\necho @(a|(b) # x); rm -rf /etc/hosts'
 deny H23 unsafe_rm 'echo ${HOME// #/Z}; rm -rf /etc/hosts'
-deny H24 unsupported_syntax 'echo ${HOME// #/Z}; rm -rf build'
+silent H24 'echo ${HOME// #/Z}; rm -rf build'
 deny H25 unsafe_rm '[[ a =~ ( #) ]]; rm -rf /etc/hosts'
 deny H26 unsafe_rm 'echo $[ 1 # x ]; rm -rf /etc/hosts'
 deny H38 unsafe_rm $'shopt -s extglob\necho @(a)#x; rm -rf /etc/hosts'
 deny H39 path_repointing_assignment 'x=(a)#b; rm -rf /etc/hosts'
 # A comment that ends in a backslash joins no line, at the top level, in a
-# quoted string for another shell and in a heredoc body.
+# quoted string for another shell and in a heredoc body. The segmenter reads
+# a line continuation there, so H31 denies hidden_separator.
 deny H27 removal_beside_eval $'# x\\\neval rm -rf /etc/hosts'
 deny H28 removal_beside_shell $'# x\\\nsh -c \'rm -rf /etc/hosts\''
 deny H29 removal_beside_shell $'sh -c \'true # x\\\nrm -rf /etc/hosts\''
 deny H30 removal_beside_heredoc $'bash <<\'EOF\'\ntrue # x\\\nrm -rf /etc/hosts\nEOF'
-deny H31 unsafe_rm $'# c\\\nr\\\nm -rf /etc/hosts'
+deny H31 hidden_separator $'# c\\\nr\\\nm -rf /etc/hosts'
 # A quote or $' inside a comment pairs with nothing after it.
 deny H32 removal_beside_env_split $'# it\'s\nenv -S \'rm -rf /etc/hosts\''
 deny H33 removal_beside_env_split $'# it\'s\nenv -S\'rm\\_-rf\\_/etc/hosts\''
 deny H34 removal_beside_variable_command $'# $\'\n$\'\\x72\\x6d\' -rf /etc/hosts'
 deny H35 removal_beside_shell $'bash -c "# $\'\n$\'\\x72\\x6d\' -rf /etc/hosts"'
-# A # glued to a closer or an operator: the guard cannot be sure whether bash
-# starts a comment there ((( 1 ))# and f()# do; @(a)#x is one word), so the #
-# keeps its reading and a command with a removal word denies. Each row's next
-# line runs the removal under bash where the # is a comment.
-deny H40 unsupported_syntax $'(( n++ ))# don\'t care\nrm -rf /etc/hosts\n# that\'s it'
-deny H41 unsupported_syntax $'cleanup()# it\'s here\n{ :; }\nrm -rf /etc/hosts\n# that\'s it'
-deny H42 unsupported_syntax $'(( 1 ))#\'\ngit worktree remove --force /etc\necho \''
-deny H43 unsupported_syntax $'for ((i=0;i<1;i++))#\'\ndo rm -rf /etc/hosts; done\necho \''
-deny H44 unsupported_syntax $'(( 1 ))#"\nrm -rf /etc/hosts\necho "'
-deny H45 unsupported_syntax $'(( 1 ))#\\\nrm -rf /etc/hosts'
-# The spaced form keeps its code; @(a)#x and x=(a)#b keep today's verdicts
-# with no removal word, and deny with one.
-deny H46 path_repointing_subshell $'(( n++ )) # don\'t care\nrm -rf /etc/hosts'
+# A # glued to a closer or an operator: bash starts a comment there ((( 1 ))#
+# and f()# do; @(a)#x is one word). The segmenter reads the # as text, so the
+# quote after it swallows the next line: a hidden separator (rule G), or a
+# quote that never closes (unsupported_syntax). Each row's next line runs
+# the removal under bash.
+deny H40 hidden_separator $'(( n++ ))# don\'t care\nrm -rf /etc/hosts\n# that\'s it'
+deny H41 hidden_separator $'cleanup()# it\'s here\n{ :; }\nrm -rf /etc/hosts\n# that\'s it'
+deny H42 hidden_separator $'(( 1 ))#\'\ngit worktree remove --force /etc\necho \''
+deny H43 hidden_separator $'for ((i=0;i<1;i++))#\'\ndo rm -rf /etc/hosts; done\necho \''
+deny H44 hidden_separator $'(( 1 ))#"\nrm -rf /etc/hosts\necho "'
+deny H45 hidden_separator $'(( 1 ))#\\\nrm -rf /etc/hosts'
+# The spaced form's quote never closes (unsupported_syntax). @(a)#x and
+# x=(a)#b keep their verdicts with no removal word; beside an accepted rm,
+# H49 is silent, as the rm is alone (H49t), and H50 keeps its code.
+deny H46 unsupported_syntax $'(( n++ )) # don\'t care\nrm -rf /etc/hosts'
 silent H47 $'shopt -s extglob\necho @(a)#x'
 silent H48 'x=(a)#b'
-deny H49 unsupported_syntax $'shopt -s extglob\necho @(a)#x; rm -rf build'
+silent H49 $'shopt -s extglob\necho @(a)#x; rm -rf build'
 deny H50 path_repointing_assignment 'x=(a)#b; rm -rf build'
 # One row per closer kind and per operator family, the next line a plain rm.
-deny H51 path_repointing_subshell $'(true)#\'\nrm -rf /etc/hosts\necho \''
-deny H52 unsupported_syntax $'(( 1 ))#\'\nrm -rf /etc/hosts\necho \''
-deny H53 unsupported_syntax $'f()#\'\nrm -rf /etc/hosts\necho \''
-deny H54 unsupported_syntax $'f(){ :; }#\'\nrm -rf /etc/hosts\necho \''
-deny H55 unsupported_syntax $'echo ${HOME}#\'\nrm -rf /etc/hosts\necho \''
-deny H56 unsupported_syntax $'[[ 1 ]]#\'\nrm -rf /etc/hosts\necho \''
-deny H57 unsupported_syntax $'echo \'a\'#\'\nrm -rf /etc/hosts\necho \''
-deny H58 unsupported_syntax $'echo "a"#\'\nrm -rf /etc/hosts\necho \''
-deny H59 unsafe_rm $'true;#\'\nrm -rf /etc/hosts\necho \''
-deny H60 unsafe_rm $'true&#\'\nrm -rf /etc/hosts\necho \''
-deny H61 unsafe_rm $'true&&#\'\nrm -rf /etc/hosts\necho \''
-deny H62 unsafe_rm $'true|#\'\nrm -rf /etc/hosts\necho \''
-deny H63 unsafe_rm $'true||#\'\nrm -rf /etc/hosts\necho \''
-deny H64 unsupported_syntax $'echo >#\'\nrm -rf /etc/hosts\necho \''
-deny H65 unsupported_syntax $'cat <#\'\nrm -rf /etc/hosts\necho \''
-deny H66 path_repointing_subshell $'(#\'\nrm -rf /etc/hosts\necho \')'
-# A line continuation between the closer and the # keeps them glued.
-deny H67 unsupported_syntax $'(( 1 ))\\\n#\'\nrm -rf /etc/hosts\necho \''
-# The ruling's false denies: a glued # beside an accepted rm denies.
-deny H68 unsupported_syntax 'rm -rf build;# done'
-deny H69 unsupported_syntax $'echo \'a\'#b; rm -rf build'
-# With no removal word the verdicts stay; a # inside a plain word or after an
-# escaped operator is text, as before.
+deny H51 hidden_separator $'(true)#\'\nrm -rf /etc/hosts\necho \''
+deny H52 hidden_separator $'(( 1 ))#\'\nrm -rf /etc/hosts\necho \''
+deny H53 hidden_separator $'f()#\'\nrm -rf /etc/hosts\necho \''
+deny H54 hidden_separator $'f(){ :; }#\'\nrm -rf /etc/hosts\necho \''
+deny H55 hidden_separator $'echo ${HOME}#\'\nrm -rf /etc/hosts\necho \''
+deny H56 hidden_separator $'[[ 1 ]]#\'\nrm -rf /etc/hosts\necho \''
+deny H57 hidden_separator $'echo \'a\'#\'\nrm -rf /etc/hosts\necho \''
+deny H58 hidden_separator $'echo "a"#\'\nrm -rf /etc/hosts\necho \''
+deny H59 hidden_separator $'true;#\'\nrm -rf /etc/hosts\necho \''
+deny H60 hidden_separator $'true&#\'\nrm -rf /etc/hosts\necho \''
+deny H61 hidden_separator $'true&&#\'\nrm -rf /etc/hosts\necho \''
+deny H62 hidden_separator $'true|#\'\nrm -rf /etc/hosts\necho \''
+deny H63 hidden_separator $'true||#\'\nrm -rf /etc/hosts\necho \''
+deny H64 hidden_separator $'echo >#\'\nrm -rf /etc/hosts\necho \''
+deny H65 hidden_separator $'cat <#\'\nrm -rf /etc/hosts\necho \''
+deny H66 hidden_separator $'(#\'\nrm -rf /etc/hosts\necho \')'
+# A line continuation between the closer and the #.
+deny H67 hidden_separator $'(( 1 ))\\\n#\'\nrm -rf /etc/hosts\necho \''
+# A glued # beside an accepted rm: silent, as the rm is alone (H68t, H69t).
+silent H68 'rm -rf build;# done'
+silent H69 $'echo \'a\'#b; rm -rf build'
+# With no removal word the verdicts stay. With one, a quote after a # that
+# swallows a newline is a hidden separator (H72, H73), though bash runs no
+# rm there.
 silent H70 $'(( n++ ))# don\'t care\necho ok\n# that\'s it'
 silent H71 $'true;# it\'s fine\necho ok'
-silent H72 $'echo a#\'\nrm -rf /etc/hosts\necho \''
-silent H73 $'echo \\;#\'\nrm -rf /etc/hosts\necho \''
+deny H72 hidden_separator $'echo a#\'\nrm -rf /etc/hosts\necho \''
+deny H73 hidden_separator $'echo \\;#\'\nrm -rf /etc/hosts\necho \''
+# The four relaxations (H24, H49, H68, H69) with /etc/hosts as the target
+# still deny.
+deny H24t unsafe_rm 'echo ${HOME// #/Z}; rm -rf /etc/hosts'
+deny H49t unsafe_rm $'shopt -s extglob\necho @(a)#x; rm -rf /etc/hosts'
+deny H68t unsafe_rm 'rm -rf /etc/hosts;# done'
+deny H69t unsafe_rm $'echo \'a\'#b; rm -rf /etc/hosts'
+# R1 (f) and R2 read their command words from the comment-skipping copy, so
+# a quote or a backslash in a comment hides no pattern command word.
+deny H74 removal_beside_variable_command $'# it\'s\n/bin/s? -c \'f=r; f=${f}m; $f -rf /etc/hosts\''
+deny H75 removal_beside_variable_command $'# it\'s\n/bin/s? -c x'
+deny H76 removal_beside_variable_command $'# x\\\n/bin/s? -c x'
+deny H77 removal_beside_variable_command $'true # x\\\n/bin/s? -c x'
+deny H78 removal_beside_variable_command $'echo hi # it\'s\n/bin/s? -c x'
 
 printf '%s\n' '== L: line ends after a run of backslashes =='
 # An even run: every backslash is escaped, so the newline ends the command and
@@ -384,25 +412,89 @@ deny L4 unsafe_worktree_remove $'echo a\\\\\ngit worktree remove --force /etc'
 deny L5 unsafe_worktree_remove $'echo a\\\\\\\\\ngit worktree remove --force /etc'
 deny L6 unsafe_worktree_remove $'echo a\\\\\\\\\\\\\ngit worktree remove --force /etc'
 deny L7 unsafe_rm $'printf "%s" a\\\\\nrm -rf /etc/hosts'
-# An odd run is a continuation: echo arm -rf /etc/hosts runs echo. Today's
-# verdict, silent, is kept.
-silent L8 $'echo a\\\nrm -rf /etc/hosts'
-silent L9 $'echo a\\\\\\\nrm -rf /etc/hosts'
-silent L10 $'echo a\\\ngit worktree remove --force /etc'
-# An even run inside single quotes is text for echo, and code for sh -c; in a
-# heredoc body it is code for bash.
-silent L11 $'echo \'a\\\\\nrm -rf /etc/hosts\''
+# An odd run is a line continuation: echo arm -rf /etc/hosts runs echo.
+# Beside a removal word a continuation denies (rule G).
+deny L8 hidden_separator $'echo a\\\nrm -rf /etc/hosts'
+deny L9 hidden_separator $'echo a\\\\\\\nrm -rf /etc/hosts'
+deny L10 hidden_separator $'echo a\\\ngit worktree remove --force /etc'
+# An even run inside single quotes is text for echo (a newline inside quotes
+# beside a removal word denies, rule G), and code for sh -c; in a heredoc
+# body it is code for bash.
+deny L11 hidden_separator $'echo \'a\\\\\nrm -rf /etc/hosts\''
 deny L12 removal_beside_shell $'sh -c \'echo a\\\\\nrm -rf /etc/hosts\''
 deny L13 removal_beside_heredoc $'bash <<\'EOF\'\necho a\\\\\nrm -rf /etc/hosts\nEOF'
 # CRLF line ends are refused before any reading.
 deny L14 adapter_input_invalid $'echo a\\\\\r\nrm -rf /etc/hosts'
-# A comment line ending in an odd run joins no line.
-deny L15 unsafe_rm $'# x\\\\\\\nrm -rf /etc/hosts'
+# A comment line ending in an odd run joins no line in bash; the segmenter
+# reads a line continuation there (rule G).
+deny L15 hidden_separator $'# x\\\\\\\nrm -rf /etc/hosts'
 # A heredoc's terminator line that ends in a backslash ends the heredoc (bash
 # joins no line there) and the next line runs; R1's join reads that backslash
 # as a continuation, so the top-level reading is what finds the rm.
 deny L16 removal_beside_heredoc $'cat <<\'E\\\'\nhello\nE\\\nrm -rf /etc/hosts'
 deny L17 removal_beside_heredoc $'cat <<E\\\\\nhello\nE\\\nrm -rf /etc/hosts'
+
+printf '%s\n' '== S: rule G, a separator the segmenter did not split on =='
+# Bypass rows: a quote read differently from bash (a " inside a double-quoted
+# ${...}) swallowed the separator before a removal, and bash runs it. The
+# [[ ]] rows are judged now that # is text, as bash reads it there.
+deny S1 hidden_separator $'echo "${x//\'"\'/}"; rm -rf '"$X"
+deny S2 hidden_separator $'name="${raw//\'"\'/}"\nrm -rf '"$X"$'\necho \'done\''
+deny S3 hidden_separator $'echo "${x//\'"\'/}" && rm -rf '"$X"
+deny S4 hidden_separator $'echo "${x//\'"\'/}"\ngit worktree remove --force ../sibling\necho \'ok\''
+deny S5 hidden_separator $'echo "${x//\'"\'/}"; rm -rf '"$X"$'; echo "${y//\'"\'/}"'
+deny S6 unsafe_rm "[[ a]] =~ ( #) ]]; rm -rf $X"
+deny S7 unsafe_worktree_remove '[[ a]] =~ ( #) ]]; git worktree remove --force ../sibling'
+# A hidden cd: bash runs the cd, so the relative rm names another folder.
+deny S8 path_repointing_cd $'[[ a]] =~ ( #) ]]; cd /\nrm -rf build'
+deny S9 hidden_separator $'echo "${x//\'"\'/}"; cd /; echo "${y//\'"\'/}"\nrm -rf build'
+# Earlier findings: a comment's quote or trailing backslash, an even run of
+# backslashes, a # glued to a closer.
+deny S10 unsupported_syntax $'echo hi # it\'s\nrm -rf '"$X"$'\necho \'done\''
+deny S11 hidden_separator $'echo hi # note \\\nrm -rf '"$X"
+deny S12 unsafe_rm $'echo a\\\\\nrm -rf '"$X"
+deny S13 unsupported_syntax $'(( 1 ))# it\'s\nrm -rf '"$X"
+# One row per state that flags a separator, each before an accepted rm.
+deny S14 hidden_separator $'echo \'a; b\'\nrm -rf build'
+hint_names S14 'run the removal as its own one-line command'
+deny S15 hidden_separator $'echo "a; b"\nrm -rf build'
+deny S16 hidden_separator $'echo $\'a; b\'\nrm -rf build'
+deny S17 hidden_separator $'echo a\\; b\nrm -rf build'
+deny S18 hidden_separator $'rm -rf \\\nbuild'
+deny S19 hidden_separator $'echo "a\\;b"\nrm -rf build'
+deny S20 hidden_separator $'echo $\'a\\;b\'\nrm -rf build'
+# Silent as before: no separator is hidden, and the redirection operators
+# >&, &>, >| and <& are not separators.
+silent S21 'rm -rf build && npm run build 2>&1 | tail -20'
+silent S22 'for d in a b; do rm -rf build; done'
+silent S23 'git rm f.txt'
+silent S24 'docker rm c1'
+silent S25 'rm -rf build && git commit -m "chore: clean"'
+silent S26 'git commit -m "fix: rm stale cache"'
+silent S27 "grep -rn 'rm -rf' scripts/"
+silent S28 'cat <&3 f; rm -rf build'
+silent S29 'rm -rf build; echo x >&2'
+silent S30 'rm -rf build; echo x &>/dev/null'
+silent S31 'rm -rf build; echo x >|out.log'
+# <| is not bash; the command denies as before.
+deny S32 unsupported_syntax 'cat <| f; rm -rf build'
+# Intended denials (KNOWN-LIMITS): a removal word beside a quoted or escaped
+# separator, a multi-line quoted string, or a comment holding a quote.
+deny S33 hidden_separator 'rm -rf build; echo "done; ok"'
+deny S34 hidden_separator "jq '.a | .b' f.json > out.json && rm -rf build"
+deny S35 hidden_separator 'curl -s "https://example.invalid/x?a=1&b=2" -o out && rm -rf build'
+deny S36 hidden_separator 'git commit -m "one" -m "rm the cache; add tests"'
+deny S37 hidden_separator "grep -nE 'unlink|rm' src/x.sh"
+deny S38 hidden_separator 'git log --oneline | grep -iE "worktree|remove"'
+deny S39 hidden_separator 'ssh host "cd x; rm -rf y"'
+deny S40 hidden_separator $'git commit -m "fix: tidy\n\nrm the old file"'
+deny S41 unsupported_syntax $'# don\'t keep it\nrm -rf build'
+deny S42 hidden_separator $'git rm -r --cached dist && git commit -m "chore: untrack dist\n\nBody text"'
+deny S43 hidden_separator $'npm rm lodash && git commit -m "chore: drop lodash\n\nBody text"'
+deny S44 hidden_separator 'docker rm c1 && echo "a;b"'
+# R2 also takes its tokens from the text with every backslash deleted, so a
+# carrier after an even run of backslashes is found without the line join.
+deny S45 removal_beside_eval $'echo a\\\\\neval rm -rf build'
 
 if [ -d "$WORKTREE/build" ] && [ -f "$WORKTREE/build/x" ]; then pass "fixtures remained present"; else fail "a fixture was executed"; fi
 

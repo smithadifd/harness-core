@@ -308,10 +308,12 @@ run_case "inside a continued word, plain" deny "$PRIMARY" $'git worktree remove 
 run_case "inside a continued word, double quotes" deny "$PRIMARY" $'git worktree remove "--for\\\nce" '"$WT"
 run_case "continuation joins the halves of a word, plain" deny "$PRIMARY" $'git wor\\\nktree remove --force '"$WT"
 run_case "continuation joins the halves of a word, double quotes" deny "$PRIMARY" $'git "wor\\\nktree" remove --force '"$WT"
-run_case "continuation joins the halves of a mention" no_opinion "$PRIMARY" $'echo git wor\\\nktree remove --force '"$WT"
+# Beside a removal word, a line continuation or an operator inside quotes
+# denies (rule G): the segmenter does not split there.
+run_case "continuation joins the halves of a mention" deny/hidden_separator "$PRIMARY" $'echo git wor\\\nktree remove --force '"$WT"
 run_case "; inside single quotes does not split" no_opinion "$PRIMARY" "echo 'a;b'; true"
-run_case "operators inside single quotes do not split" no_opinion "$PRIMARY" "echo 'a && $F | b'"
-run_case "operators inside double quotes do not split" no_opinion "$PRIMARY" "echo \"a && $F | b\""
+run_case "operators inside single quotes do not split" deny/hidden_separator "$PRIMARY" "echo 'a && $F | b'"
+run_case "operators inside double quotes do not split" deny/hidden_separator "$PRIMARY" "echo \"a && $F | b\""
 run_case "escaped quote does not open a string" deny "$PRIMARY" "echo \\\"; $F"
 run_case "removal after a closed quote pair" deny "$PRIMARY" "echo 'a' \"b\"; $F"
 run_case "escaped quote inside double quotes before forced removal" deny "$PRIMARY" "echo \"a\\\"b\"; $F"

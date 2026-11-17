@@ -21,12 +21,20 @@
 #
 # Accepted Bash language: simple-command segments made from literal words and
 # conventional single/double quoting. Newlines and ordinary shell separators
-# delimit segments; heredoc bodies are data. A comment (an unquoted # that
-# begins a word) runs to the end of its line, as in bash, and opens no quote
-# and no line continuation (split_command_segments). A finite known-wrapper
-# grammar is normalized before matching. This is detection, not prevention: an
-# unlisted exec wrapper (for example, a user-installed chronic) can make rm
-# invisible.
+# delimit segments; heredoc bodies are data. The segmenter reads # as text
+# (split_command_segments), so it reads more of a command than bash runs,
+# never less. Rule G, the invariant: a command that holds a removal word is
+# judged only when every ;, &, | and newline in it ended a segment and no
+# text was dropped. A ; & | or newline consumed inside quotes, after a
+# backslash or as a line continuation denies as hidden_separator
+# (run_policy), so a wrong quote state can only split a command too much,
+# never too little. The redirection operators >&, &>, >|, <& and <| are not
+# separators. A separator inside a $( ) span or a heredoc body is not
+# flagged; that is safe only because $(, backticks, <( or >( and << are
+# carriers R2 finds in the raw text before any segment is judged. A finite
+# known-wrapper grammar is normalized before matching. This is detection,
+# not prevention: an unlisted exec wrapper (for example, a user-installed
+# chronic) can make rm invisible.
 # A removal word (rm, or git worktree remove) anywhere in the command text,
 # heredoc bodies included, beside any code-carrying construct denies without
 # the guard reading inside that construct (removal_word_in_text and
@@ -415,6 +423,7 @@ deny_hint() {
     unsafe_rm) DENY_HINT='an rm target is not a literal path strictly below the current worktree or the named session scratchpad; spell a worktree target relative to the current folder, because an absolute home path is refused by spelling' ;;
     unsafe_worktree_remove) DENY_HINT='git worktree remove must name exactly one registered or authorized worktree and never --force; otherwise run the removal yourself, outside Claude Code' ;;
     unsupported_syntax) DENY_HINT='the command is over 6000 bytes or has an unbalanced substitution or quote; split or shorten it' ;;
+    hidden_separator) DENY_HINT='this command mentions a removal and holds a quoted or escaped separator or a line continuation; run the removal as its own one-line command, and put any text that mentions it in a file' ;;
     unsupported_rm_prefix) DENY_HINT='rm reached through a wrapper or xargs; write the rm bare with literal targets' ;;
     path_repointing_subshell|path_repointing_assignment|path_repointing_ln|path_repointing_mv|path_repointing_cd|path_repointing_pushd|path_repointing_popd|path_repointing_mkdir|path_repointing_mount|path_repointing_cp_symlink) DENY_HINT='a cd, mv, ln, mkdir, eval, subshell or substitution shares the line with a recursive rm; run the rm alone' ;;
     removal_beside_substitution) DENY_HINT='an rm or git worktree remove shares the command with a $(...) substitution, which the guard does not read inside; run the removal as its own plain command; for a commit or PR message that mentions it, write the message to a file and use git commit -F or gh --body-file' ;;
@@ -680,36 +689,23 @@ collect_heredocs() {
   done
 }
 
-# Comments follow bash's rule. An unquoted # that begins a word (at the start
-# of the text, or after a blank, a newline or one of ; & | ( )) starts a
-# comment that runs to the end of its line: its text opens no quote, no line
-# continuation, no heredoc and no substitution, and the newline after it still
-# ends the segment. The comment stays in its segment as a lone #, so a
-# trailing comment on a judged command keeps that command's verdict (the
-# validators refuse #). A # inside a word (a#b, ${#x}, $#, @(a)#x), after an
-# escape or inside quotes is text. Bash reads a # after a blank as text inside
-# an arithmetic (( )) or $[ ], a ${ } expansion, a [[ ]] test, an extglob or
-# array group glued to a word (@( ), x=( ), a[ ]) and a glob bracket; there
-# the # is read as text, as before, and COMMENT_AMBIGUOUS is set, which denies
-# the command when it holds a removal word (run_policy).
-# Where a # is glued to the character before it, the word-start reading below
-# is certain only inside a plain word (a#b is text). After a closer or an
-# operator it is not: bash reads (( 1 ))# and f()# as a comment start but
-# @(a)#x and x=(a)#b as one word. So a # directly after any ), } or ], a
-# closing quote, or one of ; & | < > ( keeps the reading below (comment or
-# text, as before) and also sets COMMENT_AMBIGUOUS. A # after a blank or a
-# newline, and a # inside a plain word, are the certain cases.
-COMMENT_AMBIGUOUS=0
+# The top-level segmenter. A # is text here, like any other character, so the
+# segmenter reads more of a command than bash runs, never less: a comment's
+# words are read as command words.
+# Rule G (G1): HIDDEN_SEPARATOR is set to 1 when a ;, &, | or newline is
+# consumed other than as a segment delimiter: inside single, $'...' or double
+# quotes, after a backslash, or as a line continuation. The redirection
+# operators >&, <&, &>, >| and <| are not separators and do not set it, so
+# 2>&1 does not. A ; & | or newline inside a $( ) span (skip_paren) or a
+# heredoc body is not flagged: that is safe only because $(, backticks, <( or
+# >( and << are carriers that R2 finds in the raw text before any segment is
+# judged. run_policy reads the flag (G2).
+HIDDEN_SEPARATOR=0
 split_command_segments() {
   local input="$1" length i=0 j k ch next state="plain" segment="" header="" line delimiter redirect_open=0 redirect_before=0
-  # word_start is 1 where an unquoted # would begin a word; parens, brackets
-  # and braces count the open constructs in which bash reads # as text.
-  # glued is 1 right after a closer or an operator (see above), and
-  # glued_before is its value before the character the plain pass reads.
-  local word_start=1 parens=0 brackets=0 braces=0 glued=0 glued_before=0
   SEGMENTS=()
   SEGMENT_DELIMITERS=()
-  COMMENT_AMBIGUOUS=0
+  HIDDEN_SEPARATOR=0
   length=${#input}
   while [ "$i" -lt "$length" ]; do
     ch="${input:$i:1}"
@@ -717,7 +713,158 @@ split_command_segments() {
     case "$state" in
       single)
         segment="$segment$ch"
-        if [ "$ch" = "'" ]; then state="plain"; glued=1; fi
+        case "$ch" in
+          "'") state="plain" ;;
+          ';'|'&'|'|'|$'\n') HIDDEN_SEPARATOR=1 ;;
+        esac
+        i=$((i + 1))
+        ;;
+      ansi)
+        if [ "$ch" = "\\" ] && [ -n "$next" ]; then
+          case "$next" in ';'|'&'|'|'|$'\n') HIDDEN_SEPARATOR=1 ;; esac
+          segment="$segment$ch$next"; i=$((i + 2))
+        else
+          segment="$segment$ch"
+          case "$ch" in
+            "'") state="plain" ;;
+            ';'|'&'|'|'|$'\n') HIDDEN_SEPARATOR=1 ;;
+          esac
+          i=$((i + 1))
+        fi
+        ;;
+      double)
+        if [ "$ch" = "\\" ] && [ -n "$next" ]; then
+          case "$next" in ';'|'&'|'|'|$'\n') HIDDEN_SEPARATOR=1 ;; esac
+          if [ "$next" != $'\n' ]; then segment="$segment$ch$next"; fi
+          i=$((i + 2))
+        elif [ "$ch" = '$' ] && [ "$next" = '(' ]; then
+          skip_paren "$input" $((i + 2)) || policy_deny unsupported_syntax
+          segment="$segment${input:i:SKIP_END-i}"
+          i="$SKIP_END"
+        else
+          segment="$segment$ch"
+          case "$ch" in
+            '"') state="plain" ;;
+            ';'|'&'|'|'|$'\n') HIDDEN_SEPARATOR=1 ;;
+          esac
+          i=$((i + 1))
+        fi
+        ;;
+      plain)
+        # redirect_open is 1 right after an unquoted, unescaped < or >.
+        redirect_before="$redirect_open"
+        redirect_open=0
+        case "$ch" in
+          '$')
+            if [ "$next" = '(' ]; then
+              skip_paren "$input" $((i + 2)) || policy_deny unsupported_syntax
+              segment="$segment${input:i:SKIP_END-i}"
+              i="$SKIP_END"
+            elif [ "$next" = "'" ]; then
+              segment="$segment$ch$next"; state="ansi"; i=$((i + 2))
+            else
+              segment="$segment$ch"; i=$((i + 1))
+            fi
+            ;;
+          "'"|'"') segment="$segment$ch"; state=$([ "$ch" = "'" ] && printf single || printf double); i=$((i + 1)) ;;
+          "\\")
+            if [ "$next" = $'\n' ]; then
+              # A line continuation joins the two lines with nothing between.
+              HIDDEN_SEPARATOR=1
+              i=$((i + 2))
+            elif [ -n "$next" ]; then
+              # An escaped character never opens a quote or ends a segment.
+              case "$next" in ';'|'&'|'|') HIDDEN_SEPARATOR=1 ;; esac
+              segment="$segment$ch$next"; i=$((i + 2))
+            else
+              segment="$segment$ch"; i=$((i + 1))
+            fi
+            ;;
+          ';') header="$header$segment;"; SEGMENT_DELIMITERS[${#SEGMENTS[@]}]=';'; SEGMENTS[${#SEGMENTS[@]}]="$segment"; segment=""; i=$((i + 1)) ;;
+          '&')
+            if [ "$redirect_before" -eq 1 ] || [ "$next" = '>' ]; then
+              # `>&N`, `<&N`, `&>FILE` and `&>>FILE` are redirection
+              # operators, not a separator: the command they decorate goes on.
+              segment="$segment$ch"; i=$((i + 1))
+              continue
+            fi
+            if [ "$next" = '&' ]; then header="$header$segment&&"; SEGMENT_DELIMITERS[${#SEGMENTS[@]}]='&&'; i=$((i + 2)); else header="$header$segment&"; SEGMENT_DELIMITERS[${#SEGMENTS[@]}]='&'; i=$((i + 1)); fi
+            SEGMENTS[${#SEGMENTS[@]}]="$segment"
+            segment=""
+            ;;
+          '|')
+            if [ "$redirect_before" -eq 1 ]; then
+              # `>|` is one redirection operator, not a pipe.
+              segment="$segment$ch"; i=$((i + 1))
+              continue
+            fi
+            if [ "$next" = '|' ]; then header="$header$segment||"; SEGMENT_DELIMITERS[${#SEGMENTS[@]}]='||'; i=$((i + 2)); else header="$header$segment|"; SEGMENT_DELIMITERS[${#SEGMENTS[@]}]='|'; i=$((i + 1)); fi
+            SEGMENTS[${#SEGMENTS[@]}]="$segment"
+            segment=""
+            ;;
+          $'\n')
+            SEGMENT_DELIMITERS[${#SEGMENTS[@]}]=$'\n'
+            SEGMENTS[${#SEGMENTS[@]}]="$segment"
+            collect_heredocs "$header$segment"
+            segment=""
+            header=""
+            i=$((i + 1))
+            k=0
+            while [ "$k" -lt "${#HEREDOC_DELIMS[@]}" ]; do
+              delimiter="${HEREDOC_DELIMS[$k]}"
+              while [ "$i" -lt "$length" ]; do
+                j="$i"
+                while [ "$j" -lt "$length" ] && [ "${input:$j:1}" != $'\n' ]; do j=$((j + 1)); done
+                line="${input:$i:$((j - i))}"
+                [ "${HEREDOC_STRIP_TABS[$k]}" -eq 0 ] || while [ "${line#$'\t'}" != "$line" ]; do line="${line#$'\t'}"; done
+                i="$j"
+                [ "$i" -ge "$length" ] || i=$((i + 1))
+                [ "$line" = "$delimiter" ] && break
+              done
+              k=$((k + 1))
+            done
+            ;;
+          *)
+            segment="$segment$ch"; i=$((i + 1))
+            case "$ch" in '<'|'>') redirect_open=1 ;; esac
+            ;;
+        esac
+        ;;
+    esac
+  done
+  SEGMENTS[${#SEGMENTS[@]}]="$segment"
+}
+
+# R1 and R2's comment-skipping reading (top_level_text, collect_command_words):
+# a private copy of the segmenter as it read comments before rule G. An
+# unquoted # that begins a word (at the start of the text, or after a blank, a
+# newline or one of ; & | ( )) starts a comment that runs to the end of its
+# line: its text opens no quote, no line continuation, no heredoc and no
+# substitution, and the newline after it still ends the segment. The comment
+# stays in its segment as a lone #. A # inside a word (a#b, ${#x}, $#,
+# @(a)#x), after an escape or inside quotes is text, and so is a # after a
+# blank inside an arithmetic (( )) or $[ ], a ${ } expansion, a [[ ]] test, an
+# extglob or array group glued to a word (@( ), x=( ), a[ ]) or a glob
+# bracket. R1 is true when any of its readings finds a removal word, so this
+# reading can only add denies; the segmenter that judges commands reads # as
+# text. Like split_command_segments it writes SEGMENTS and SEGMENT_DELIMITERS:
+# run_policy splits again after R1 and R2 run, and copies the segments before
+# judging them.
+split_segments_skipping_comments() {
+  local input="$1" length i=0 j k ch next state="plain" segment="" header="" line delimiter redirect_open=0 redirect_before=0
+  # word_start is 1 where an unquoted # would begin a word; parens, brackets
+  # and braces count the open constructs in which bash reads # as text.
+  local word_start=1 parens=0 brackets=0 braces=0
+  SEGMENTS=()
+  SEGMENT_DELIMITERS=()
+  length=${#input}
+  while [ "$i" -lt "$length" ]; do
+    ch="${input:$i:1}"
+    next="${input:$((i + 1)):1}"
+    case "$state" in
+      single)
+        segment="$segment$ch"
+        if [ "$ch" = "'" ]; then state="plain"; fi
         i=$((i + 1))
         ;;
       ansi)
@@ -725,7 +872,7 @@ split_command_segments() {
           segment="$segment$ch$next"; i=$((i + 2))
         else
           segment="$segment$ch"
-          if [ "$ch" = "'" ]; then state="plain"; glued=1; fi
+          if [ "$ch" = "'" ]; then state="plain"; fi
           i=$((i + 1))
         fi
         ;;
@@ -739,7 +886,7 @@ split_command_segments() {
           i="$SKIP_END"
         else
           segment="$segment$ch"
-          if [ "$ch" = '"' ]; then state="plain"; glued=1; fi
+          if [ "$ch" = '"' ]; then state="plain"; fi
           i=$((i + 1))
         fi
         ;;
@@ -747,15 +894,12 @@ split_command_segments() {
         # redirect_open is 1 right after an unquoted, unescaped < or >.
         redirect_before="$redirect_open"
         redirect_open=0
-        glued_before="$glued"
-        glued=0
         case "$ch" in
           '$')
             if [ "$next" = '(' ]; then
               skip_paren "$input" $((i + 2)) || policy_deny unsupported_syntax
               segment="$segment${input:i:SKIP_END-i}"
               i="$SKIP_END"
-              glued=1
             elif [ "$next" = "'" ]; then
               segment="$segment$ch$next"; state="ansi"; i=$((i + 2))
             elif [ "$next" = '{' ]; then
@@ -770,9 +914,8 @@ split_command_segments() {
           "'"|'"') segment="$segment$ch"; state=$([ "$ch" = "'" ] && printf single || printf double); i=$((i + 1)); word_start=0 ;;
           "\\")
             if [ "$next" = $'\n' ]; then
-              # A line continuation joins the two lines with nothing between,
-              # so the character after it is glued to the one before it.
-              i=$((i + 2)); glued="$glued_before"
+              # A line continuation joins the two lines with nothing between.
+              i=$((i + 2))
             elif [ -n "$next" ]; then
               # An escaped character never opens a quote or ends a segment.
               segment="$segment$ch$next"; i=$((i + 2)); word_start=0
@@ -781,20 +924,17 @@ split_command_segments() {
             fi
             ;;
           '#')
-            [ "$glued_before" -eq 0 ] || COMMENT_AMBIGUOUS=1
             if [ "$word_start" -eq 1 ] && [ $((parens + brackets + braces)) -eq 0 ]; then
               # A comment: skip to the newline, which the next pass reads.
               segment="$segment#"
               while [ "$i" -lt "$length" ] && [ "${input:$i:1}" != $'\n' ]; do i=$((i + 1)); done
             else
-              [ "$word_start" -eq 0 ] || COMMENT_AMBIGUOUS=1
               segment="$segment$ch"; i=$((i + 1)); word_start=0
             fi
             ;;
-          ';') header="$header$segment;"; SEGMENT_DELIMITERS[${#SEGMENTS[@]}]=';'; SEGMENTS[${#SEGMENTS[@]}]="$segment"; segment=""; i=$((i + 1)); word_start=1; glued=1 ;;
+          ';') header="$header$segment;"; SEGMENT_DELIMITERS[${#SEGMENTS[@]}]=';'; SEGMENTS[${#SEGMENTS[@]}]="$segment"; segment=""; i=$((i + 1)); word_start=1 ;;
           '&')
             word_start=1
-            glued=1
             if [ "$redirect_before" -eq 1 ] || [ "$next" = '>' ]; then
               # `>&N`, `<&N`, `&>FILE` and `&>>FILE` are redirection
               # operators, not a separator: the command they decorate goes on.
@@ -807,7 +947,6 @@ split_command_segments() {
             ;;
           '|')
             word_start=1
-            glued=1
             if [ "$redirect_before" -eq 1 ]; then
               # `>|` is one redirection operator, not a pipe.
               segment="$segment$ch"; i=$((i + 1))
@@ -849,23 +988,22 @@ split_command_segments() {
                 # one of them open a group; a lone ( at a word start is a
                 # subshell, where # comments as usual.
                 if [ "$parens" -gt 0 ] || [ "$word_start" -eq 0 ] || [ "$next" = '(' ]; then parens=$((parens + 1)); fi
-                word_start=1; glued=1 ;;
+                word_start=1 ;;
               ')')
                 # The ) that closes a counted group is inside its word (bash
                 # reads @(a)#x and x=(a)#b as one word), so a # right after it
-                # is text; after (( )) and f() that reads more than bash does,
-                # which glued makes fail closed. Any other ) is an operator.
+                # is text. Any other ) is an operator.
                 if [ "$parens" -gt 0 ]; then parens=$((parens - 1)); word_start=0; else word_start=1; fi
-                glued=1 ;;
+                ;;
               '[')
                 # [[ at a word start and a [ glued to a word open a group; a
                 # lone [ at a word start is the test command.
                 if [ "$brackets" -gt 0 ] || [ "$word_start" -eq 0 ] || [ "$next" = '[' ]; then brackets=$((brackets + 1)); fi
                 word_start=0 ;;
-              ']') [ "$brackets" -eq 0 ] || brackets=$((brackets - 1)); word_start=0; glued=1 ;;
+              ']') [ "$brackets" -eq 0 ] || brackets=$((brackets - 1)); word_start=0 ;;
               '{') [ "$braces" -eq 0 ] || braces=$((braces + 1)); word_start=0 ;;
-              '}') [ "$braces" -eq 0 ] || braces=$((braces - 1)); word_start=0; glued=1 ;;
-              '<'|'>') redirect_open=1; word_start=0; glued=1 ;;
+              '}') [ "$braces" -eq 0 ] || braces=$((braces - 1)); word_start=0 ;;
+              '<'|'>') redirect_open=1; word_start=0 ;;
               *) word_start=0 ;;
             esac
             ;;
@@ -876,7 +1014,8 @@ split_command_segments() {
   SEGMENTS[${#SEGMENTS[@]}]="$segment"
 }
 
-# The command as bash reads it at the top level: the segments with their
+# The command as R1 and R2 read it at the top level: the segments of the
+# comment-skipping reading (split_segments_skipping_comments) with their
 # delimiters, comments reduced to # and line continuations joined, heredoc
 # bodies left out. R1 and R2 read it beside the raw text. A newline delimiter
 # is written after a blank, so R1's line join can never read a segment that
@@ -885,7 +1024,7 @@ split_command_segments() {
 TOP_LEVEL_TEXT=""
 top_level_text() { # TEXT
   local k=0 out="" nl=$'\n'
-  split_command_segments "$1"
+  split_segments_skipping_comments "$1"
   while [ "$k" -lt "${#SEGMENTS[@]}" ]; do
     if [ "${SEGMENT_DELIMITERS[$k]-}" = "$nl" ]; then
       out="$out${SEGMENTS[$k]} $nl"
@@ -3222,6 +3361,8 @@ judge_worktree_segment() {
 # any code-carrying construct (find_carrier) denies as removal_beside_<class>
 # without the guard reading inside that construct: substitutions, heredocs,
 # eval, a shell and the rest are where every earlier bypass came from. A
+# removal word beside a ; & | or newline the segmenter did not split on
+# denies as hidden_separator (rule G, run_policy). A
 # removal word with no carrier is judged as plain top-level commands. All of
 # this reads the command as text; it never runs, sources or expands it, and it
 # forks nothing.
@@ -3877,8 +4018,9 @@ r1_unreadable_pattern_group() { # TEXT
 }
 
 # The command words of TEXT, for R1 (f), the source carrier's . and the
-# variable_command carrier. For each top-level segment (heredoc bodies are not
-# segments) with its control openers and redirections removed: the first raw
+# variable_command carrier. For each top-level segment of the comment-skipping
+# reading (split_segments_skipping_comments; heredoc bodies are not segments)
+# with its control openers and redirections removed: the first raw
 # word that is not an assignment, and the raw word at PREFIX_INDEX after the
 # known prefixes (only the first when prefix skipping fails). A segment that
 # begins with (( is an arithmetic command and has none.
@@ -3890,7 +4032,7 @@ collect_command_words() { # TEXT
   local -a segs raw deq
   CMD_WORDS_RAW=()
   CMD_WORDS_DEQ=()
-  split_command_segments "$1"
+  split_segments_skipping_comments "$1"
   segs=(${SEGMENTS[@]+"${SEGMENTS[@]}"})
   for segment in ${segs[@]+"${segs[@]}"}; do
     trim_horizontal "$segment"
@@ -3951,15 +4093,23 @@ command_word_is_pattern() { # RAW
   return 1
 }
 
-# R1: true when TEXT holds a removal word. The word tests read the raw text,
-# the top-level reading of every command (top_level_text), and, when the text
-# holds a #, the comment-continuation reading (r1_split_comment_continuations);
-# (f) reads the top-level segments. The top-level reading finds a removal word
+# R1: true when TEXT holds a removal word. R1 is a union of readings and is
+# true when any of them finds one. The word tests read the raw text; when it
+# holds a backslash, the text with every backslash deleted and every newline
+# kept (a reading that needs no lexer and no line join); the top-level
+# reading of every command (top_level_text), which skips comments; and, when
+# the text holds a #, the comment-continuation reading
+# (r1_split_comment_continuations). (f) reads the top-level segments of the
+# same comment-skipping reading. The top-level reading finds a removal word
 # the segmenter reads as a command word even where R1's line join reads the
-# raw text wrongly.
+# raw text wrongly. Rule G (run_policy) is gated on R1, so a reading is only
+# ever added here, never taken away.
 removal_word_in_text() { # TEXT
   local text="$1" k
   r1_word_tests "$text" && return 0
+  case "$text" in
+    *"\\"*) r1_word_tests "${text//\\/}" && return 0 ;;
+  esac
   case "$text" in
     *'#'*)
       r1_split_comment_continuations "$text"
@@ -4011,6 +4161,8 @@ r1_word_tests() { # TEXT
 # R2: sets CARRIER_CLASS to the first code-carrying construct of TEXT, in this
 # order, and returns 1 when it has none. Every token match is in any letter
 # case. CARRIER_CLASS is assigned only from these literals. When TEXT holds a
+# backslash, the tokens also come from the text with every backslash deleted
+# and every newline kept. When TEXT holds a
 # #, the tokens also come from the comment-continuation and top-level
 # readings, and the env split is also read in the top-level one, so a comment
 # cannot glue a carrier word to its line or hide it in a quote it opens.
@@ -4029,6 +4181,14 @@ find_carrier() { # TEXT
   r1_split_parameter_operators "$R1_NORMALIZED"
   r1_tokenize "$R1_OPSPLIT"
   toks=(${R1_TOKENS[@]+"${R1_TOKENS[@]}"})
+  case "$text" in
+    *"\\"*)
+      r1_normalize "${text//\\/}"
+      r1_split_parameter_operators "$R1_NORMALIZED"
+      r1_tokenize "$R1_OPSPLIT"
+      toks+=(${R1_TOKENS[@]+"${R1_TOKENS[@]}"})
+      ;;
+  esac
   case "$text" in
     *'#'*)
       r1_split_comment_continuations "$text"
@@ -4164,7 +4324,7 @@ deny_unsafe_redirections() {
 MAX_COMMAND_CHARS=6000
 
 run_policy() {
-  local normalized command_raw command_len segment raw_segment saw_explicit=0 saw_worktree=0 saw_rm=0 saw_temp_only=0 all_accepted=1 command_has_rm=0 index detect_segment stripped segment_index comment_ambiguous
+  local normalized command_raw command_len segment raw_segment saw_explicit=0 saw_worktree=0 saw_rm=0 saw_temp_only=0 all_accepted=1 command_has_rm=0 index detect_segment stripped segment_index hidden_separator
   local rm_segments=()
   local -a judged
   [ "$ARG_ERROR" -eq 0 ] || policy_deny invalid_configuration
@@ -4212,8 +4372,9 @@ run_policy() {
   # scope; find -delete, rsync --delete and git clean remain outside this
   # policy's charter.
   split_command_segments "$command_raw"
-  # Judging splits other text, so the top-level split's flag is kept here.
-  comment_ambiguous="$COMMENT_AMBIGUOUS"
+  # Judging splits other text, so the top-level split's rule G flag is kept
+  # here.
+  hidden_separator="$HIDDEN_SEPARATOR"
   index=0
   while [ "$index" -lt "${#SEGMENTS[@]}" ]; do
     segment="${SEGMENTS[$index]}"
@@ -4326,9 +4487,11 @@ run_policy() {
   if [ "$saw_temp_only" -eq 1 ] && { [ "$all_accepted" -eq 0 ] || [ "$saw_rm" -eq 1 ]; }; then
     policy_deny unsafe_worktree_remove
   fi
-  # A # at a word start inside a construct where bash may read it as text
-  # (split_command_segments): the removal word cannot be placed, so deny.
-  [ "$comment_ambiguous" -eq 0 ] || policy_deny unsupported_syntax
+  # Rule G (G2): a removal word, and a ; & | or newline that the top-level
+  # split consumed other than as a delimiter (split_command_segments): bash
+  # may end a command there that the guard did not judge, so deny. unsafe_rm
+  # and the path_repointing_ codes keep precedence where they fire first.
+  [ "$hidden_separator" -eq 0 ] || policy_deny hidden_separator
   [ "$saw_explicit" -eq 1 ] || policy_no_opinion
   [ "$all_accepted" -eq 1 ] || policy_no_opinion
   # A worktree removal can accept only worktree removals, never an rm.

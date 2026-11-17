@@ -86,7 +86,13 @@ n2 "named scratchpad descendant" "rm -rf $SCRATCHPAD/cache"
 for rm_spelling in /bin/rm /usr/bin/rm ./rm ../bin/rm 'command rm' 'exec rm' 'env rm' 'sudo rm' 'nohup rm' 'nice rm'; do
   n2 "$rm_spelling literal descendant" "$rm_spelling -rf ./build"
 done
-n2 "continued literal rm" $'rm -rf \\\n./build'
+# The source accepted a line continuation inside a literal rm; rule G now
+# denies it, since a continuation beside a removal word can hide a separator.
+out="$(payload $'rm -rf \\\n./build' | /bin/bash --noprofile --norc -p "$GUARD" --scratchpad "$SCRATCHPAD" --authorized-worktree "$DISPOSABLE" 2>/dev/null)"
+case "$out" in
+  *'"permissionDecision":"deny"'*'(reason=hidden_separator)'*) pass "N2 continued literal rm: deny/hidden_separator (rule G)" ;;
+  *) fail "N2 continued literal rm: expected deny/hidden_separator, got ${out:0:160}" ;;
+esac
 n2 "tab-separated literal rm" $'rm\t-rf\t./build'
 n2 "leading negation operator with literal descendant" '! rm -rf ./build'
 n2 "assignment prefix with literal descendant" 'FOO=1 rm -rf ./build'
