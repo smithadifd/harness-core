@@ -11,12 +11,11 @@ When a suite fails, the message also names the host's stat (the first line
 of its --version answer, or that it rejects the flag), because the guard's
 registry and identity checks depend on which stat the host has.
 
-A second test reads the plugin's manifest and hooks file and checks the
-fields the hook entry test (H1, in the dependencies suite) does not.
+The plugin's manifest and hooks file, which now also carry the git guard,
+are checked in test_rails_manifest.py.
 """
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 from pathlib import Path
@@ -78,28 +77,3 @@ def test_suite_passes(suite, tmp_path):
     assert done.returncode == 0, f"{suite} exited {done.returncode} (host stat: {host_stat_banner()})\n{tail}"
     assert not failed, f"host stat: {host_stat_banner()}\n" + "\n".join(failed[:40])
     assert passed, f"{suite} printed no PASS line\n{tail}"
-
-
-def test_plugin_manifest_and_hooks_fields():
-    manifest = json.loads((PLUGIN / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
-    assert manifest == {
-        "name": "rails",
-        "version": "0.1.0",
-        "description": "Guard hooks that deny destructive shell commands. Deny only: no hook in this plugin ever allows.",
-        "author": {"name": "harness-core maintainers"},
-        "license": "MIT",
-        "keywords": ["guard", "hooks", "deny"],
-    }
-    for field in ("homepage", "repository", "userConfig", "hooks"):
-        assert field not in manifest, field
-    hooks = json.loads((PLUGIN / "hooks" / "hooks.json").read_text(encoding="utf-8"))
-    assert sorted(hooks) == ["description", "hooks"]
-    assert sorted(hooks["hooks"]) == ["PreToolUse"]
-    [group] = hooks["hooks"]["PreToolUse"]
-    assert group["matcher"] == "Bash"
-    [entry] = group["hooks"]
-    assert sorted(entry) == ["args", "command", "onFailure", "statusMessage", "timeout", "type"]
-    assert entry["statusMessage"] == "Checking destructive command guardrails..."
-    for word in entry["args"]:
-        assert not word.startswith("--scratchpad") and not word.startswith("--authorized-worktree"), word
-        assert not word.startswith("--adapter-policy") and not word.startswith("--timeout-runner"), word

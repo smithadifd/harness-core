@@ -12,7 +12,7 @@
     },
     {
       "name": "rails",
-      "description": "Guard hooks that deny destructive shell commands. Deny only: no hook in this plugin ever allows.",
+      "description": "Guard hooks for shell commands: deny destructive commands, ask before a push to main or a force-push. No hook in this plugin ever allows.",
       "source": "./plugins/rails"
     },
     {

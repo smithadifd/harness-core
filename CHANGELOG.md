@@ -5,6 +5,14 @@ and any pin move of the vendored ledger.
 
 ## Unreleased
 
+- The git guard in the `rails` plugin (`plugins/rails/hooks/git-guard.sh`), a
+  second `PreToolUse` hook on every Bash call: it asks before a push that
+  updates main or master and before a force, delete, mirror or prune push,
+  and, when commit style is on, checks the first line of a commit message.
+  Three options: `push_to_main` and `force_push` (default `ask`) and
+  `commit_style` (default `off`), each `ask`, `deny` or `off`. It never allows;
+  a push it cannot read is presumed to be both kinds, and a missing tool or a
+  fault denies by name.
 - The instance folder template moves into the `harness` plugin, at
   `plugins/harness/files/instance/` (a README, a `.gitignore` and a README each
   for `roadmaps/`, `decisions/` and `standards/`), and the setup skill offers it

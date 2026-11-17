@@ -58,7 +58,7 @@ Two sibling repositories are published separately, and both are public:
 | `skills/_lib/recall/` | a local full-text index over agent session transcripts, with a guard that refuses private folders |
 | `skills/_lib/ledger/` | the item ledger, itself vendored from the public ledger repository (see below) |
 | `.claude-plugin/marketplace.json`, `plugins/harness/` | the plugin marketplace and the `harness` plugin, including its setup skill and the script behind it (see "Install the default tier") |
-| `plugins/rails/` | the `rails` plugin: the destructive-command guard hook and its tests (see "The rails plugin") |
+| `plugins/rails/` | the `rails` plugin: the destructive-command guard and git guard hooks and their tests (see "The rails plugin") |
 | `scripts/`, `install-profiles/` | two maintenance scripts and an install profile |
 | `skills/_lib/tests/`, `skills/_lib/recall/tests/`, `scripts/tests/` | the tests of the vendored modules |
 
@@ -361,8 +361,11 @@ the marketplace file.
 
 ## The rails plugin
 
-`rails` holds guard hooks. At this tag it has one: the destructive-command
-guard, a `PreToolUse` hook on every Bash call.
+`rails` holds guard hooks. At this tag it has two, each a `PreToolUse` hook on
+every Bash call: the destructive-command guard and the git guard. Claude Code
+runs both, and a deny from either wins. Neither ever returns an allow.
+
+### The destructive-command guard
 
 - **What it denies.** An explicit `rm` whose targets are not literal paths
   strictly below the current worktree (or a session scratchpad): `/`, `.`,
@@ -419,6 +422,72 @@ HINT.` The code names the rule or the fault (`unsafe_rm`,
 `dependency_missing_jq`, `engine_timeout`, and so on), and the hint says what
 to do. It never carries the command or a path from it. Known limits are in
 [KNOWN-LIMITS.md](KNOWN-LIMITS.md).
+
+### The git guard
+
+- **What it asks before.** A `git push` that updates main or master: by name
+  (`origin main`, `HEAD:main`, `refs/heads/main`, in any letter case, to any
+  remote), by `HEAD` or a bare `git push` while main or master is checked out,
+  `--all`, `--branches` or `--mirror`, or a matching (`:`) or wildcard
+  refspec; and a force, delete, mirror or prune push (`--force`, `-f`,
+  `--force-with-lease`, `--force-if-includes`, a `+` refspec, `--delete`, `-d`,
+  a `:branch` refspec, `--mirror`, `--prune`, and git's abbreviations of
+  them, wherever they stand before `--`). A push it cannot read counts as
+  both: a push beside a substitution, `eval`, `alias`, `env -S`, a shell or an
+  interpreter running inline code, `xargs`, `find -exec`, `source`, `trap`,
+  `flock`, or a heredoc that feeds anything but `cat`, `tee`, `echo`,
+  `printf`, `git commit -F -` or `gh … --body-file -`; a word built from a
+  variable, glob or brace; an option or wrapper it does not know; a `GIT_`
+  variable that selects a repository or injects configuration, or `-c`,
+  beside it; or a bare push whose current branch it cannot read.
+  Configuration that can define a git alias or re-point a push
+  (`git -c alias.…`, `--config-env`, `GIT_CONFIG_*`) asks even with no push
+  word.
+- **Options.** Three, set in `/config` or with
+  `claude plugin configure rails@harness-core`: `push_to_main` (default
+  `ask`), `force_push` (default `ask`) and `commit_style` (default `off`), each
+  `ask`, `deny` or `off`. A push the guard cannot read takes the stricter of
+  the first two. With `commit_style` on, the first `-m` message of a top-level
+  `git commit` must start with a conventional prefix (`feat:`, `fix:`, `docs:`,
+  `refactor:`, `chore:`, `test:`, `ci:`, `build:`, `perf:`, `style:` or
+  `revert:`, with an optional scope in parentheses and an optional `!`);
+  `--amend`, `--fixup`, `--squash`, `-F`, `-C` and `-c` are exempt, and a
+  message it cannot read (a variable, a substitution) fails the check. The
+  options reach the guard only as its own hook arguments, which Claude Code
+  fills from your user or managed settings; no environment variable sets
+  them. A value other than `ask`, `deny` or `off` denies when its check fires,
+  and the reason names the option.
+- **Never allows.** It asks, denies or stays silent, and Claude Code's own
+  permission flow decides the rest.
+- **It fails closed.** As the destructive guard: a missing program, an
+  engine crash, malformed engine output, engine stderr beside a silent
+  verdict, an adapter fault, a signal or malformed hook input is a deny with
+  a named reason, and the hook runs with `"onFailure": "block"`.
+- **What it needs.** `jq`, `wc` and `tr` from the same trusted roots,
+  `/usr/bin/perl`, `/usr/bin/env` and `/bin/bash`; and, only when a bare or
+  `HEAD` push needs the current branch, `git` from the same roots. It asks
+  that `git` three read-only questions under a scrubbed environment and never
+  reads a remote.
+- **Unattended.** With the delegation loop's `CLAUDE_SEAT_UNATTENDED=1`, its
+  asks are denies, and each one appends a line to `$SEAT_SCRATCH/owed.log`
+  when that folder exists. Its log is armed only by `SEAT_SCRATCH`, as the
+  destructive guard's is.
+- **What it does not claim.** A push named indirectly (a variable from an
+  earlier call, a glob or brace spelling, a script, a Makefile or npm target,
+  a git alias from a configuration file, a payload sent to another machine) is
+  not seen. When the text names the destination branch, the text decides,
+  even if configuration written earlier re-points it. Only main and master
+  are protected. `gh pr merge`, a web merge and pushes from other machines are
+  not local pushes. Changes between its check and the push are not seen.
+  Commit style judges only the first message of a top-level commit. The
+  source's review of pipelines into a shell with no push in them is not
+  carried.
+
+A reason reads `Git guard asks before this command (reason=CODE): HINT.` or
+`Git guard denied the command (reason=CODE): HINT.` The code names the gate
+or the fault (`push_main_branch`, `push_force`, `push_beside_substitution`,
+`commit_nonconventional`, `option_invalid_force_push`,
+`dependency_missing_git`, and so on); the hint never carries the command.
 
 ## The default-tier load probe
 
