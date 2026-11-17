@@ -1830,6 +1830,9 @@ class InstanceWrites:
 
     def __init__(self) -> None:
         self.root_made = False
+        # The mode an existing empty folder had before it was made private;
+        # None until that mode change has landed.
+        self.root_mode: int | None = None
         self.dirs: list[str] = []
         self.files: list[str] = []
 
@@ -1871,6 +1874,14 @@ def instance_write(target: Path, existed: bool, files: list[tuple[str, bytes]], 
         raise SetupError(f"cannot open {target}: {one_line(exc)}") from exc
     if os.listdir(fds[""]):
         raise SetupError(f"{target} is not empty; the instance folder must be new or empty")
+    if existed:
+        # An existing empty folder keeps the mode it had (often 0755); the folder
+        # holds the person's plans, so it is made private like a new one. This is
+        # done before anything, .git included, is made inside it, and the mode it
+        # had is kept so that any later failure puts it back.
+        before = stat.S_IMODE(os.fstat(fds[""]).st_mode)
+        os.fchmod(fds[""], 0o700)
+        writes.root_mode = before
 
     def folder(rel: str) -> int:
         if rel in fds:
@@ -1901,14 +1912,12 @@ def instance_write(target: Path, existed: bool, files: list[tuple[str, bytes]], 
         made = None
     if made is None or not stat.S_ISDIR(made.st_mode):
         raise SetupError("git init reported success but made no .git folder")
-    # An existing empty folder keeps the mode it had (often 0755); the folder
-    # holds the person's plans, so it is made private like a new one.
-    os.fchmod(fds[""], 0o700)
 
 
 def instance_rollback(target: Path, writes: InstanceWrites, fds: dict[str, int]) -> list[str]:
     """Undo what instance_write made: each file, then each subfolder it made,
-    then the folder itself if it made it. Nothing is deleted recursively. A
+    then the folder itself if it made it, or the mode an existing folder had
+    if it changed that. Nothing is deleted recursively. A
     leftover (git's own partial .git, an entry that would not go) is kept and
     named; returns the names."""
     kept: list[str] = []
@@ -1936,6 +1945,11 @@ def instance_rollback(target: Path, writes: InstanceWrites, fds: dict[str, int])
             pass
         else:
             kept.append(str(target / ".git"))
+        if writes.root_mode is not None:
+            try:
+                os.fchmod(root, writes.root_mode)
+            except OSError:
+                kept.append(str(target))
     for fd in fds.values():
         try:
             os.close(fd)

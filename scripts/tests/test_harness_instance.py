@@ -550,6 +550,70 @@ def test_an_error_at_every_point_rolls_back_to_the_state_before(tmp_path, monkey
         assert snap(run_k.w.folder) == run_k.before, (k, label)
 
 
+class ChmodOs(FlakyOs):
+    """setup.py's `os` with every fchmod counted and an I/O error raised at the
+    numbered ones; the folder's mode is changed for real otherwise."""
+
+    def __init__(self, fail_chmod=()):
+        super().__init__()
+        self.fail_chmod = set(fail_chmod)
+        self.chmods: list[int] = []
+
+    def fchmod(self, fd, mode):
+        self.chmods.append(mode)
+        if len(self.chmods) in self.fail_chmod:
+            raise OSError(errno.EIO, "injected")
+        return os.fchmod(fd, mode)
+
+
+def fail_git_init(monkeypatch):
+    def broken(git, target):
+        raise setup.SetupError("git init failed: boom")
+
+    monkeypatch.setattr(setup, "instance_git_init", broken)
+
+
+@pytest.mark.parametrize("fail", ["the-mode-change", "git-init-after-it"])
+@pytest.mark.parametrize("before", [0o755, 0o750], ids=["0755", "0750"])
+def test_a_failure_after_the_mode_change_leaves_the_folder_with_its_mode_and_no_git_folder(
+        tmp_path, monkeypatch, before, fail):
+    w = world(tmp_path)
+    inst = w.work / "inst"
+    inst.mkdir()
+    os.chmod(inst, before)
+    flaky = ChmodOs(fail_chmod=(1,) if fail == "the-mode-change" else ())
+    monkeypatch.setattr(setup, "os", flaky)
+    if fail == "git-init-after-it":
+        fail_git_init(monkeypatch)
+    with pytest.raises(setup.SetupError) as raised:
+        in_process(monkeypatch, w, inst)
+    monkeypatch.setattr(setup, "os", os)
+    if fail == "the-mode-change":
+        assert str(raised.value) == "unexpected error: OSError: [Errno 5] injected"
+        assert flaky.chmods == [0o700]
+    else:
+        assert str(raised.value) == "git init failed: boom; rolled back, nothing was left"
+        assert flaky.chmods == [0o700, before], "the mode was not put back"
+    assert stat.S_IMODE(inst.stat().st_mode) == before
+    assert not (inst / ".git").exists(), "a git folder was left behind"
+    assert os.listdir(inst) == []
+
+
+def test_a_mode_that_cannot_be_put_back_is_kept_and_named(tmp_path, monkeypatch):
+    w = world(tmp_path)
+    inst = w.work / "inst"
+    inst.mkdir()
+    os.chmod(inst, 0o755)
+    monkeypatch.setattr(setup, "os", ChmodOs(fail_chmod=(2,)))
+    fail_git_init(monkeypatch)
+    with pytest.raises(setup.SetupError) as raised:
+        in_process(monkeypatch, w, inst)
+    monkeypatch.setattr(setup, "os", os)
+    assert str(raised.value) == (
+        f"git init failed: boom; rolled back, except for what is kept: {inst}")
+    assert os.listdir(inst) == []
+
+
 def test_a_rollback_step_that_fails_keeps_and_names_what_it_could_not_remove(
         tmp_path, monkeypatch):
     clean = attempt(monkeypatch, tmp_path, "clean", (), existing=False)
