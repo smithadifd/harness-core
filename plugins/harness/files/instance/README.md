@@ -30,7 +30,7 @@ folder points at the database and no settings file needs editing for a session t
   `git add -A`, then `git commit`.
 - No remote is needed; adding one later is optional.
 - Back up the ledger with `ledger backup` (SQLite's online backup), never a file copy of the
-  database, and keep the database, its WAL and its SHM files out of synced folders (Syncthing,
-  iCloud, Dropbox). This folder holds no database, so a copy of it carries none.
+  database, and keep the database, its WAL and its SHM files out of any folder a file-sync
+  service copies. This folder holds no database, so a copy of it carries none.
 - Each subfolder starts with a README that says what belongs there. Delete it once the folder has
   real content.

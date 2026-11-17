@@ -22,6 +22,8 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import importlib.util
+
 import pytest
 
 from harness_fixtures import (
@@ -33,6 +35,16 @@ setup = load_setup()
 INSTANCE_FILES = setup.INSTANCE_FILES
 TEMPLATE = ROOT / "plugins" / "harness" / "files" / "instance"
 GIT_REFUSAL = "setup: git is not on PATH"
+NO_PERSON_SCRIPT = ROOT / "scripts" / "check-no-person.py"
+
+
+def load_no_person():
+    """scripts/check-no-person.py as a module, so the test runs its own shape rules."""
+    spec = importlib.util.spec_from_file_location("no_person_for_instance_tests",
+                                                  NO_PERSON_SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def world(tmp_path, *, git=True, name="case"):
@@ -87,7 +99,7 @@ def test_the_template_holds_markdown_and_a_gitignore_only():
 def test_the_template_text_keeps_the_database_out_of_the_instance_folder():
     text = (TEMPLATE / "README.md").read_text(encoding="utf-8")
     for gone in ("settings.json", "additionalDirectories", "LEDGER_DB", "<workspace>",
-                 "<foundry>", "<instance>", "lives in `.ledger/`", "Create an instance"):
+                 "<instance>", "lives in `.ledger/`", "Create an instance"):
         assert gone not in text, gone
     assert "Not here: this folder holds markdown only" in text
     assert ".local/share/ledger/ledger.db" in text
@@ -97,9 +109,15 @@ def test_the_template_text_keeps_the_database_out_of_the_instance_folder():
 
 
 def test_no_template_file_names_a_private_system_or_a_home_path():
+    # The no-person script's own shape rules (home paths, private hosts, tokens, decision
+    # numbers), imported and run over each template file as it would be tracked; the
+    # deny list is the script's job in CI and is not available here.
+    no_person = load_no_person()
     for rel in INSTANCE_FILES:
-        text = (TEMPLATE / rel).read_text(encoding="utf-8")
-        assert "foundry" not in text.lower(), rel
+        data = (TEMPLATE / rel).read_bytes()
+        tracked = f"plugins/harness/files/instance/{rel}"
+        assert no_person.scan_text(tracked, data, None, {}, set()) == [], rel
+        text = data.decode("utf-8")
         assert "/Users/" not in text and "/home/" not in text, rel
 
 
