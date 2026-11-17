@@ -3,7 +3,7 @@
 Each tag of this repository gets an entry: what changed in the vendored files,
 and any pin move of the vendored ledger.
 
-## Unreleased
+## v0.1.3
 
 - The git guard in the `rails` plugin (`plugins/rails/hooks/git-guard.sh`), a
   second `PreToolUse` hook on every Bash call: it asks before a push that
