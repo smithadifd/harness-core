@@ -130,10 +130,15 @@ REQUIRED_PHRASES = (
 #
 # Each required line must appear exactly once under its heading, and each core
 # section may hold no other line, so a contradicting line added beside a
-# required one is caught too. Sections not listed here (command shapes, clean
-# up, where people read, tool gotchas) are not core rules and stay free to
-# change. A reworded core rule is a deliberate edit to the rules default and
-# to this table together.
+# required one is caught too. The four sections not listed here (command
+# shapes, clean up, where people read, tool gotchas) are not core rules: their
+# bodies stay free to change, but their headings are pinned in
+# EXPECTED_HEADINGS, so no section can be added, removed, renamed or moved
+# without this file changing with it (a new section could otherwise
+# contradict a core rule where nothing reads it). Fenced code blocks are not
+# rules: the rules default holds none, a fence is a problem wherever it
+# opens, and a line or heading inside one is never read. A reworded core rule
+# is a deliberate edit to the rules default and to this table together.
 CORE_RULES: dict[str, tuple[str, ...]] = {
     "": (
         "# Harness rules",
@@ -163,22 +168,63 @@ CORE_RULES: dict[str, tuple[str, ...]] = {
     ),
 }
 
+# Every "## " heading of the rules default, in order: the five core sections
+# above and the four whose bodies are free.
+EXPECTED_HEADINGS: tuple[str, ...] = (
+    "Review",
+    "Evidence",
+    "Merge",
+    "Delegated work",
+    "Command shapes",
+    "Clean up",
+    "Where people read",
+    "Tool gotchas",
+)
 
-def _sections(text: str) -> dict[str, list[str]]:
-    """The non-blank lines of each "## " section, trailing blanks trimmed. The
-    lines before the first "## " heading are the section named "". A heading
-    that appears twice has both bodies joined, so a repeated heading cannot
-    hide a line."""
+# A line that opens or closes a fenced code block: up to three spaces, then a
+# run of three or more backticks or tildes.
+FENCE = re.compile(r" {0,3}(`{3,}|~{3,})")
+
+
+def _parse(text: str) -> tuple[list[str], dict[str, list[str]], list[int]]:
+    """Read the rules text once: the "## " headings in order, the non-blank
+    lines of each section (trailing blanks trimmed), and the line number of
+    each fence that opens. The lines before the first "## " heading are the
+    section named "". A heading that appears twice has both bodies joined, so
+    a repeated heading cannot hide a line. A line inside a fenced code block
+    (opened and closed by a run of backticks or tildes; one that never closes
+    runs to the end) is neither a heading nor a rule line."""
+    headings: list[str] = []
     sections: dict[str, list[str]] = {"": []}
+    fences: list[int] = []
     current = ""
-    for line in text.split("\n"):
+    fence: tuple[str, int] | None = None  # (character, length) of the open fence
+    for number, line in enumerate(text.split("\n"), 1):
         line = line.rstrip(" \t")
-        if line.startswith("## "):
+        if fence is not None:
+            close = FENCE.fullmatch(line)
+            if close and close.group(1)[0] == fence[0] and len(close.group(1)) >= fence[1]:
+                fence = None
+            continue
+        opening = FENCE.match(line)
+        if opening:
+            fence = (opening.group(1)[0], len(opening.group(1)))
+            fences.append(number)
+        elif line.startswith("## "):
             current = line[3:]
+            headings.append(current)
             sections.setdefault(current, [])
         elif line:
             sections[current].append(line)
-    return sections
+    return headings, sections, fences
+
+
+def _sections(text: str) -> dict[str, list[str]]:
+    return _parse(text)[1]
+
+
+def _headings(text: str) -> list[str]:
+    return _parse(text)[0]
 
 
 def _brief(line: str) -> str:
@@ -189,7 +235,11 @@ def _rule_problems(text: str) -> list[str]:
     """Why the text does not hold the core rules, one message each; an empty
     list when it does."""
     problems: list[str] = []
-    sections = _sections(text)
+    headings, sections, fences = _parse(text)
+    for number in fences:
+        problems.append(f"a fenced code block opens at line {number}: the rules default holds none")
+    if headings != list(EXPECTED_HEADINGS):
+        problems.append(f"the '## ' headings are {headings}, not the pinned {list(EXPECTED_HEADINGS)}")
     for heading, required in CORE_RULES.items():
         found = sections.get(heading)
         if found is None:
@@ -213,6 +263,50 @@ def _replace(old: str, new: str):
         assert text.count(old) == 1, f"mutation anchor is not unique: {old!r}"
         return text.replace(old, new)
     return mutate
+
+
+def _then(*steps):
+    """A mutation that applies each step in turn."""
+    def mutate(text: str) -> str:
+        for step in steps:
+            text = step(text)
+        return text
+    return mutate
+
+
+def _swap_sections(first: str, second: str):
+    """A mutation that swaps two adjacent "## " sections, bodies and all."""
+    def mutate(text: str) -> str:
+        parts = text.split("\n## ")
+        names = [part.split("\n", 1)[0] for part in parts]
+        a, b = names.index(first), names.index(second)
+        assert b == a + 1, f"sections {first!r} and {second!r} are not adjacent"
+        parts[a], parts[b] = parts[b], parts[a]
+        return "\n## ".join(parts)
+    return mutate
+
+
+def _drop_from(heading: str):
+    """A mutation that cuts the last section, from its heading to the end."""
+    def mutate(text: str) -> str:
+        marker = f"\n## {heading}\n"
+        assert text.count(marker) == 1, f"mutation anchor is not unique: {marker!r}"
+        cut = text.index(marker)
+        assert text.find("\n## ", cut + len(marker)) == -1, f"{heading!r} is not the last section"
+        return text[:cut] + "\n"
+    return mutate
+
+
+def _fence_the_core_sections(text: str) -> str:
+    """A mutation that moves every core section, Review through Delegated work,
+    behind the free sections as the body of a fence that never closes. Every
+    heading and line is still there, word for word, and no line is extra."""
+    start, end = text.index("## Review\n"), text.index("## Command shapes\n")
+    return text[:start] + text[end:].rstrip("\n") + "\n\n```\n" + text[start:end]
+
+
+_FENCE_OPEN = "\n```\n"
+_REPRODUCE = "- Reproduce a CI-only failure locally before reasoning about it.\n"
 
 
 # Each mutation negates, weakens or contradicts one core rule. Most keep every
@@ -256,6 +350,31 @@ MUTATIONS = {
     "contradiction-under-a-repeated-heading": lambda text: text + "\n## Review\n- Skip the review for a small change.\n",
     "required-line-removed": _replace("- Reproduce a CI-only failure locally before reasoning about it.\n", ""),
     "section-renamed": _replace("## Merge", "## Merge (optional)"),
+    # A section the pins do not read must not be a place to hide a rule or a
+    # contradiction: the heading list is pinned, and fenced text is never read.
+    "section-appended-with-a-contradiction": lambda text: text + "\n## Exceptions\n\n- Skip the review for a small change.\n",
+    "section-appended-empty": lambda text: text + "\n## Notes\n",
+    "free-heading-repeated": lambda text: text + "\n## Clean up\n",
+    "section-added-between-core-sections": _replace("\n## Evidence", "\n## Exceptions\n\n- Skip the review for a small change.\n\n## Evidence"),
+    "free-section-removed": _drop_from("Tool gotchas"),
+    "free-section-renamed": _replace("## Clean up", "## Clean-up"),
+    "free-sections-reordered": _swap_sections("Command shapes", "Clean up"),
+    "core-sections-reordered": _swap_sections("Evidence", "Merge"),
+    "review-section-fenced": _then(
+        _replace("## Review\n", "```\n## Review\n"),
+        _replace("\n## Evidence", "\n```\n\n## Evidence"),
+    ),
+    "review-section-in-a-tilde-fence": _then(
+        _replace("## Review\n", "~~~\n## Review\n"),
+        _replace("\n## Evidence", "\n~~~\n\n## Evidence"),
+    ),
+    "core-sections-moved-into-an-unclosed-fence": _fence_the_core_sections,
+    "required-line-only-in-a-fence": _then(
+        _replace(_REPRODUCE, ""),
+        lambda text: text + _FENCE_OPEN + _REPRODUCE + "```\n",
+    ),
+    "heading-hidden-in-a-fence": lambda text: text + _FENCE_OPEN + "## Exceptions\n- Skip the review for a small change.\n```\n",
+    "fence-never-closed": lambda text: text + _FENCE_OPEN + "- Skip the review for a small change.\n",
 }
 
 
@@ -383,6 +502,37 @@ def test_the_phrase_check_alone_misses_the_negated_review_rule():
     assert "No change bound for a merge gets a fresh-context review" in mutated
     assert [phrase for phrase in REQUIRED_PHRASES if phrase not in mutated] == []
     assert _rule_problems(mutated) != []
+
+
+def test_the_rules_default_has_exactly_the_pinned_headings_in_order():
+    assert _headings(_rules_text()) == list(EXPECTED_HEADINGS)
+
+
+def test_the_pinned_headings_include_every_core_section():
+    assert [heading for heading in CORE_RULES if heading and heading not in EXPECTED_HEADINGS] == []
+
+
+def test_a_heading_or_line_inside_a_fence_is_not_read():
+    text = (
+        "## One\n- a\n"
+        "```\n## Two\n- b\n```\n"
+        "- c\n"
+        "~~~~\n## Three\n```\n~~~\n- d\n~~~~\n"
+        "## Four\n"
+    )
+    assert _headings(text) == ["One", "Four"]
+    assert _sections(text) == {"": [], "One": ["- a", "- c"], "Four": []}
+    assert _parse(text)[2] == [3, 8]
+    # A fence that never closes hides everything after it.
+    assert _sections("## One\n- a\n```\n## Two\n- b\n") == {"": [], "One": ["- a"]}
+
+
+def test_a_fenced_block_anywhere_in_the_rules_default_is_a_problem():
+    text = _rules_text()
+    assert _rule_problems(text) == []
+    for fence in ("```", "~~~"):
+        problems = _rule_problems(text + f"\n{fence}\nexample\n{fence}\n")
+        assert any("fenced code block" in problem for problem in problems), problems
 
 
 def test_the_core_rule_check_ignores_trailing_blanks_and_blank_lines():
