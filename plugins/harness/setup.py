@@ -41,6 +41,7 @@ import secrets
 import shlex
 import shutil
 import signal
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -1334,6 +1335,60 @@ def ledger_init_verb(home: Path, operator: str,
         tree.close()
 
 
+def reserve_temp_name(parent: int, base: str) -> str:
+    """A name for the temporary database in the folder parent, one that no
+    entry has now. The ledger command creates the file."""
+    for _attempt in range(100):
+        name = temp_name(base)
+        try:
+            os.stat(name, dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            return name
+    raise SetupError("cannot find an unused name for the temporary ledger database")
+
+
+def confirm_first_write(path: str) -> None:
+    """The first write's topic is in the database at path: the log is folded
+    into the file, and the item the write creates is read back."""
+    source = FIRST_WRITE[FIRST_WRITE.index("--source") + 1]
+    try:
+        conn = sqlite3.connect(path, timeout=30)
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            rows = conn.execute(
+                "SELECT payload FROM events WHERE kind = 'item.created'").fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        raise SetupError(
+            f"the first ledger write made a database setup cannot read: {one_line(exc)}") from exc
+    for (payload,) in rows:
+        try:
+            if json.loads(payload).get("source") == source:
+                return
+        except (TypeError, ValueError, AttributeError):
+            continue
+    raise SetupError("the first ledger write reported success but the topic is not in the new database")
+
+
+def drop_temp_database(parent: int, temp: str) -> list[str]:
+    """Delete the temporary database and the files SQLite keeps beside it.
+    Returns the names it could not delete."""
+    left = []
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        try:
+            os.unlink(temp + suffix, dir_fd=parent)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            left.append(temp + suffix)
+    try:
+        sync(parent)
+    except OSError:
+        pass
+    return left
+
+
 def ledger_init_locked(tree: Tree, operator: str, harness: str | None) -> str:
     """Make the first ledger write when the database file is absent. Setup
     must have completed: the write is part of it. A database that already
@@ -1353,22 +1408,55 @@ def ledger_init_locked(tree: Tree, operator: str, harness: str | None) -> str:
             "the ledger command is not on PATH; it comes with the ledger-hooks "
             "plugin once that plugin is loaded (run /reload-plugins or start a "
             "new session), then run ledger-init again")
+    # The write runs against a temporary database that setup owns, in the
+    # final path's own folder. The file is published to the final path only
+    # after the child has succeeded and the topic is in it, so a failed or
+    # timed-out child can never leave a partial file at the final path that
+    # the next run would take for a finished database.
+    parent_rel, _, base = DB_REL.rpartition("/")
+    parent = tree.dir(parent_rel, create=True)
+    temp = reserve_temp_name(parent, base)
+    temp_path = tree.show(f"{parent_rel}/{temp}")
     env = dict(os.environ)
-    env["LEDGER_DB"] = str(database)
+    env["LEDGER_DB"] = temp_path
     env["LEDGER_OPERATOR"] = operator
     env["LEDGER_HARNESS"] = harness or DEFAULT_HARNESS
-    command = [ledger, *first_write_command(tree.root)[1:]]
+    command = [ledger, "--db", temp_path, *FIRST_WRITE]
     try:
-        done = subprocess.run(command, env=env, capture_output=True, text=True,
-                              stdin=subprocess.DEVNULL, timeout=120)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise SetupError(f"the first ledger write failed: {one_line(exc)}") from exc
-    if done.returncode != 0:
-        detail = one_line(done.stderr or done.stdout or f"exit {done.returncode}")
-        raise SetupError(f"the first ledger write failed: {detail}")
-    if not os.path.isfile(database):
+        try:
+            done = subprocess.run(command, env=env, capture_output=True, text=True,
+                                  stdin=subprocess.DEVNULL, timeout=120)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise SetupError(f"the first ledger write failed: {one_line(exc)}") from exc
+        if done.returncode != 0:
+            detail = one_line(done.stderr or done.stdout or f"exit {done.returncode}")
+            raise SetupError(f"the first ledger write failed: {detail}")
+        try:
+            info = os.stat(temp, dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            info = None
+        if info is None or not stat.S_ISREG(info.st_mode):
+            raise SetupError(
+                f"the first ledger write reported success but made no database at {database}")
+        confirm_first_write(temp_path)
+        fd = os.open(temp, READ_FLAGS, dir_fd=parent)
+        try:
+            sync(fd)
+        finally:
+            os.close(fd)
+        try:
+            os.link(temp, base, src_dir_fd=parent, dst_dir_fd=parent)
+        except FileExistsError:
+            raise SetupError(
+                f"{database} appeared while the first ledger write was running; "
+                "it was not replaced, and the new database was dropped") from None
+        sync(parent)
+    finally:
+        left = drop_temp_database(parent, temp)
+    if left:
         raise SetupError(
-            f"the first ledger write reported success but made no database at {database}")
+            f"the ledger database was created, but these temporary files could not be "
+            f"removed: {', '.join(tree.show(f'{parent_rel}/{name}') for name in left)}")
     return f"created: ledger database at {database}\n"
 
 

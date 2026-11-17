@@ -33,17 +33,22 @@ Rules that hold in every mode:
 - Never pass `--approve-all`. Never write to the person's rules folder, the
   settings file or the ledger yourself.
 - Never ask for, print or store a credential.
+- Single-quote every value you put into a command: the operator, the harness
+  and each `--approve` id, exactly as the templates below show. The deny ids
+  contain parentheses (`deny:Read(.env)`), which the shell reads as syntax, so
+  an unquoted id stops the command before the script runs. If a value itself
+  holds a single quote, write that quote as `'\''`.
 
 ## Set up
 
 1. **Who the ledger's writes are for.** Ask the person for the operator name:
-   the name the ledger stamps on what they write. Use `claude-code` as the
-   harness name unless they give another.
+   the name the ledger stamps on what they write. The harness name is
+   `claude-code` unless they give another; use it wherever `<harness>` appears.
 
 2. **Print the plan.** Nothing is written by this step:
 
    ```text
-   python3 "${CLAUDE_SKILL_DIR}/../../setup.py" plan --home "$HOME" --operator <operator> --harness claude-code
+   python3 "${CLAUDE_SKILL_DIR}/../../setup.py" plan --home "$HOME" --operator '<operator>' --harness '<harness>'
    ```
 
    Show the whole output. Say what it holds: each `FILE` is a file that will be
@@ -66,7 +71,7 @@ Rules that hold in every mode:
    using the id printed after `OPTIONAL`, and nothing for the others:
 
    ```text
-   python3 "${CLAUDE_SKILL_DIR}/../../setup.py" apply --home "$HOME" --operator <operator> --harness claude-code --approve <id> --approve <id>
+   python3 "${CLAUDE_SKILL_DIR}/../../setup.py" apply --home "$HOME" --operator '<operator>' --harness '<harness>' --approve '<id>' --approve '<id>'
    ```
 
    If the output says a file "already existed" and was kept, tell the person
@@ -76,7 +81,7 @@ Rules that hold in every mode:
    absent, and does nothing when one is already there:
 
    ```text
-   python3 "${CLAUDE_SKILL_DIR}/../../setup.py" ledger-init --home "$HOME" --operator <operator> --harness claude-code
+   python3 "${CLAUDE_SKILL_DIR}/../../setup.py" ledger-init --home "$HOME" --operator '<operator>' --harness '<harness>'
    ```
 
    If it says the ledger command is not on PATH, the ledger plugin is not

@@ -381,6 +381,76 @@ def test_ledger_init_does_not_trust_a_success_that_made_no_database(tmp_path):
                         f"database at {at(home, DB)}\n")
 
 
+def database_folder_entries(home):
+    folder = at(home, DB).parent
+    return sorted(entry.name for entry in folder.iterdir()) if folder.exists() else []
+
+
+def test_ledger_init_a_failed_child_leaves_no_partial_file_and_a_retry_writes_the_topic(tmp_path):
+    home, bin_dir = applied_home(tmp_path)
+    show_stored(bin_dir)
+    put_stub(bin_dir, "ledger", "#!/bin/sh\nprintf 'partial' > \"$LEDGER_DB\"\n"
+                                "echo 'disk full' >&2\nexit 3\n")
+    failed = setup_run("ledger-init", home, bin_dir=bin_dir)
+    assert failed.rc == 1
+    assert failed.err == "setup: the first ledger write failed: disk full\n"
+    assert not at(home, DB).exists(), "a partial file was left at the final path"
+    assert database_folder_entries(home) == [], "a temporary file was left behind"
+    rc, lines = doctor(home, bin_dir)
+    assert rc == 1
+    assert lines_of(lines, "FAIL", "ledger") == [
+        f"FAIL ledger: the ledger database is missing: {at(home, DB)}; run ledger-init"]
+
+    # The retry runs the first write again: it is not taken for a finished database.
+    make_bin(tmp_path / "case")
+    retry = setup_run("ledger-init", home, bin_dir=bin_dir)
+    assert retry.rc == 0, retry.err
+    assert retry.out == f"created: ledger database at {at(home, DB)}\n"
+    assert database_folder_entries(home) == ["ledger.db"]
+    listing = subprocess.run([str(bin_dir / "ledger"), "--db", str(at(home, DB)), "query"],
+                             capture_output=True, text=True, env={"PATH": str(bin_dir)})
+    rows = [line.split("\t") for line in listing.stdout.splitlines()]
+    assert len(rows) == 1 and rows[0][1:] == ["topic", "closed", "Harness setup"]
+    rc, lines = doctor(home, bin_dir)
+    assert rc == 0 and lines_of(lines, "FAIL", "ledger") == []
+
+
+def test_ledger_init_a_database_setup_cannot_read_is_not_published(tmp_path):
+    home, bin_dir = applied_home(tmp_path)
+    put_stub(bin_dir, "ledger", "#!/bin/sh\nprintf 'not a database at all, just text' > \"$LEDGER_DB\"\nexit 0\n")
+    done = setup_run("ledger-init", home, bin_dir=bin_dir)
+    assert done.rc == 1
+    assert done.err.startswith("setup: the first ledger write made a database setup cannot read: ")
+    assert not at(home, DB).exists()
+    assert database_folder_entries(home) == []
+
+
+def test_ledger_init_a_success_without_the_topic_is_not_published(tmp_path):
+    home, bin_dir = applied_home(tmp_path)
+    put_stub(bin_dir, "ledger", "#!/bin/sh\npython3 -c \"import os, sqlite3; c = sqlite3.connect("
+                                "os.environ['LEDGER_DB']); c.execute('create table events "
+                                "(kind text, payload text)'); c.commit(); c.close()\"\n")
+    done = setup_run("ledger-init", home, bin_dir=bin_dir)
+    assert done.rc == 1
+    assert done.err == ("setup: the first ledger write reported success but the topic is not "
+                        "in the new database\n")
+    assert not at(home, DB).exists()
+    assert database_folder_entries(home) == []
+
+
+def test_ledger_init_never_replaces_a_database_that_appeared_while_the_write_ran(tmp_path):
+    home, bin_dir = applied_home(tmp_path)
+    (bin_dir / "ledger").rename(bin_dir / "ledger-real")
+    put_stub(bin_dir, "ledger", "#!/bin/sh\n/bin/sh \"${0%/*}/ledger-real\" \"$@\" || exit $?\n"
+                                f"printf 'theirs' > '{at(home, DB)}'\n")
+    done = setup_run("ledger-init", home, bin_dir=bin_dir)
+    assert done.rc == 1
+    assert done.err == (f"setup: {at(home, DB)} appeared while the first ledger write was "
+                        "running; it was not replaced, and the new database was dropped\n")
+    assert at(home, DB).read_bytes() == b"theirs"
+    assert database_folder_entries(home) == ["ledger.db"]
+
+
 def test_ledger_init_needs_an_operator(tmp_path):
     home, bin_dir = applied_home(tmp_path)
     done = setup_run("ledger-init", home, bin_dir=bin_dir, operator=None)

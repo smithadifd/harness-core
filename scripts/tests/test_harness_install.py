@@ -19,11 +19,13 @@ from __future__ import annotations
 import json
 import re
 import shlex
+import subprocess
+from pathlib import Path
 
 import pytest
 
 from harness_fixtures import (
-    HARNESS, OPERATOR, README, ROOT, SEEDED_SETTINGS, SKILL,
+    HARNESS, OPERATOR, README, ROOT, SEEDED_SETTINGS, SKILL, child_env,
     added_dirs, ancestors, approve_args, at, changed_files, load_setup, make_bin,
     make_home, plan_configure, plan_files, plan_option_ids, plan_settings_path,
     setup_run, setup_run_traced, show_stored, sha, snap,
@@ -144,9 +146,18 @@ def test_install_1_the_stub_got_the_options_and_the_ledger_command_the_plan_list
     block = lines.index("FIRST LEDGER WRITE")
     assert lines[block + 1] == "----" and lines[block + 3] == "----"
     command = shlex.split(lines[block + 2])
-    assert (bin_dir / "ledger-argv").read_text(encoding="utf-8").splitlines() == command[1:]
+    # The command the stub got is the plan's command run against a temporary
+    # database in the final database's own folder (published to the final
+    # path only after the write succeeded); every other argument is the plan's.
+    assert command[1] == "--db" and command[2] == str(at(home, DB))
+    argv = (bin_dir / "ledger-argv").read_text(encoding="utf-8").splitlines()
+    assert argv[0] == "--db" and argv[2:] == command[3:]
+    temp = Path(argv[1])
+    assert temp.parent == at(home, DB).parent
+    assert re.fullmatch(r"\.ledger\.db\.harness-[0-9a-f]{16}\.tmp", temp.name), temp.name
     assert (bin_dir / "ledger-env").read_text(encoding="utf-8").splitlines() == [
-        str(at(home, DB)), OPERATOR, HARNESS]
+        str(temp), OPERATOR, HARNESS]
+    assert not temp.exists(), "the temporary database was not removed"
 
 
 def test_install_1_the_first_ledger_write_makes_the_database_and_a_repeat_writes_nothing(tmp_path):
@@ -428,3 +439,43 @@ def test_the_readme_names_every_optional_setting_the_plan_proposes():
     assert '`{"enabled": true}`' in text
     for key in ("ledger_db", "ledger_operator", "ledger_harness"):
         assert f"`{key}`" in text, key
+
+
+SKILL_COMMAND = 'python3 "${CLAUDE_SKILL_DIR}/../../setup.py"'
+
+
+def skill_commands(text):
+    return [line.strip() for line in text.splitlines() if line.strip().startswith(SKILL_COMMAND)]
+
+
+def test_the_skill_single_quotes_every_value_the_model_substitutes():
+    text = SKILL.read_text(encoding="utf-8")
+    seen = {"--operator": 0, "--harness": 0, "--approve": 0}
+    commands = skill_commands(text)
+    assert len(commands) == 5
+    for command in commands:
+        for flag, value in re.findall(r"(--operator|--harness|--approve) (\S+)", command):
+            assert re.fullmatch(r"'<[a-z]+>'", value), f"unquoted {flag} value {value}: {command}"
+            seen[flag] += 1
+        bare = re.sub(r"'<[a-z]+>'", "", command)
+        assert "<" not in bare and ">" not in bare, f"unquoted placeholder: {command}"
+    assert seen == {"--operator": 3, "--harness": 3, "--approve": 2}
+    # The skill says why.
+    assert "parentheses" in text and "deny:Read(.env)" in text
+
+
+def test_the_documented_apply_command_runs_through_bash_with_a_deny_id(tmp_path):
+    home, bin_dir = fixture(tmp_path, settings=None)
+    template = next(command for command in skill_commands(SKILL.read_text(encoding="utf-8"))
+                    if " apply " in command)
+    ids = iter(["deny:Read(.env)", "sandbox"])
+    command = template.replace("<operator>", OPERATOR).replace("<harness>", HARNESS)
+    command = re.sub(r"<id>", lambda _match: next(ids), command)
+    env = child_env(home, bin_dir)
+    env["CLAUDE_SKILL_DIR"] = str(SKILL.parent)
+    done = subprocess.run(["/bin/bash", "-c", command], capture_output=True, text=True,
+                          env=env, timeout=120)
+    assert done.returncode == 0, done.stderr
+    stored = json.loads(at(home, SETTINGS).read_text(encoding="utf-8"))
+    assert stored["permissions"]["deny"] == ["Read(.env)"]
+    assert stored["sandbox"]["enabled"] is True
