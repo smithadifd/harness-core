@@ -85,6 +85,7 @@ the text itself.
 | `scripts/tests/harness_fixtures.py` | the fixture home, the stub claude and ledger commands and the write trace the harness tests share |
 | `scripts/tests/test_harness_doctor.py` | tests of the doctor and ledger-init verbs |
 | `scripts/tests/test_harness_install.py` | the CI parts of the four install tests, and the README and the skill held to the script |
+| `scripts/tests/test_harness_rules_files.py` | tests of the rules default and the override starter |
 | `scripts/tests/test_harness_setup.py` | fixture-home tests of the harness plan, apply and remove script, with a hard stop and an injected exception at every step |
 | `scripts/tests/test_marketplace_manifest.py` | tests of the marketplace check (folders, manifests, expected sources, full-commit pins, tag against pin with a fake API fetch and with urllib's opener over a local transport) and of the plugin validation job |
 | `scripts/tests/test_probe_default_tier_load.py` | tests of the load probe, against a stubbed claude and git |
