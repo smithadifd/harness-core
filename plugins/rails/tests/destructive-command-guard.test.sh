@@ -572,7 +572,8 @@ run_command "unlisted literal command" none 'printf safe'
 run_command "ordinary ls" none 'ls ./build'
 run_command "rm word as echo data" none 'echo rm'
 run_command "rm word as grep pattern" none 'grep rm file'
-run_command "non-recursive xargs rm remains outside policy" none 'xargs rm -f'
+run_command "non-recursive xargs rm targets are non-literal too" deny 'xargs rm -f'
+expect_reason S1 "non-recursive xargs rm" non_literal_rm_targets
 run_command "unsupported ordinary Git command" none 'git status --short'
 run_command "remote Git command" none 'git push origin feature'
 
