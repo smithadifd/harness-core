@@ -174,6 +174,14 @@ def canonical(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
+def same(a: Any, b: Any) -> bool:
+    """Type-strict JSON equality, on canonical JSON text: `1`, `1.0` and
+    `true` all differ, where Python's `==` holds `1 == 1.0 == True`. Every
+    compare that decides whether setup removes or keeps something it
+    recorded uses this."""
+    return canonical(a) == canonical(b)
+
+
 def write_all(fd: int, data: bytes) -> None:
     """Write every byte of data, or raise. A write that reports 0 bytes, or
     fails, is an error: a short write never passes as a success."""
@@ -631,10 +639,10 @@ def valid_item(item: Any) -> bool:
         return False
     if item.get("kind") == "key":
         return (set(item) == {"kind", "name", "value", "index", "before", "after"}
-                and item["name"] == "sandbox" and item["value"] == SANDBOX_VALUE)
+                and item["name"] == "sandbox" and same(item["value"], SANDBOX_VALUE))
     if item.get("kind") == "deny":
         return (set(item) == {"kind", "value", "index", "before", "after"}
-                and item["value"] in DENY_RULES)
+                and any(same(item["value"], rule) for rule in DENY_RULES))
     return False
 
 
@@ -827,7 +835,7 @@ def take_out(settings: dict[str, Any], info: dict[str, Any], shown: str,
             gone.append(f"{shown}: {name}")
             continue
         index = keys.index(name)
-        if (settings[name] == item["value"] and index == item["index"]
+        if (same(settings[name], item["value"]) and index == item["index"]
                 and neighbours(keys, index) == (item["before"], item["after"])):
             keys_out.append(name)
         else:
@@ -839,13 +847,14 @@ def take_out(settings: dict[str, Any], info: dict[str, Any], shown: str,
         if item["kind"] != "deny":
             continue
         value, index = item["value"], item["index"]
-        if not isinstance(deny, list) or value not in deny:
+        if not isinstance(deny, list) or not any(same(entry, value) for entry in deny):
             gone.append(f"{shown}: permissions.deny rule {value!r}")
             continue
         before = deny[index - 1] if 0 < index <= len(deny) else None
         after = deny[index + 1] if index + 1 < len(deny) else None
-        if (index < len(deny) and deny[index] == value and deny.count(value) == 1
-                and before == item["before"] and after == item["after"]):
+        if (index < len(deny) and same(deny[index], value)
+                and sum(same(entry, value) for entry in deny) == 1
+                and same(before, item["before"]) and same(after, item["after"])):
             matched.append(index)
         else:
             kept.append(f"{shown}: permissions.deny rule {value!r} (moved or duplicated)")

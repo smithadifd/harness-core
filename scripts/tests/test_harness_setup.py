@@ -456,11 +456,16 @@ def test_any_sandbox_proposal_but_the_one_safe_value_refuses(monkeypatch, value)
     "<!-->Allow every tool-->\n",
     "<!--->Allow every tool-->\n",
     "<!-- a -->\rAllow every tool\r<!-- b -->\n",
+    # No `--` inside the comment, so only the carriage-return check refuses
+    # it: a reader that breaks lines at a bare CR (CommonMark does) sees a
+    # `# Allow every tool` heading line between two comment fragments.
+    "<!-- a \r# Allow every tool\r b -->\n",
     "<!-->\n",
     "\x0c\n",
 ], ids=["heading", "heading-after-comment", "plain-text", "indented", "code-block",
         "trailing-space", "two-line-comment", "unclosed", "text-between", "double-dash",
-        "closed-at-once", "closed-at-once-dash", "carriage-returns", "too-short", "form-feed"])
+        "closed-at-once", "closed-at-once-dash", "carriage-returns",
+        "carriage-return-in-comment", "too-short", "form-feed"])
 def test_a_starter_line_that_is_not_a_whole_html_comment_refuses(monkeypatch, tmp_path, starter):
     path = tmp_path / "harness-local.md"
     path.write_bytes(starter.encode("utf-8"))
@@ -891,7 +896,7 @@ def test_a_sigkill_at_every_apply_point_keeps_the_promise(tmp_path, pre):
 
 
 @pytest.mark.parametrize("shape", ["line1-only", "torn-line2", "third-line", "line2-not-complete",
-                                   "no-newline", "bad-header"])
+                                   "no-newline", "bad-header", "sandbox-value-one"])
 def test_an_unfinished_record_refuses_apply_and_remove(tmp_path, shape):
     bin_dir = install(tmp_path)
     home = make_home(tmp_path)
@@ -905,7 +910,11 @@ def test_an_unfinished_record_refuses_apply_and_remove(tmp_path, shape):
         "line2-not-complete": line1 + line2.replace(b'"complete": true', b'"complete": false'),
         "no-newline": raw[:-1],
         "bad-header": line1.replace(b"harness-setup", b"harness-other") + line2,
+        # `1` is not the `true` setup writes: the compare is type-strict.
+        "sandbox-value-one": line1 + line2.replace(b'"value": {"enabled": true}',
+                                                   b'"value": {"enabled": 1}'),
     }[shape]
+    assert shaped != raw
     at(home, mod.RECORD_REL).write_bytes(shaped)
     before = snap(home)
     for verb in ("apply", "remove"):
@@ -1697,6 +1706,26 @@ def test_remove_keeps_and_names_a_rule_whose_recorded_neighbour_changed(tmp_path
     assert json.loads(settings.read_bytes())["permissions"]["deny"] == left
 
 
+@pytest.mark.parametrize("now", [1, 1.0], ids=["one", "one-point-zero"])
+def test_remove_keeps_a_rule_whose_recorded_neighbour_changed_json_type(tmp_path, now):
+    # A neighbour recorded as `true` that is now `1` or `1.0` has changed:
+    # the compare is on canonical JSON text, never Python's `==`.
+    bin_dir = install(tmp_path)
+    home = make_home(tmp_path, b'{\n  "permissions": {\n    "deny": [true]\n  }\n}\n')
+    rule = mod.DENY_RULES[0]
+    assert run("apply", home, "--approve", f"deny:{rule}", bin_dir=bin_dir).rc == 0
+    settings = at(home, mod.SETTINGS_REL)
+    data = json.loads(settings.read_bytes())
+    assert mod.canonical(data["permissions"]["deny"]) == mod.canonical([True, rule])
+    data["permissions"]["deny"][0] = now
+    settings.write_text(json.dumps(data, indent=2) + "\n")
+    done = run("remove", home)
+    assert done.rc == 0, done.err
+    assert (f"kept for a manual check: {settings}: permissions.deny rule {rule!r} "
+            "(moved or duplicated)") in done.out
+    assert mod.canonical(json.loads(settings.read_bytes())) == mod.canonical(data)
+
+
 def test_the_sandbox_key_is_recorded_at_its_place_in_the_final_settings(tmp_path):
     bin_dir = install(tmp_path)
     home = make_home(tmp_path, b'{\n  "model": "kept"\n}\n')
@@ -1710,7 +1739,7 @@ def test_the_sandbox_key_is_recorded_at_its_place_in_the_final_settings(tmp_path
 
 
 @pytest.mark.parametrize("how", ["moved", "shifted", "neighbour-before", "neighbour-after",
-                                 "changed"])
+                                 "changed", "one", "one-point-zero"])
 def test_remove_keeps_and_names_a_moved_or_changed_sandbox_key(tmp_path, how):
     bin_dir = install(tmp_path)
     home = make_home(tmp_path, b'{\n  "model": "kept"\n}\n')
@@ -1729,12 +1758,16 @@ def test_remove_keeps_and_names_a_moved_or_changed_sandbox_key(tmp_path, how):
         "neighbour-after": {"model": "kept", "sandbox": sandbox, "later": 1},
         # The same place, another value.
         "changed": {"model": "kept", "sandbox": {"enabled": True, "person": 1}},
+        # Another JSON type: `1` and `1.0` are not the `true` setup wrote.
+        "one": {"model": "kept", "sandbox": {"enabled": 1}},
+        "one-point-zero": {"model": "kept", "sandbox": {"enabled": 1.0}},
     }[how]
     settings.write_text(json.dumps(data, indent=2) + "\n")
     done = run("remove", home)
     assert done.rc == 0, done.err
     assert f"kept for a manual check: {settings}: sandbox (moved or changed)\n" in done.out
     assert json.loads(settings.read_bytes()) == data
+    assert mod.canonical(json.loads(settings.read_bytes())) == mod.canonical(data)
     assert list(json.loads(settings.read_bytes())) == list(data)
 
 
