@@ -3321,7 +3321,7 @@ heredoc_message_subject() { # VALUE
   [ "$first" != "$v" ] || return 1
   case "$first" in
     "\$(cat <<'"*"'") d="${first#"\$(cat <<'"}"; d="${d%"'"}" ;;
-    "\$(cat <<\""*'"') d="${first#"\$(cat <<\""}"; d="${d%'"'}" ;;
+    "\$(cat <<\""*'"') d="${first#"\$(cat <<\""}"; d="${d%\"}" ;;
     *) return 1 ;;
   esac
   [[ "$d" =~ ^[A-Za-z0-9_-]+$ ]] || return 1

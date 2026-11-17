@@ -16,6 +16,7 @@ HEREDOC_OK=$'git commit -m "$(cat <<\'EOF\'\nfeat: x\n\nA body line.\nEOF\n)"'
 HEREDOC_BAD=$'git commit -m "$(cat <<\'EOF\'\nnope\n\nA body line.\nEOF\n)"'
 HEREDOC_UNQUOTED=$'git commit -m "$(cat <<EOF\nfeat: x\n\nA body line.\nEOF\n)"'
 HEREDOC_APOSTROPHE=$'git commit -m "$(cat <<\'EOF\'\nfeat: x\n\nIt doesn\'t balance.\nEOF\n)"'
+HEREDOC_DQ_OK=$'git commit -m "$(cat <<"EOF"\nfeat: x\n\nA body line.\nEOF\n)"'
 
 printf '%s\n' '== K rows, commit_style=deny =='
 gg_row "K-1 conventional" silent 'git commit -m "feat: x"'
@@ -74,6 +75,7 @@ gg_row "K-40 a commit in a subshell" deny:commit_nonconventional '(git commit -m
 gg_row "K-41 --reuse-message= is exempt" silent 'git commit --reuse-message=HEAD -m nope'
 gg_row "K-42 --sq= abbreviation is exempt" silent 'git commit --sq=HEAD -m nope'
 gg_row "K-43 an unknown git option before commit is unreadable" deny:commit_message_unreadable 'git --future commit -m nope'
+gg_row "K-44 the double-quoted-delimiter heredoc subject (one trailing quote stripped)" silent "$HEREDOC_DQ_OK"
 
 printf '%s\n' '== Commit style at the default (off) =='
 GG_COMMIT=off
