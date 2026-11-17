@@ -207,6 +207,22 @@ def test_the_marketplace_lists_harness_and_both_external_plugins():
     assert len(names) == len(set(names))
 
 
+def test_the_ledger_pin_is_one_that_declares_the_options_and_the_readme_names_it():
+    """Setup stores ledger_db, ledger_operator and ledger_harness on the ledger plugin and
+    writes through its `ledger` command; v0.3.1 declares no options and ships no command,
+    so setup stops at its configure step. The README's status paragraph names the pin."""
+    entry = next(e for e in load_json(ROOT / MARKETPLACE)["plugins"] if e["name"] == "ledger-hooks")
+    ref = entry["source"]["ref"]
+    assert re.fullmatch(r"v\d+\.\d+\.\d+", ref), ref
+    assert tuple(int(part) for part in ref[1:].split(".")) >= (0, 4, 0), (
+        f"ledger-hooks is pinned at {ref}; setup needs v0.4.0 or later")
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    start = readme.index("**Status at this tag.**")
+    status = readme[start:].split("\n\n", 1)[0]
+    assert f"`{ref}`" in status, f"the status paragraph does not name the pin {ref}"
+    assert "claude plugin configure failed" not in status
+
+
 def test_harness_depends_only_on_entries_of_the_marketplace():
     names = {entry["name"] for entry in load_json(ROOT / MARKETPLACE)["plugins"]}
     manifest = load_json(ROOT / "plugins" / "harness" / PLUGIN_MANIFEST)
