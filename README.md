@@ -57,7 +57,7 @@ Two sibling repositories are published separately, and both are public:
 | `skills/_lib/*.py`, `skills/_lib/*.json`, `skills/_lib/*.tsv` | modules that resolve the harness root, configuration paths, overrides and model pool settings |
 | `skills/_lib/recall/` | a local full-text index over agent session transcripts, with a guard that refuses private folders |
 | `skills/_lib/ledger/` | the item ledger, itself vendored from the public ledger repository (see below) |
-| `.claude-plugin/marketplace.json`, `plugins/harness/` | the plugin marketplace and the `harness` plugin's skeleton (see "Install the default tier") |
+| `.claude-plugin/marketplace.json`, `plugins/harness/` | the plugin marketplace and the `harness` plugin, including its plan, apply and remove script (see "Install the default tier") |
 | `plugins/rails/` | the `rails` plugin: the destructive-command guard hook and its tests (see "The rails plugin") |
 | `scripts/`, `install-profiles/` | two maintenance scripts and an install profile |
 | `skills/_lib/tests/`, `skills/_lib/recall/tests/`, `scripts/tests/` | the tests of the vendored modules |
@@ -104,9 +104,9 @@ The marketplace in `.claude-plugin/marketplace.json` is named `harness-core`.
 At this tag it lists four plugins:
 
 - `harness`, a folder in this repository (`plugins/harness/`). It is the one
-  plugin a person installs, and it depends on the other two. For now it carries
-  no skill, hook or script: installing it brings the set and nothing else. The
-  setup skill and the guard hooks (`rails`) come in later changes.
+  plugin a person installs, and it depends on the other two. It carries the
+  plan, apply and remove script the setup skill will call. The setup skill
+  and the guard hooks (`rails`) come in later changes.
 - `sdlc`, the skills, from the public skills repository.
 - `ledger-hooks`, the ledger's hooks, from the public ledger repository.
 - `rails`, a folder in this repository (`plugins/rails/`): the guard hooks.
