@@ -15,7 +15,11 @@
 #   G  >&WORD read as a file target
 #   B3 commands that crashed bash 3.2 on an empty array (run with /bin/bash)
 #   H  shell comments: an unquoted # that begins a word runs to the end of
-#      its line and opens no quote and no line continuation
+#      its line and opens no quote and no line continuation; a # glued to a
+#      closer or an operator, beside a removal word, denies
+#   L  line ends: a newline after an even run of backslashes ends the command
+#      (every backslash in the run is escaped); after an odd run it is a line
+#      continuation
 # Each row runs the hook exactly as hooks.json does (env -u BASH_ENV -u ENV
 # /bin/bash --noprofile --norc -p GUARD) with a PreToolUse JSON on stdin, from
 # a worktree with a build folder. X is an absolute path outside the worktree.
@@ -324,6 +328,81 @@ deny H32 removal_beside_env_split $'# it\'s\nenv -S \'rm -rf /etc/hosts\''
 deny H33 removal_beside_env_split $'# it\'s\nenv -S\'rm\\_-rf\\_/etc/hosts\''
 deny H34 removal_beside_variable_command $'# $\'\n$\'\\x72\\x6d\' -rf /etc/hosts'
 deny H35 removal_beside_shell $'bash -c "# $\'\n$\'\\x72\\x6d\' -rf /etc/hosts"'
+# A # glued to a closer or an operator: the guard cannot be sure whether bash
+# starts a comment there ((( 1 ))# and f()# do; @(a)#x is one word), so the #
+# keeps its reading and a command with a removal word denies. Each row's next
+# line runs the removal under bash where the # is a comment.
+deny H40 unsupported_syntax $'(( n++ ))# don\'t care\nrm -rf /etc/hosts\n# that\'s it'
+deny H41 unsupported_syntax $'cleanup()# it\'s here\n{ :; }\nrm -rf /etc/hosts\n# that\'s it'
+deny H42 unsupported_syntax $'(( 1 ))#\'\ngit worktree remove --force /etc\necho \''
+deny H43 unsupported_syntax $'for ((i=0;i<1;i++))#\'\ndo rm -rf /etc/hosts; done\necho \''
+deny H44 unsupported_syntax $'(( 1 ))#"\nrm -rf /etc/hosts\necho "'
+deny H45 unsupported_syntax $'(( 1 ))#\\\nrm -rf /etc/hosts'
+# The spaced form keeps its code; @(a)#x and x=(a)#b keep today's verdicts
+# with no removal word, and deny with one.
+deny H46 path_repointing_subshell $'(( n++ )) # don\'t care\nrm -rf /etc/hosts'
+silent H47 $'shopt -s extglob\necho @(a)#x'
+silent H48 'x=(a)#b'
+deny H49 unsupported_syntax $'shopt -s extglob\necho @(a)#x; rm -rf build'
+deny H50 path_repointing_assignment 'x=(a)#b; rm -rf build'
+# One row per closer kind and per operator family, the next line a plain rm.
+deny H51 path_repointing_subshell $'(true)#\'\nrm -rf /etc/hosts\necho \''
+deny H52 unsupported_syntax $'(( 1 ))#\'\nrm -rf /etc/hosts\necho \''
+deny H53 unsupported_syntax $'f()#\'\nrm -rf /etc/hosts\necho \''
+deny H54 unsupported_syntax $'f(){ :; }#\'\nrm -rf /etc/hosts\necho \''
+deny H55 unsupported_syntax $'echo ${HOME}#\'\nrm -rf /etc/hosts\necho \''
+deny H56 unsupported_syntax $'[[ 1 ]]#\'\nrm -rf /etc/hosts\necho \''
+deny H57 unsupported_syntax $'echo \'a\'#\'\nrm -rf /etc/hosts\necho \''
+deny H58 unsupported_syntax $'echo "a"#\'\nrm -rf /etc/hosts\necho \''
+deny H59 unsafe_rm $'true;#\'\nrm -rf /etc/hosts\necho \''
+deny H60 unsafe_rm $'true&#\'\nrm -rf /etc/hosts\necho \''
+deny H61 unsafe_rm $'true&&#\'\nrm -rf /etc/hosts\necho \''
+deny H62 unsafe_rm $'true|#\'\nrm -rf /etc/hosts\necho \''
+deny H63 unsafe_rm $'true||#\'\nrm -rf /etc/hosts\necho \''
+deny H64 unsupported_syntax $'echo >#\'\nrm -rf /etc/hosts\necho \''
+deny H65 unsupported_syntax $'cat <#\'\nrm -rf /etc/hosts\necho \''
+deny H66 path_repointing_subshell $'(#\'\nrm -rf /etc/hosts\necho \')'
+# A line continuation between the closer and the # keeps them glued.
+deny H67 unsupported_syntax $'(( 1 ))\\\n#\'\nrm -rf /etc/hosts\necho \''
+# The ruling's false denies: a glued # beside an accepted rm denies.
+deny H68 unsupported_syntax 'rm -rf build;# done'
+deny H69 unsupported_syntax $'echo \'a\'#b; rm -rf build'
+# With no removal word the verdicts stay; a # inside a plain word or after an
+# escaped operator is text, as before.
+silent H70 $'(( n++ ))# don\'t care\necho ok\n# that\'s it'
+silent H71 $'true;# it\'s fine\necho ok'
+silent H72 $'echo a#\'\nrm -rf /etc/hosts\necho \''
+silent H73 $'echo \\;#\'\nrm -rf /etc/hosts\necho \''
+
+printf '%s\n' '== L: line ends after a run of backslashes =='
+# An even run: every backslash is escaped, so the newline ends the command and
+# the next line runs.
+deny L1 unsafe_rm $'echo a\\\\\nrm -rf /etc/hosts'
+deny L2 unsafe_rm $'echo a\\\\\\\\\nrm -rf /etc/hosts'
+deny L3 unsafe_rm $'echo a\\\\\\\\\\\\\nrm -rf /etc/hosts'
+deny L4 unsafe_worktree_remove $'echo a\\\\\ngit worktree remove --force /etc'
+deny L5 unsafe_worktree_remove $'echo a\\\\\\\\\ngit worktree remove --force /etc'
+deny L6 unsafe_worktree_remove $'echo a\\\\\\\\\\\\\ngit worktree remove --force /etc'
+deny L7 unsafe_rm $'printf "%s" a\\\\\nrm -rf /etc/hosts'
+# An odd run is a continuation: echo arm -rf /etc/hosts runs echo. Today's
+# verdict, silent, is kept.
+silent L8 $'echo a\\\nrm -rf /etc/hosts'
+silent L9 $'echo a\\\\\\\nrm -rf /etc/hosts'
+silent L10 $'echo a\\\ngit worktree remove --force /etc'
+# An even run inside single quotes is text for echo, and code for sh -c; in a
+# heredoc body it is code for bash.
+silent L11 $'echo \'a\\\\\nrm -rf /etc/hosts\''
+deny L12 removal_beside_shell $'sh -c \'echo a\\\\\nrm -rf /etc/hosts\''
+deny L13 removal_beside_heredoc $'bash <<\'EOF\'\necho a\\\\\nrm -rf /etc/hosts\nEOF'
+# CRLF line ends are refused before any reading.
+deny L14 adapter_input_invalid $'echo a\\\\\r\nrm -rf /etc/hosts'
+# A comment line ending in an odd run joins no line.
+deny L15 unsafe_rm $'# x\\\\\\\nrm -rf /etc/hosts'
+# A heredoc's terminator line that ends in a backslash ends the heredoc (bash
+# joins no line there) and the next line runs; R1's join reads that backslash
+# as a continuation, so the top-level reading is what finds the rm.
+deny L16 removal_beside_heredoc $'cat <<\'E\\\'\nhello\nE\\\nrm -rf /etc/hosts'
+deny L17 removal_beside_heredoc $'cat <<E\\\\\nhello\nE\\\nrm -rf /etc/hosts'
 
 if [ -d "$WORKTREE/build" ] && [ -f "$WORKTREE/build/x" ]; then pass "fixtures remained present"; else fail "a fixture was executed"; fi
 

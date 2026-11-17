@@ -692,12 +692,21 @@ collect_heredocs() {
 # array group glued to a word (@( ), x=( ), a[ ]) and a glob bracket; there
 # the # is read as text, as before, and COMMENT_AMBIGUOUS is set, which denies
 # the command when it holds a removal word (run_policy).
+# Where a # is glued to the character before it, the word-start reading below
+# is certain only inside a plain word (a#b is text). After a closer or an
+# operator it is not: bash reads (( 1 ))# and f()# as a comment start but
+# @(a)#x and x=(a)#b as one word. So a # directly after any ), } or ], a
+# closing quote, or one of ; & | < > ( keeps the reading below (comment or
+# text, as before) and also sets COMMENT_AMBIGUOUS. A # after a blank or a
+# newline, and a # inside a plain word, are the certain cases.
 COMMENT_AMBIGUOUS=0
 split_command_segments() {
   local input="$1" length i=0 j k ch next state="plain" segment="" header="" line delimiter redirect_open=0 redirect_before=0
   # word_start is 1 where an unquoted # would begin a word; parens, brackets
   # and braces count the open constructs in which bash reads # as text.
-  local word_start=1 parens=0 brackets=0 braces=0
+  # glued is 1 right after a closer or an operator (see above), and
+  # glued_before is its value before the character the plain pass reads.
+  local word_start=1 parens=0 brackets=0 braces=0 glued=0 glued_before=0
   SEGMENTS=()
   SEGMENT_DELIMITERS=()
   COMMENT_AMBIGUOUS=0
@@ -708,7 +717,7 @@ split_command_segments() {
     case "$state" in
       single)
         segment="$segment$ch"
-        [ "$ch" = "'" ] && state="plain"
+        if [ "$ch" = "'" ]; then state="plain"; glued=1; fi
         i=$((i + 1))
         ;;
       ansi)
@@ -716,7 +725,7 @@ split_command_segments() {
           segment="$segment$ch$next"; i=$((i + 2))
         else
           segment="$segment$ch"
-          [ "$ch" = "'" ] && state="plain"
+          if [ "$ch" = "'" ]; then state="plain"; glued=1; fi
           i=$((i + 1))
         fi
         ;;
@@ -730,7 +739,7 @@ split_command_segments() {
           i="$SKIP_END"
         else
           segment="$segment$ch"
-          [ "$ch" = '"' ] && state="plain"
+          if [ "$ch" = '"' ]; then state="plain"; glued=1; fi
           i=$((i + 1))
         fi
         ;;
@@ -738,12 +747,15 @@ split_command_segments() {
         # redirect_open is 1 right after an unquoted, unescaped < or >.
         redirect_before="$redirect_open"
         redirect_open=0
+        glued_before="$glued"
+        glued=0
         case "$ch" in
           '$')
             if [ "$next" = '(' ]; then
               skip_paren "$input" $((i + 2)) || policy_deny unsupported_syntax
               segment="$segment${input:i:SKIP_END-i}"
               i="$SKIP_END"
+              glued=1
             elif [ "$next" = "'" ]; then
               segment="$segment$ch$next"; state="ansi"; i=$((i + 2))
             elif [ "$next" = '{' ]; then
@@ -758,8 +770,9 @@ split_command_segments() {
           "'"|'"') segment="$segment$ch"; state=$([ "$ch" = "'" ] && printf single || printf double); i=$((i + 1)); word_start=0 ;;
           "\\")
             if [ "$next" = $'\n' ]; then
-              # A line continuation joins the two lines with nothing between.
-              i=$((i + 2))
+              # A line continuation joins the two lines with nothing between,
+              # so the character after it is glued to the one before it.
+              i=$((i + 2)); glued="$glued_before"
             elif [ -n "$next" ]; then
               # An escaped character never opens a quote or ends a segment.
               segment="$segment$ch$next"; i=$((i + 2)); word_start=0
@@ -768,6 +781,7 @@ split_command_segments() {
             fi
             ;;
           '#')
+            [ "$glued_before" -eq 0 ] || COMMENT_AMBIGUOUS=1
             if [ "$word_start" -eq 1 ] && [ $((parens + brackets + braces)) -eq 0 ]; then
               # A comment: skip to the newline, which the next pass reads.
               segment="$segment#"
@@ -777,9 +791,10 @@ split_command_segments() {
               segment="$segment$ch"; i=$((i + 1)); word_start=0
             fi
             ;;
-          ';') header="$header$segment;"; SEGMENT_DELIMITERS[${#SEGMENTS[@]}]=';'; SEGMENTS[${#SEGMENTS[@]}]="$segment"; segment=""; i=$((i + 1)); word_start=1 ;;
+          ';') header="$header$segment;"; SEGMENT_DELIMITERS[${#SEGMENTS[@]}]=';'; SEGMENTS[${#SEGMENTS[@]}]="$segment"; segment=""; i=$((i + 1)); word_start=1; glued=1 ;;
           '&')
             word_start=1
+            glued=1
             if [ "$redirect_before" -eq 1 ] || [ "$next" = '>' ]; then
               # `>&N`, `<&N`, `&>FILE` and `&>>FILE` are redirection
               # operators, not a separator: the command they decorate goes on.
@@ -792,6 +807,7 @@ split_command_segments() {
             ;;
           '|')
             word_start=1
+            glued=1
             if [ "$redirect_before" -eq 1 ]; then
               # `>|` is one redirection operator, not a pipe.
               segment="$segment$ch"; i=$((i + 1))
@@ -833,22 +849,23 @@ split_command_segments() {
                 # one of them open a group; a lone ( at a word start is a
                 # subshell, where # comments as usual.
                 if [ "$parens" -gt 0 ] || [ "$word_start" -eq 0 ] || [ "$next" = '(' ]; then parens=$((parens + 1)); fi
-                word_start=1 ;;
+                word_start=1; glued=1 ;;
               ')')
                 # The ) that closes a counted group is inside its word (bash
                 # reads @(a)#x and x=(a)#b as one word), so a # right after it
-                # is text; after (( )) that reads more than bash does. Any
-                # other ) is an operator.
-                if [ "$parens" -gt 0 ]; then parens=$((parens - 1)); word_start=0; else word_start=1; fi ;;
+                # is text; after (( )) and f() that reads more than bash does,
+                # which glued makes fail closed. Any other ) is an operator.
+                if [ "$parens" -gt 0 ]; then parens=$((parens - 1)); word_start=0; else word_start=1; fi
+                glued=1 ;;
               '[')
                 # [[ at a word start and a [ glued to a word open a group; a
                 # lone [ at a word start is the test command.
                 if [ "$brackets" -gt 0 ] || [ "$word_start" -eq 0 ] || [ "$next" = '[' ]; then brackets=$((brackets + 1)); fi
                 word_start=0 ;;
-              ']') [ "$brackets" -eq 0 ] || brackets=$((brackets - 1)); word_start=0 ;;
+              ']') [ "$brackets" -eq 0 ] || brackets=$((brackets - 1)); word_start=0; glued=1 ;;
               '{') [ "$braces" -eq 0 ] || braces=$((braces + 1)); word_start=0 ;;
-              '}') [ "$braces" -eq 0 ] || braces=$((braces - 1)); word_start=0 ;;
-              '<'|'>') redirect_open=1; word_start=0 ;;
+              '}') [ "$braces" -eq 0 ] || braces=$((braces - 1)); word_start=0; glued=1 ;;
+              '<'|'>') redirect_open=1; word_start=0; glued=1 ;;
               *) word_start=0 ;;
             esac
             ;;
@@ -861,13 +878,20 @@ split_command_segments() {
 
 # The command as bash reads it at the top level: the segments with their
 # delimiters, comments reduced to # and line continuations joined, heredoc
-# bodies left out. R1 and R2 read it beside the raw text.
+# bodies left out. R1 and R2 read it beside the raw text. A newline delimiter
+# is written after a blank, so R1's line join can never read a segment that
+# ends in an escaped backslash, and the newline after it, as a continuation:
+# this reading does not depend on that join being right.
 TOP_LEVEL_TEXT=""
 top_level_text() { # TEXT
-  local k=0 out=""
+  local k=0 out="" nl=$'\n'
   split_command_segments "$1"
   while [ "$k" -lt "${#SEGMENTS[@]}" ]; do
-    out="$out${SEGMENTS[$k]}${SEGMENT_DELIMITERS[$k]-}"
+    if [ "${SEGMENT_DELIMITERS[$k]-}" = "$nl" ]; then
+      out="$out${SEGMENTS[$k]} $nl"
+    else
+      out="$out${SEGMENTS[$k]}${SEGMENT_DELIMITERS[$k]-}"
+    fi
     k=$((k + 1))
   done
   TOP_LEVEL_TEXT="$out"
@@ -3225,12 +3249,35 @@ is_shell_name() { # WORD
   return "$rc"
 }
 
-# The removal-word test's normal form: line continuations, the $ of a $'...'
-# or $"..." opener, and every quote and backslash are deleted.
+# R1's line join. A backslash and the newline after it are a line
+# continuation, and are deleted, only when the run of backslashes that ends at
+# that newline has odd length. In an even run every backslash is escaped (a\\
+# then a newline is a\ and a newline), so the newline stays and still ends the
+# command.
+R1_JOINED=""
+r1_join_continuations() { # TEXT
+  local t="$1" out="" head run nl=$'\n'
+  while :; do
+    case "$t" in *"\\$nl"*) ;; *) break ;; esac
+    head="${t%%"\\$nl"*}"
+    t="${t:${#head}+2}"
+    run="${head##*[!\\]}"
+    if [ $((${#run} % 2)) -eq 0 ]; then
+      out="$out$head"
+    else
+      out="$out$head\\$nl"
+    fi
+  done
+  R1_JOINED="$out$t"
+}
+
+# The removal-word test's normal form: line continuations (r1_join_continuations),
+# the $ of a $'...' or $"..." opener, and every quote and backslash are deleted.
 R1_NORMALIZED=""
 r1_normalize() { # TEXT
-  local t="$1" nl=$'\n'
-  t="${t//\\$nl/}"
+  local t
+  r1_join_continuations "$1"
+  t="$R1_JOINED"
   t="${t//\$\'/\'}"
   t="${t//\$\"/\"}"
   t="${t//\'/}"
@@ -3670,9 +3717,10 @@ r1g_finish_chunk() { # RAW HIT HIT_BRACE OPEN_STACK NEWLINE_AFTER
   R1G_BASE_CP="$next_cp"
 }
 r1_scan_chunks() { # TEXT
-  local s="$1" nl=$'\n' n i=0 c prev="" chunk="" stack="" flags="" hit=0 hit_brace=0 in_chunk=0 newline=0
+  local s nl=$'\n' n i=0 c prev="" chunk="" stack="" flags="" hit=0 hit_brace=0 in_chunk=0 newline=0
   local word top flag k
-  s="${s//\\$nl/}"
+  r1_join_continuations "$1"
+  s="$R1_JOINED"
   n=${#s}
   R1G_CHUNKS=()
   R1G_CP=()
@@ -3903,10 +3951,12 @@ command_word_is_pattern() { # RAW
   return 1
 }
 
-# R1: true when TEXT holds a removal word. The word tests read the raw text
-# and, when it holds a #, the comment-continuation reading and the top-level
-# reading too (r1_split_comment_continuations, top_level_text); (f) reads the
-# top-level segments.
+# R1: true when TEXT holds a removal word. The word tests read the raw text,
+# the top-level reading of every command (top_level_text), and, when the text
+# holds a #, the comment-continuation reading (r1_split_comment_continuations);
+# (f) reads the top-level segments. The top-level reading finds a removal word
+# the segmenter reads as a command word even where R1's line join reads the
+# raw text wrongly.
 removal_word_in_text() { # TEXT
   local text="$1" k
   r1_word_tests "$text" && return 0
@@ -3914,10 +3964,10 @@ removal_word_in_text() { # TEXT
     *'#'*)
       r1_split_comment_continuations "$text"
       if [ "$R1_SPLIT_TEXT" != "$text" ]; then r1_word_tests "$R1_SPLIT_TEXT" && return 0; fi
-      top_level_text "$text"
-      r1_word_tests "$TOP_LEVEL_TEXT" && return 0
       ;;
   esac
+  top_level_text "$text"
+  if [ "$TOP_LEVEL_TEXT" != "$text" ]; then r1_word_tests "$TOP_LEVEL_TEXT" && return 0; fi
   # (f) a command word spelled with a pattern is presumed a removal word.
   collect_command_words "$text"
   k=0
