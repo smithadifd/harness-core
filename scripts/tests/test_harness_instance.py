@@ -187,6 +187,19 @@ def test_create_makes_private_files_and_folders(tmp_path):
         assert mode == (0o700 if path.is_dir() else 0o600), (path, oct(mode))
 
 
+@pytest.mark.parametrize("before", [0o755, 0o777, 0o750], ids=["0755", "0777", "0750"])
+def test_create_makes_an_existing_empty_folder_private_whatever_mode_it_had(tmp_path, before):
+    w = world(tmp_path)
+    target = w.work / "inst"
+    target.mkdir()
+    os.chmod(target, before)
+    assert stat.S_IMODE(target.stat().st_mode) == before
+    done = run("instance-create", w, target)
+    assert done.rc == 0, done.err
+    mode = stat.S_IMODE(target.stat().st_mode)
+    assert mode == 0o700, f"existing empty folder left at {oct(mode)}, not 0700"
+
+
 def test_create_follows_a_symlink_above_the_folder_and_names_the_real_path(tmp_path):
     w = world(tmp_path)
     real = w.work / "real"

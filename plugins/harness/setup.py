@@ -1901,6 +1901,9 @@ def instance_write(target: Path, existed: bool, files: list[tuple[str, bytes]], 
         made = None
     if made is None or not stat.S_ISDIR(made.st_mode):
         raise SetupError("git init reported success but made no .git folder")
+    # An existing empty folder keeps the mode it had (often 0755); the folder
+    # holds the person's plans, so it is made private like a new one.
+    os.fchmod(fds[""], 0o700)
 
 
 def instance_rollback(target: Path, writes: InstanceWrites, fds: dict[str, int]) -> list[str]:
