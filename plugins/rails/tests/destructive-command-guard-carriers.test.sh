@@ -435,6 +435,13 @@ deny L15 hidden_separator $'# x\\\\\\\nrm -rf /etc/hosts'
 # as a continuation, so the top-level reading is what finds the rm.
 deny L16 removal_beside_heredoc $'cat <<\'E\\\'\nhello\nE\\\nrm -rf /etc/hosts'
 deny L17 removal_beside_heredoc $'cat <<E\\\\\nhello\nE\\\nrm -rf /etc/hosts'
+# An even run, then a carrier word split by a real continuation: bash ends
+# echo at the newline and runs the carrier. Only R1's even-run test keeps
+# that newline; a join that deleted it would glue the carrier word to echo's
+# word, and the command would deny hidden_separator instead.
+deny L18 removal_beside_eval $'echo a\\\\\nev\\\nal rm -rf /etc/hosts'
+deny L19 removal_beside_source $'echo a\\\\\nsou\\\nrce ./x.sh; rm -rf build'
+deny L20 removal_beside_trap $'echo a\\\\\ntr\\\nap \'rm -rf /etc/hosts\' EXIT'
 
 printf '%s\n' '== S: rule G, a separator the segmenter did not split on =='
 # Bypass rows: a quote read differently from bash (a " inside a double-quoted

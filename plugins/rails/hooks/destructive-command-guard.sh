@@ -3464,7 +3464,8 @@ is_shell_name() { # WORD
 # continuation, and are deleted, only when the run of backslashes that ends at
 # that newline has odd length. In an even run every backslash is escaped (a\\
 # then a newline is a\ and a newline), so the newline stays and still ends the
-# command.
+# command. The carriers suite's L18 to L20 pin the even-run test: an even run
+# and then a carrier word split by a real continuation.
 R1_JOINED=""
 r1_join_continuations() { # TEXT
   local t="$1" out="" head run nl=$'\n'
@@ -4253,6 +4254,10 @@ r1_word_tests() { # TEXT
 # glue a carrier word to its line or hide it in a quote it opens, and the
 # comment-skipping copy cannot hide one by dropping text bash runs. The .
 # and variable_command checks read the command words of both readings.
+# The backslash-deleted tokens and the tokens of the segmenter's top-level
+# reading are redundant backstops: no row is known that only they catch (a
+# search of 288 candidate commands found none), so no test pins either one on
+# its own. They are kept because they only widen what R2 reads.
 CARRIER_CLASS=""
 find_carrier() { # TEXT
   local text="$1" tok k raw top_text="" top_text_g=""
@@ -4270,6 +4275,7 @@ find_carrier() { # TEXT
   toks=(${R1_TOKENS[@]+"${R1_TOKENS[@]}"})
   case "$text" in
     *"\\"*)
+      # Redundant backstop, not pinned on its own (see above).
       r1_normalize "${text//\\/}"
       r1_split_parameter_operators "$R1_NORMALIZED"
       r1_tokenize "$R1_OPSPLIT"
@@ -4290,6 +4296,7 @@ find_carrier() { # TEXT
       r1_split_parameter_operators "$R1_NORMALIZED"
       r1_tokenize "$R1_OPSPLIT"
       toks+=(${R1_TOKENS[@]+"${R1_TOKENS[@]}"})
+      # Redundant backstop, not pinned on its own (see above).
       r1_normalize "$top_text_g"
       r1_split_parameter_operators "$R1_NORMALIZED"
       r1_tokenize "$R1_OPSPLIT"
