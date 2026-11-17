@@ -10,6 +10,13 @@
 #      beside a shell, a substitution, a process substitution, a here-string
 #      or xargs denies as removal_beside_<construct> without the guard
 #      reading inside it;
+#   O  a command word glued with no blank to a control opener: a case arm's
+#      ")" (x), (x), a|x), x ), a multi-line arm, an arm after ;&) and the
+#      "))" of an arithmetic for or while (followed by do or {), read as the
+#      command word it is, for rm, git worktree remove and the repointing
+#      and source rows; the glued "(" forms (then(, do(, else(, {(,
+#      if((...))then) are pinned too: they deny through the pattern
+#      presumption for a command word that holds a "(";
 #   S  controls: ordinary commands with redirections and compound commands
 #      stay silent, and an accepted rm in a compound stays silent; an rm
 #      inside bash -c or eval denies even when its target is safe.
@@ -107,6 +114,62 @@ deny G20 removal_beside_shell 'bash -c "ln -s / l; rm -f l/etc/hosts"'
 # not read inside them.
 deny S11 removal_beside_shell 'bash -c "rm -f ./build/x"'
 deny S14 removal_beside_eval 'eval "rm -f ./build/x"'
+
+printf '%s\n' '== O: a command word glued to a control opener =='
+deny O1 unsafe_rm 'case x in x)rm -rf /etc/hosts;; esac'
+deny O2 unsafe_worktree_remove 'case x in x)git worktree remove --force /etc;; esac'
+deny O3 unsafe_rm 'case x in (x)rm -rf /etc/hosts;; esac'
+deny O4 unsafe_worktree_remove 'case x in (x)git worktree remove --force /etc;; esac'
+deny O5 unsafe_rm 'case x in a|x)rm -rf /etc/hosts;; esac'
+deny O6 unsafe_worktree_remove 'case x in a|x)git worktree remove --force /etc;; esac'
+deny O7 unsafe_rm $'case x in\n  x)rm -rf /etc/hosts ;;\nesac'
+deny O8 unsafe_worktree_remove $'case x in\n  x)git worktree remove --force /etc ;;\nesac'
+deny O9 unsafe_rm 'case x in x )rm -rf /etc/hosts;; esac'
+deny O10 unsafe_worktree_remove 'case x in x )git worktree remove --force /etc;; esac'
+# ;& is bash 4 and later; bash 3.2 refuses it, so it runs only there.
+deny O11 unsafe_rm 'case x in x) :;&y)rm -rf /etc/hosts;; esac'
+deny O12 unsafe_worktree_remove 'case x in x) :;&y)git worktree remove --force /etc;; esac'
+deny O13 unsafe_rm 'for ((i=0;i<1;i++))do rm -rf /etc/hosts; done'
+deny O14 unsafe_worktree_remove 'for ((i=0;i<1;i++))do git worktree remove --force /etc; done'
+# while ((...))do parses in bash 5; bash 3.2 refuses the glued do.
+deny O15 unsafe_rm 'while ((i++<1))do rm -rf /etc/hosts; done'
+deny O16 unsafe_worktree_remove 'while ((i++<1))do git worktree remove --force /etc; done'
+deny O17 unsafe_rm 'for ((i=0;i<1;i++)){ rm -rf /etc/hosts; }'
+deny O18 unsafe_worktree_remove 'for ((i=0;i<1;i++)){ git worktree remove --force /etc; }'
+deny O19 unsafe_rm $'case x in x)\trm -rf /etc/hosts;; esac'
+deny O20 unsafe_rm 'case "$1" in clean)rm -rf /etc/hosts;; esac'
+deny O21 unsafe_rm 'case x in x)rm -rf "$HOME";; esac'
+deny O22 unsafe_rm 'case x in x)RM -rf /etc/hosts;; esac'
+deny O23 unsafe_worktree_remove 'case x in x)git worktree remove --force ../other;; esac'
+deny O24 path_repointing_cd 'case x in x)cd /;; esac; rm -rf build'
+deny O25 path_repointing_pushd 'case x in x)pushd /;; esac; rm -rf build'
+deny O26 path_repointing_ln 'case x in x)ln -s / build/l;; esac; rm -rf build/l/etc'
+deny O27 removal_beside_source 'case x in x). ./scripts/setup.sh;; esac; rm -rf build'
+# Glued "(" forms: bash runs each; the command word holds a "(", so the
+# pattern presumption denies it.
+deny O28 removal_beside_variable_command 'if true; then(rm -rf /etc/hosts); fi'
+deny O29 removal_beside_variable_command 'if true; then(git worktree remove --force /etc); fi'
+deny O30 removal_beside_variable_command 'for i in 1; do(rm -rf /etc/hosts); done'
+deny O31 removal_beside_variable_command 'for i in 1; do(git worktree remove --force /etc); done'
+deny O32 removal_beside_variable_command 'if false; then :; else(rm -rf /etc/hosts); fi'
+deny O33 removal_beside_variable_command 'if false; then :; else(git worktree remove --force /etc); fi'
+deny O34 removal_beside_variable_command '{(rm -rf /etc/hosts); }'
+deny O35 removal_beside_variable_command '{(git worktree remove --force /etc); }'
+# if((...))then parses in bash 5; bash 3.2 refuses the glued then.
+deny O36 removal_beside_variable_command 'if((1))then rm -rf /etc/hosts; fi'
+deny O37 removal_beside_variable_command 'if((1))then git worktree remove --force /etc; fi'
+# The same glued forms with no removal word and no repointing stay silent,
+# and an accepted rm in a glued arm is silent as it is after a blank.
+silent O38 'case x in x)echo hi;; esac'
+silent O39 'case x in (x)echo hi;; esac'
+silent O40 'case x in a|x)echo hi;; esac'
+silent O41 $'case x in\n  x)echo hi ;;\nesac'
+silent O42 'case x in x )echo hi;; esac'
+silent O43 'case x in x) :;&y)echo hi;; esac'
+silent O44 'for ((i=0;i<1;i++))do echo hi; done'
+silent O45 'while ((i++<1))do echo hi; done'
+silent O46 'for ((i=0;i<1;i++)){ echo hi; }'
+silent O47 'case x in x)rm -rf build;; esac'
 
 printf '%s\n' '== S: controls stay silent =='
 silent S1 '2>/dev/null ls'
