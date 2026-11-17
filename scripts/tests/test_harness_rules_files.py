@@ -426,9 +426,11 @@ MUTATIONS = {
         "- Reproduce a CI-only failure locally before reasoning about it.",
         "- Reproduce a CI-only failure locally before reasoning about it, where you can.",
     ),
+    # Moved, not copied, into "Clean up", a free section: the whole-file count
+    # stays 1, so only the placement check can name it.
     "pinned-line-under-another-heading": _then(
         _replace(_REPRODUCE, ""),
-        _replace("\n## Command shapes", "- Reproduce a CI-only failure locally before reasoning about it.\n\n## Command shapes"),
+        _replace("\n## Where people read", "- Reproduce a CI-only failure locally before reasoning about it.\n\n## Where people read"),
     ),
     "required-line-removed": _replace("- Reproduce a CI-only failure locally before reasoning about it.\n", ""),
     "section-renamed": _replace("## Merge", "## Merge (optional)"),
@@ -600,6 +602,18 @@ def test_a_missing_reworded_or_copied_pinned_line_is_named():
     ):
         problems = _rule_problems(MUTATIONS[name](text))
         assert f"pinned line found {count} times in the file, not once: {named}" in problems, (name, problems)
+
+
+def test_a_pinned_line_moved_into_a_free_section_is_named_as_under_another_heading():
+    text = _rules_text()
+    line = "- Reproduce a CI-only failure locally before reasoning about it."
+    mutated = MUTATIONS["pinned-line-under-another-heading"](text)
+    whole = [raw.rstrip(" \t") for raw in mutated.split("\n")]
+    assert whole.count(line) == 1, "the line must be moved, not copied or lost"
+    assert line in _sections(mutated)["Clean up"], "the line must sit in the free section Clean up"
+    # The only problem is the placement message: the whole-file count is 1, and
+    # the free section holds no check of its own, so nothing else can name it.
+    assert _rule_problems(mutated) == [f"'Evidence': pinned line is under another heading: {_brief(line)}"]
 
 
 def test_the_phrase_check_alone_misses_the_negated_review_rule():
