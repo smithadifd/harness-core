@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plan, apply and remove the default-tier files and settings proposals.
+"""Plan, apply, remove, doctor and ledger-init: the default-tier setup.
 
 The setup skill drives this script. Plan writes nothing and takes no lock.
 Apply places the rules default, places the override starter when the person
@@ -7,7 +7,9 @@ has none, and adds each approved settings item that is absent: a missing key,
 or a deny rule appended after the existing ones. It never changes, removes or
 reorders an existing entry, and nothing it proposes grants anything. Remove
 takes out exactly what a complete setup record lists, and keeps and names
-anything the person has changed since.
+anything the person has changed since. Ledger-init makes the first ledger
+write, which creates the database file when it is absent. Doctor reads and
+reports: it writes nothing and takes no lock.
 
 The promise, in full, is in KNOWN-LIMITS.md ("Harness setup"). In short:
 
@@ -36,8 +38,10 @@ import hashlib
 import json
 import os
 import secrets
+import shlex
 import shutil
 import signal
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -71,6 +75,23 @@ RECORD_VERSION = 1
 LEDGER_PLUGIN = "ledger-hooks@harness-core"
 DEFAULT_HARNESS = "claude-code"
 
+# The option names the ledger-hooks plugin declares (its userConfig). Claude
+# Code refuses a name the plugin does not declare.
+OPTION_DB = "ledger_db"
+OPTION_OPERATOR = "ledger_operator"
+OPTION_HARNESS = "ledger_harness"
+OPTION_KEYS = (OPTION_DB, OPTION_OPERATOR, OPTION_HARNESS)
+
+DB_REL = ".local/share/ledger/ledger.db"
+
+# The first ledger write: one closed topic, keyed by its source so a repeat
+# is the same item. It exists to create the database file.
+FIRST_WRITE = ("new", "--type", "topic", "--title", "Harness setup",
+               "--source", "harness-setup", "--status", "closed")
+
+# The interpreters the ledger command itself looks for, in its order.
+PYTHONS = ("python3", "python3.14", "python3.13", "python3.12", "python3.11", "python")
+
 # Deny rules for reading secret files: env files and key material. Nothing
 # here is an allow rule, an extra directory, or an auto-allow key.
 DENY_RULES: tuple[str, ...] = (
@@ -101,6 +122,7 @@ PREFIX = "setup:"
 HEX = frozenset("0123456789abcdef")
 
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+FOLLOW_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
 READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
 TEMP_FLAGS = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
 LOCK_FLAGS = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -214,17 +236,21 @@ def one_line(text: str) -> str:
 
 
 def database_path(home: Path) -> Path:
-    return home / ".local" / "share" / "ledger" / "ledger.db"
+    return home.joinpath(*DB_REL.split("/"))
 
 
 def ledger_values(home: Path, operator: str, harness: str | None) -> dict[str, str]:
     values = {
-        "database": str(database_path(home)),
-        "operator": operator,
+        OPTION_DB: str(database_path(home)),
+        OPTION_OPERATOR: operator,
     }
     if harness:
-        values["harness"] = harness
+        values[OPTION_HARNESS] = harness
     return values
+
+
+def first_write_command(home: Path) -> list[str]:
+    return ["ledger", "--db", str(database_path(home)), *FIRST_WRITE]
 
 
 def optional_items() -> list[tuple[str, str]]:
@@ -336,11 +362,23 @@ def format_plan(home: Path, operator: str, harness: str | None) -> str:
         "----",
         f"FILE {RECORD_REL}",
         "record of this apply",
+        f"FILE {LOCK_REL}",
+        "the lock file, created empty; uninstall keeps it",
+        f"FILE {DB_REL}",
+        "the ledger database, made by the first ledger write below only when it is "
+        "absent; uninstall keeps it",
         "LEDGER",
         f"claude plugin configure {LEDGER_PLUGIN} --values-stdin",
         "----",
         json.dumps(values, indent=2),
         "----",
+        "FIRST LEDGER WRITE",
+        "----",
+        " ".join(shlex.quote(part) for part in first_write_command(home)),
+        "----",
+        f"SETTINGS {SETTINGS_REL}",
+        "changed only by an optional item below that you approve; Claude Code also "
+        "stores the ledger options in it",
     ]
     for ident, text in optional_items():
         lines.extend([f"OPTIONAL {ident}", "----", text, "----"])
@@ -409,6 +447,44 @@ class Tree:
             raise
         self.fds[rel] = fd
         return fd
+
+    def follow_dir(self, rel: str) -> int:
+        """The descriptor of the ledger database's folder rel. This is the one
+        folder setup opens by following symlinks, at rel or above it: the
+        database path is the person's, as the ledger command treats it. A
+        folder that is missing is made with ordinary mkdir, one level at a
+        time; the apply and remove walk above never comes here."""
+        key = f"follow:{rel}"
+        if key in self.fds:
+            return self.fds[key]
+        path = self.show(rel)
+        try:
+            try:
+                fd = os.open(path, FOLLOW_DIR_FLAGS)
+            except FileNotFoundError:
+                self.make_followed(rel)
+                fd = os.open(path, FOLLOW_DIR_FLAGS)
+        except OSError as exc:
+            raise SetupError(
+                f"cannot open the ledger database folder {path}: {one_line(exc)}") from exc
+        self.fds[key] = fd
+        return fd
+
+    def make_followed(self, rel: str) -> None:
+        """Make each missing level of rel below the home, each 0700. A level
+        that exists, as a folder or as a symlink, is left as it is."""
+        walked = ""
+        for name in rel.split("/"):
+            walked = f"{walked}/{name}" if walked else name
+            try:
+                os.mkdir(self.show(walked), 0o700)
+            except FileExistsError:
+                continue
+            fd = os.open(self.show(walked.rpartition("/")[0]), FOLLOW_DIR_FLAGS)
+            try:
+                sync(fd)
+            finally:
+                os.close(fd)
 
     def parent_of(self, rel: str) -> tuple[int | None, str]:
         parent_rel, _, name = rel.rpartition("/")
@@ -1282,6 +1358,362 @@ def remove_locked(tree: Tree) -> tuple[str, list[str]]:
 
 
 # ---------------------------------------------------------------------------
+# Ledger-init: the first ledger write
+
+
+def ledger_init_verb(home: Path, operator: str,
+                     harness: str | None) -> tuple[str, list[str], int]:
+    tree = Tree(home)
+    try:
+        lock = take_lock(tree)
+        try:
+            return ledger_init_locked(tree, operator, harness), [], 0
+        finally:
+            os.close(lock)
+    finally:
+        tree.close()
+
+
+def reserve_temp_name(parent: int, base: str) -> str:
+    """A name for the temporary database in the folder parent, one that no
+    entry has now. The ledger command creates the file."""
+    for _attempt in range(100):
+        name = temp_name(base)
+        try:
+            os.stat(name, dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            return name
+    raise SetupError("cannot find an unused name for the temporary ledger database")
+
+
+def confirm_first_write(path: str) -> None:
+    """The first write's topic is in the database at path: the log is folded
+    into the file, and the item the write creates is read back."""
+    source = FIRST_WRITE[FIRST_WRITE.index("--source") + 1]
+    try:
+        conn = sqlite3.connect(path, timeout=30)
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            rows = conn.execute(
+                "SELECT payload FROM events WHERE kind = 'item.created'").fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        raise SetupError(
+            f"the first ledger write made a database setup cannot read: {one_line(exc)}") from exc
+    for (payload,) in rows:
+        try:
+            if json.loads(payload).get("source") == source:
+                return
+        except (TypeError, ValueError, AttributeError):
+            continue
+    raise SetupError("the first ledger write reported success but the topic is not in the new database")
+
+
+def drop_temp_database(parent: int, temp: str) -> list[str]:
+    """Delete the temporary database and the files SQLite keeps beside it.
+    Returns the names it could not delete."""
+    left = []
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        try:
+            os.unlink(temp + suffix, dir_fd=parent)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            left.append(temp + suffix)
+    try:
+        sync(parent)
+    except OSError:
+        pass
+    return left
+
+
+def ledger_init_locked(tree: Tree, operator: str, harness: str | None) -> str:
+    """Make the first ledger write when the database file is absent. Setup
+    must have completed: the write is part of it. A database that already
+    exists is never written to."""
+    raw, head, body = read_record(tree)
+    if raw is None:
+        raise SetupError(f"no record at {tree.show(RECORD_REL)}; run apply first")
+    if body is None:
+        raise hard_stop_refusal(tree, head)
+    database = database_path(tree.root)
+    if os.path.lexists(database):
+        return (f"kept: ledger database already exists at {database}; "
+                "no first write was made\n")
+    ledger = shutil.which("ledger")
+    if not ledger:
+        raise SetupError(
+            "the ledger command is not on PATH; it comes with the ledger-hooks "
+            "plugin once that plugin is loaded (run /reload-plugins or start a "
+            "new session), then run ledger-init again")
+    # The write runs against a temporary database that setup owns, in the
+    # final path's own folder. The file is published to the final path only
+    # after the child has succeeded and the topic is in it, so a failed or
+    # timed-out child can never leave a partial file at the final path that
+    # the next run would take for a finished database.
+    parent_rel, _, base = DB_REL.rpartition("/")
+    parent = tree.follow_dir(parent_rel)
+    temp = reserve_temp_name(parent, base)
+    temp_path = tree.show(f"{parent_rel}/{temp}")
+    env = dict(os.environ)
+    env["LEDGER_DB"] = temp_path
+    env["LEDGER_OPERATOR"] = operator
+    env["LEDGER_HARNESS"] = harness or DEFAULT_HARNESS
+    command = [ledger, "--db", temp_path, *FIRST_WRITE]
+    try:
+        try:
+            done = subprocess.run(command, env=env, capture_output=True, text=True,
+                                  stdin=subprocess.DEVNULL, timeout=120)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise SetupError(f"the first ledger write failed: {one_line(exc)}") from exc
+        if done.returncode != 0:
+            detail = one_line(done.stderr or done.stdout or f"exit {done.returncode}")
+            raise SetupError(f"the first ledger write failed: {detail}")
+        try:
+            info = os.stat(temp, dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            info = None
+        if info is None or not stat.S_ISREG(info.st_mode):
+            raise SetupError(
+                f"the first ledger write reported success but made no database at {database}")
+        confirm_first_write(temp_path)
+        fd = os.open(temp, READ_FLAGS, dir_fd=parent)
+        try:
+            sync(fd)
+        finally:
+            os.close(fd)
+        try:
+            os.link(temp, base, src_dir_fd=parent, dst_dir_fd=parent)
+        except FileExistsError:
+            raise SetupError(
+                f"{database} appeared while the first ledger write was running; "
+                "it was not replaced, and the new database was dropped") from None
+        sync(parent)
+    finally:
+        left = drop_temp_database(parent, temp)
+    if left:
+        raise SetupError(
+            f"the ledger database was created, but these temporary files could not be "
+            f"removed: {', '.join(tree.show(f'{parent_rel}/{name}') for name in left)}")
+    return f"created: ledger database at {database}\n"
+
+
+# ---------------------------------------------------------------------------
+# Doctor: reads and reports, writes nothing, takes no lock
+
+
+class Report:
+    def __init__(self) -> None:
+        self.lines: list[str] = []
+        self.failed = False
+
+    def add(self, status: str, area: str, text: str) -> None:
+        if status == "FAIL":
+            self.failed = True
+        self.lines.append(f"{status} {area}: {one_line(text)}")
+
+    def guard(self, area: str, action: Callable[[], Any]) -> Any:
+        try:
+            return action()
+        except SetupError as exc:
+            self.add("FAIL", area, str(exc))
+        except Exception as exc:
+            self.add("FAIL", area, f"unexpected error: {type(exc).__name__}: {one_line(exc)}")
+        return None
+
+
+def item_label(item: dict[str, Any]) -> str:
+    if item["kind"] == "key":
+        return f"settings key {item['name']}"
+    return f"deny rule {item['value']}"
+
+
+def doctor_record(tree: Tree, report: Report) -> dict[str, Any] | None:
+    raw, head, body = read_record(tree)
+    if raw is None:
+        if tree.entry(BACKUP_REL) is not None:
+            report.add("FAIL", "record", f"leftover settings backup: {tree.show(BACKUP_REL)}")
+        else:
+            report.add("FAIL", "record",
+                       f"setup has not run: no record at {tree.show(RECORD_REL)}")
+        return None
+    if body is None:
+        report.add("FAIL", "record", str(hard_stop_refusal(tree, head)))
+        return None
+    report.add("ok", "record", f"setup record is complete: {tree.show(RECORD_REL)}")
+    return body
+
+
+def doctor_files(tree: Tree, body: dict[str, Any] | None, report: Report) -> None:
+    listed = {item["path"]: item["sha256"] for item in body["files"]} if body else {}
+    for rel in (RULES_REL, OVERRIDE_REL):
+        shown = tree.show(rel)
+        found = tree.read(rel)
+        if rel in listed:
+            if found is None:
+                report.add("FAIL", "files", f"placed by setup and now missing: {shown}")
+            elif digest(found[0]) == listed[rel]:
+                report.add("ok", "files", f"placed by setup and unchanged: {shown}")
+            else:
+                report.add("note", "files",
+                           f"changed since setup: {shown}; uninstall keeps it")
+        elif found is not None:
+            report.add("note", "files",
+                       f"present, but setup did not place it: {shown}; uninstall leaves it")
+        elif rel == RULES_REL:
+            report.add("FAIL", "files", f"missing: {shown}")
+        else:
+            report.add("note", "files", f"no override file: {shown}")
+
+
+def doctor_settings(tree: Tree, body: dict[str, Any] | None, report: Report) -> None:
+    if body is None:
+        return
+    info = body["settings"]
+    if not info["items"]:
+        report.add("ok", "settings", "setup added no settings item")
+        return
+    shown = tree.show(SETTINGS_REL)
+    found = read_settings(tree)
+    for item in info["items"]:
+        label = item_label(item)
+        if found is None:
+            report.add("note", "settings", f"{label} is already gone ({shown} is absent)")
+            continue
+        trial = json.loads(json.dumps(found[2]))
+        kept: list[str] = []
+        gone: list[str] = []
+        take_out(trial, {"items": [item], "created_deny": False,
+                         "created_permissions": False}, shown, kept, gone)
+        if kept:
+            report.add("note", "settings",
+                       f"{label} was moved or changed since setup; uninstall keeps it")
+        elif gone:
+            report.add("note", "settings", f"{label} is already gone; uninstall skips it")
+        else:
+            report.add("ok", "settings", f"{label} is in place as setup added it")
+
+
+def doctor_options(home: Path, report: Report) -> Path:
+    """Report the ledger plugin's stored options. Returns the database path
+    they name, or the default path when none is stored."""
+    default = database_path(home)
+    claude = shutil.which("claude")
+    if not claude:
+        report.add("FAIL", "options", "claude is not on PATH; cannot read the stored ledger options")
+        return default
+    try:
+        done = subprocess.run([claude, "plugin", "configure", LEDGER_PLUGIN, "--json"],
+                              capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                              timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        report.add("FAIL", "options", f"claude plugin configure failed: {one_line(exc)}")
+        return default
+    if done.returncode != 0:
+        detail = one_line(done.stderr or done.stdout or f"exit {done.returncode}")
+        report.add("FAIL", "options", f"claude plugin configure failed: {detail}")
+        return default
+    try:
+        data = json.loads(done.stdout)
+    except ValueError:
+        data = None
+    schema = data.get("schema") if isinstance(data, dict) else None
+    inputs = data.get("inputs") if isinstance(data, dict) else None
+    configured = data.get("configured") if isinstance(data, dict) else None
+    if (not isinstance(schema, dict) or not isinstance(inputs, dict)
+            or not isinstance(configured, list)):
+        report.add("FAIL", "options",
+                   "claude plugin configure --json gave output setup cannot read")
+        return default
+    stored = default
+    required = (OPTION_DB, OPTION_OPERATOR)
+    for key in OPTION_KEYS:
+        status = "FAIL" if key in required else "note"
+        value = inputs.get(key)
+        if key not in schema:
+            report.add(status, "options", f"{LEDGER_PLUGIN} declares no option {key}")
+        elif key not in configured or not isinstance(value, str) or not value:
+            report.add(status, "options", f"{key} is not set")
+        else:
+            report.add("ok", "options", f"{key} is set: {value}")
+            if key == OPTION_DB:
+                stored = Path(value)
+                if stored != default:
+                    report.add("note", "options",
+                               f"{key} is not the default path {default}; the database "
+                               "check below uses the stored path")
+    return stored
+
+
+def doctor_database(path: Path, report: Report) -> None:
+    try:
+        info = os.stat(path)
+    except FileNotFoundError:
+        report.add("FAIL", "ledger",
+                   f"the ledger database is missing: {path}; run ledger-init")
+        return
+    except OSError as exc:
+        report.add("FAIL", "ledger", f"cannot read the ledger database {path}: {one_line(exc)}")
+        return
+    if not stat.S_ISREG(info.st_mode):
+        report.add("FAIL", "ledger", f"the ledger database is not a regular file: {path}")
+    elif info.st_size == 0:
+        report.add("FAIL", "ledger", f"the ledger database is empty: {path}")
+    else:
+        report.add("ok", "ledger", f"the ledger database exists: {path} ({info.st_size} bytes)")
+
+
+def doctor_tools(report: Report) -> None:
+    found = None
+    for name in PYTHONS:
+        path = shutil.which(name)
+        if not path:
+            continue
+        try:
+            done = subprocess.run(
+                [path, "-I", "-S", "-B", "-c",
+                 "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)"],
+                capture_output=True, stdin=subprocess.DEVNULL, timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if done.returncode == 0:
+            found = path
+            break
+    if found:
+        report.add("ok", "tools", f"Python 3.11 or later: {found}")
+    else:
+        report.add("FAIL", "tools",
+                   "Python 3.11 or later is not on PATH; the ledger command needs it")
+    ledger = shutil.which("ledger")
+    if ledger:
+        report.add("ok", "tools", f"the ledger command: {ledger}")
+    else:
+        report.add("note", "tools",
+                   "the ledger command is not on PATH in this session; run /reload-plugins "
+                   "or start a new session")
+
+
+def doctor_verb(home: Path) -> tuple[str, list[str], int]:
+    tree = Tree(home)
+    report = Report()
+    try:
+        body = report.guard("record", lambda: doctor_record(tree, report))
+        report.guard("files", lambda: doctor_files(tree, body, report))
+        report.guard("settings", lambda: doctor_settings(tree, body, report))
+    finally:
+        tree.close()
+    stored = report.guard("options", lambda: doctor_options(home, report))
+    report.guard("ledger", lambda: doctor_database(stored or database_path(home), report))
+    report.guard("tools", lambda: doctor_tools(report))
+    counts = {name: sum(line.startswith(name + " ") for line in report.lines)
+              for name in ("ok", "note", "FAIL")}
+    report.lines.append(f"doctor: {counts['ok']} ok, {counts['note']} note, "
+                        f"{counts['FAIL']} FAIL")
+    return "".join(line + "\n" for line in report.lines), [], 1 if report.failed else 0
+
+
+# ---------------------------------------------------------------------------
 # Command line
 
 
@@ -1292,12 +1724,13 @@ class Parser(argparse.ArgumentParser):
 
 def build_parser() -> argparse.ArgumentParser:
     parser = Parser(description="Plan, apply or remove the default-tier setup.")
-    parser.add_argument("verb", choices=("plan", "apply", "remove"))
+    parser.add_argument("verb",
+                        choices=("plan", "apply", "remove", "doctor", "ledger-init"))
     parser.add_argument("--home", required=True, help="absolute path of the home folder")
     parser.add_argument("--operator", default=None,
-                        help="the ledger operator name (plan and apply)")
+                        help="the ledger operator name (plan, apply and ledger-init)")
     parser.add_argument("--harness", default=DEFAULT_HARNESS,
-                        help="the ledger harness name (plan and apply)")
+                        help="the ledger harness name (plan, apply and ledger-init)")
     parser.add_argument("--approve", action="append", default=[], metavar="ID",
                         help="approve one optional settings proposal by id")
     parser.add_argument("--approve-all", action="store_true",
@@ -1314,24 +1747,33 @@ def resolve_home(value: str) -> Path:
     return home
 
 
-def run(argv: list[str]) -> tuple[str, list[str]]:
+def run(argv: list[str]) -> tuple[str, list[str], int]:
+    """(standard output, warnings, exit status)."""
     args = build_parser().parse_args(argv)
     home = resolve_home(vars(args)["home"])
     if args.verb == "remove":
-        return remove_verb(home)
+        out, warnings = remove_verb(home)
+        return out, warnings, 0
+    if args.verb == "doctor":
+        return doctor_verb(home)
     if not args.operator:
+        if args.verb == "ledger-init":
+            raise SetupError("--operator is required for ledger-init")
         raise SetupError("--operator is required for plan and apply")
     harness = args.harness or None
+    if args.verb == "ledger-init":
+        return ledger_init_verb(home, args.operator, harness)
     if args.verb == "plan":
-        return format_plan(home, args.operator, harness), []
-    return apply_verb(home, args.operator, harness, args.approve, args.approve_all)
+        return format_plan(home, args.operator, harness), [], 0
+    out, warnings = apply_verb(home, args.operator, harness, args.approve, args.approve_all)
+    return out, warnings, 0
 
 
 def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGINT, signal.SIG_DFL)
     os.umask(0o077)
     try:
-        out, warnings = run(sys.argv[1:] if argv is None else argv)
+        out, warnings, status = run(sys.argv[1:] if argv is None else argv)
     except SetupError as exc:
         print(f"{PREFIX} {one_line(exc)}", file=sys.stderr)
         return 1
@@ -1342,7 +1784,7 @@ def main(argv: list[str] | None = None) -> int:
     sys.stdout.write(out)
     for line in warnings:
         print(f"{PREFIX} {line}", file=sys.stderr)
-    return 0
+    return status
 
 
 if __name__ == "__main__":

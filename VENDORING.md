@@ -68,7 +68,8 @@ the text itself.
 | `plugins/harness/.claude-plugin/plugin.json` | the harness plugin's manifest: its version and the plugins it depends on |
 | `plugins/harness/files/harness-local.md` | the override starter: HTML comments only, grants nothing |
 | `plugins/harness/files/harness.md` | the rules default placed by setup |
-| `plugins/harness/setup.py` | plan, apply and remove for the default-tier files and settings proposals |
+| `plugins/harness/setup.py` | plan, apply, remove, doctor and ledger-init for the default-tier files and settings proposals |
+| `plugins/harness/skills/setup/SKILL.md` | the setup skill: sets up, checks and uninstalls by driving the script |
 | `scripts/check-core-manifest.py` | checks that every tracked file is vendored or repository-only |
 | `scripts/check-ledger-vendor.py` | the vendored ledger's drift check |
 | `scripts/check-marketplace.py` | checks the marketplace and the harness plugin's manifest: folders, manifests, each external plugin bound to its expected source, full-commit pins, and, with the source option, each tag against its pin through the GitHub REST API, with no credential |
@@ -81,6 +82,9 @@ the text itself.
 | `scripts/tests/test_check_ledger_vendor.py` | tests of the ledger drift check |
 | `scripts/tests/test_check_no_person.py` | tests of the no-person check |
 | `scripts/tests/test_ci_workflow.py` | tests of the CI workflows' runners, triggers and gates, and that every gate script runs under an isolated python3 |
+| `scripts/tests/harness_fixtures.py` | the fixture home, the stub claude and ledger commands and the write trace the harness tests share |
+| `scripts/tests/test_harness_doctor.py` | tests of the doctor and ledger-init verbs |
+| `scripts/tests/test_harness_install.py` | the CI parts of the four install tests, and the README and the skill held to the script |
 | `scripts/tests/test_harness_rules_files.py` | tests of the rules default and the override starter |
 | `scripts/tests/test_harness_setup.py` | fixture-home tests of the harness plan, apply and remove script, with a hard stop and an injected exception at every step |
 | `scripts/tests/test_marketplace_manifest.py` | tests of the marketplace check (folders, manifests, expected sources, full-commit pins, tag against pin with a fake API fetch and with urllib's opener over a local transport) and of the plugin validation job |
