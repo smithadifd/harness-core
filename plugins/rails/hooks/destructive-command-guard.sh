@@ -1189,16 +1189,53 @@ strip_command_redirections() {
 # them still runs. Sets CONTROL_STRIPPED to the trimmed segment with every
 # leading opener removed: then, do, else, if, elif, while, until, coproc
 # (with the name of a named coprocess), time (with its -p), ! and { (each
-# followed by a blank), (, a case statement's head up to its first pattern, a
-# case arm's pattern (a first word that ends in an unquoted ")" and opens no
-# parenthesis, with a command after it), and a function definition's head
-# (NAME(), NAME (), function NAME).
+# followed by a blank), (, a case statement's head (case WORD in), a case
+# arm's pattern, and a function definition's head (NAME(), NAME (),
+# function NAME). A case arm's pattern ends at the first unquoted ")" in the
+# first word that closes no "(" the word opened, with more text after it;
+# bash needs no blank there, so x)rm, (x)rm, a|x)rm and the i++))do of an
+# arithmetic for all leave the command word behind the ")". A pattern
+# written with a blank before its ")" (x )rm) ends at a second word that
+# begins with ")".
 CONTROL_STRIPPED=""
 FUNCTION_HEAD_RE='^function[[:blank:]]+[^[:blank:](){}]+([[:blank:]]*\(\))?'
 NAME_PARENS_RE='^[A-Za-z_][A-Za-z0-9_.:-]*[[:blank:]]*\(\)'
 COPROC_NAME_RE='^[A-Za-z_][A-Za-z0-9_]*[[:blank:]]+[({]'
+# Sets CLOSE_INDEX to the index of the first unquoted ")" in the raw word
+# WORD that closes no "(" the word opened; returns 1 when there is none.
+# Quotes, backslash escapes, $'...', $(...), ${...} and backquotes are
+# skipped whole.
+CLOSE_INDEX=0
+first_free_close_paren() { # WORD
+  local s="$1" n="${#1}" i=0 depth=0
+  while [ "$i" -lt "$n" ]; do
+    case "${s:i:1}" in
+      \\) i=$((i + 2)); continue ;;
+      \') i=$((i + 1))
+          while [ "$i" -lt "$n" ] && [ "${s:i:1}" != "'" ]; do i=$((i + 1)); done ;;
+      \") skip_dquote "$s" $((i + 1)) || return 1; i="$SKIP_END"; continue ;;
+      \`) skip_backtick "$s" $((i + 1)) || return 1; i="$SKIP_END"; continue ;;
+      '$')
+        case "${s:i+1:1}" in
+          '(') skip_paren "$s" $((i + 2)) || return 1; i="$SKIP_END"; continue ;;
+          '{') skip_brace "$s" $((i + 2)) || return 1; i="$SKIP_END"; continue ;;
+          "'") i=$((i + 2))
+               while [ "$i" -lt "$n" ] && [ "${s:i:1}" != "'" ]; do
+                 [ "${s:i:1}" != "\\" ] || i=$((i + 1))
+                 i=$((i + 1))
+               done ;;
+        esac ;;
+      '(') depth=$((depth + 1)) ;;
+      ')')
+        if [ "$depth" -eq 0 ]; then CLOSE_INDEX="$i"; return 0; fi
+        depth=$((depth - 1)) ;;
+    esac
+    i=$((i + 1))
+  done
+  return 1
+}
 strip_control_openers() {
-  local segment="$1" previous_segment="" keyword
+  local segment="$1" previous_segment="" keyword first
   trim_horizontal "$segment"; segment="$TRIMMED"
   while [ -n "$segment" ] && [ "$segment" != "$previous_segment" ]; do
     previous_segment="$segment"
@@ -1217,13 +1254,26 @@ strip_control_openers() {
     if [ "$segment" = "$previous_segment" ]; then
       case "$segment" in
         '('*) segment="${segment#?}" ;;
-        case\ *' in '*') '*) segment="${segment#*) }" ;;
         *)
           if [[ "$segment" =~ $FUNCTION_HEAD_RE ]] || [[ "$segment" =~ $NAME_PARENS_RE ]]; then
             segment="${segment:${#BASH_REMATCH[0]}}"
-          elif split_shell_words "$segment" && [ "${#SPLIT_RAW[@]}" -gt 1 ] \
-            && [[ "${SPLIT_RAW[0]}" == *')' ]] && [[ "${SPLIT_RAW[0]}" != *'('* ]]; then
-            segment="${segment#"${SPLIT_RAW[0]}"}"
+          elif split_shell_words "$segment" && [ "${#SPLIT_RAW[@]}" -gt 3 ] \
+            && [ "${SPLIT_RAW[0]}" = case ] && [ "${SPLIT_RAW[2]}" = in ]; then
+            # The case head: case, its word and in. The pattern after it is
+            # cut on the next pass.
+            segment="${segment#case}"
+            trim_horizontal "$segment"; segment="${TRIMMED#"${SPLIT_RAW[1]}"}"
+            trim_horizontal "$segment"; segment="${TRIMMED#in}"
+          elif [ "${#SPLIT_RAW[@]}" -gt 0 ]; then
+            first="${SPLIT_RAW[0]}"
+            if first_free_close_paren "$first" \
+              && { [ $((CLOSE_INDEX + 1)) -lt "${#first}" ] || [ "${#SPLIT_RAW[@]}" -gt 1 ]; }; then
+              segment="${segment:$((CLOSE_INDEX + 1))}"
+            elif [ "${#SPLIT_RAW[@]}" -gt 1 ] && [[ "${SPLIT_RAW[1]}" == ')'* ]] \
+              && { [ "${#SPLIT_RAW[1]}" -gt 1 ] || [ "${#SPLIT_RAW[@]}" -gt 2 ]; }; then
+              segment="${segment#"$first"}"
+              trim_horizontal "$segment"; segment="${TRIMMED#?}"
+            fi
           fi ;;
       esac
     fi
