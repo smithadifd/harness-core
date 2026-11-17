@@ -109,7 +109,7 @@ REQUIRED_PHRASES = (
     "Three review rounds at most",
     "open bug finding",
     "written or explicitly approved by the human who merges",
-    "never by the change's author or its builder",
+    "never by the change's author or its builder.",
     "Every gating job's conclusion must be success",
     "a skipped, cancelled or neutral gating job does not count as green",
     "harness-local.md",
