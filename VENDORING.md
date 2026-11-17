@@ -68,7 +68,12 @@ the text itself.
 | `plugins/harness/.claude-plugin/plugin.json` | the harness plugin's manifest: its version and the plugins it depends on |
 | `plugins/harness/files/harness-local.md` | the override starter: HTML comments only, grants nothing |
 | `plugins/harness/files/harness.md` | the rules default placed by setup |
-| `plugins/harness/setup.py` | plan, apply, remove, doctor and ledger-init for the default-tier files and settings proposals |
+| `plugins/harness/files/instance/.gitignore` | the instance folder template: keeps a ledger database out of the repository |
+| `plugins/harness/files/instance/README.md` | the instance folder template: what the folder is and what goes in it |
+| `plugins/harness/files/instance/decisions/README.md` | the instance folder template: what belongs in decisions/ |
+| `plugins/harness/files/instance/roadmaps/README.md` | the instance folder template: what belongs in roadmaps/ |
+| `plugins/harness/files/instance/standards/README.md` | the instance folder template: what belongs in standards/ |
+| `plugins/harness/setup.py` | plan, apply, remove, doctor and ledger-init for the default-tier files and settings proposals, and instance-plan and instance-create for the optional instance folder |
 | `plugins/harness/skills/setup/SKILL.md` | the setup skill: sets up, checks and uninstalls by driving the script |
 | `plugins/rails/.claude-plugin/plugin.json` | the rails plugin's manifest: name, version, description, license |
 | `plugins/rails/hooks/hooks.json` | the rails plugin's hook registration: the destructive-command guard on every Bash call, exec form, onFailure block |
@@ -110,6 +115,7 @@ the text itself.
 | `scripts/tests/harness_fixtures.py` | the fixture home, the stub claude and ledger commands and the write trace the harness tests share |
 | `scripts/tests/test_harness_doctor.py` | tests of the doctor and ledger-init verbs |
 | `scripts/tests/test_harness_install.py` | the CI parts of the four install tests, and the README and the skill held to the script |
+| `scripts/tests/test_harness_instance.py` | tests of the instance template and the instance-plan and instance-create verbs, with an injected failure at every point |
 | `scripts/tests/test_harness_rules_files.py` | tests of the rules default and the override starter |
 | `scripts/tests/test_harness_setup.py` | fixture-home tests of the harness plan, apply and remove script, with a hard stop and an injected exception at every step |
 | `scripts/tests/test_marketplace_manifest.py` | tests of the marketplace check (folders, manifests, expected sources, full-commit pins, tag against pin with a fake API fetch and with urllib's opener over a local transport) and of the plugin validation job |

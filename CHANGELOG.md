@@ -5,6 +5,16 @@ and any pin move of the vendored ledger.
 
 ## Unreleased
 
+- The instance folder template moves into the `harness` plugin, at
+  `plugins/harness/files/instance/` (a README, a `.gitignore` and a README each
+  for `roadmaps/`, `decisions/` and `standards/`), and the setup skill offers it
+  as an optional step: a new folder of the person's choosing, made a local git
+  repository. `setup.py` gains `instance-plan` and `instance-create`, and the
+  skill gains `/harness:setup instance`. The template's text changes in one
+  respect: the instance folder holds markdown only, because the default tier
+  keeps the ledger database under the local share folder, so the workspace
+  settings walkthrough is gone. The folder is the person's: it is not in the
+  setup record, and `doctor` and uninstall never touch it.
 - The setup skill in the `harness` plugin (`/harness:setup`, with `doctor` and
   `uninstall`), driving `plugins/harness/setup.py`, which gains two verbs:
   `ledger-init` makes the first ledger write, which creates the database file

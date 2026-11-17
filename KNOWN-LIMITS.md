@@ -76,3 +76,15 @@ Advice, not a guarantee. The next apply or remove refuses, naming the record and
 - **Stored options are read through Claude Code.** `doctor` runs `claude plugin configure ledger-hooks@harness-core --json` and reports what it answers; it does not read them from `settings.json`, and a Claude Code that changes that output makes `doctor` fail by name.
 - **The guards' tools are not checked yet.** `doctor` checks Python 3.11 or later and the `ledger` command; the guard hooks, when they ship, add the tools they need.
 - **Uninstall's preview is `doctor`'s.** It judges each settings item against the current file the way remove does, but a file changed between the two runs is judged again by remove, which keeps what it cannot match.
+
+### The instance folder
+
+What `setup.py instance-create` promises, and what it leaves to you.
+
+- **The folder is yours, and setup keeps no record of it.** It is never in the setup record, apply does not make it and remove, uninstall and `doctor` never look at it. Nothing undoes it but you deleting the folder.
+- **A failure rolls back what this run made.** Each file it wrote, each subfolder it made and the folder itself if it made it are removed, one entry at a time and never recursively. What it cannot remove, including a partial `.git` that `git init` left, is kept and named in the refusal; a folder that then holds anything is refused on the next run until you clear it.
+- **A hard stop is not rolled back.** After a kill or a crash the folder may hold some of the files and no `.git`; the next run refuses it as not empty, and you delete what is there. Setup never acts on it.
+- **A folder is only ever filled when it was empty.** It is checked when the plan is made, again when create starts, and once more on the opened folder before the first file, and every file is created without replacing an entry and without following a symlink. A writer that fills the folder between the last check and a file's creation can make a file fail, and that is rolled back; it cannot make setup overwrite anything.
+- **The path is the person's.** The folder that holds the instance folder is followed through symlinks, as the shell would; the instance folder itself is never a symlink. Setup does not check whether the folder is already inside another git repository, or inside a synced folder.
+- **No commit, no remote, no identity.** Setup makes the repository and nothing else, so it never reads or sets a git identity.
+- **Private modes.** Setup's umask (077) makes the folders 0700 and the files 0600, and the `.git` folder inherits it.
