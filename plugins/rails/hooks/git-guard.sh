@@ -3095,25 +3095,35 @@ and_chain() { # FROM TO
   return 0
 }
 
-# C2: true when no segment from FROM up to TO (not included) closes the ( )
-# or { } group that segment FROM's command runs in. A cd in a subshell ends
-# with the subshell, so a tracked segment whose group closes before the push
-# does not move the push.
-group_holds_until() { # FROM TO
-  local k=0 depth
+# C1 and C2, read once per push at segment PUSH_INDEX. SCOPE_ALL_AND is 1
+# when every delimiter from the first segment to the push is && (an earlier
+# || can skip a tracked segment while the push still runs). SCOPE_HOLDS[k]
+# is 1 when no segment from k up to the push closes the ( ) or { } group that
+# segment k's command runs in (a cd in a subshell ends with the subshell).
+# One pass each way, so a long chain stays linear.
+SCOPE_ALL_AND=0
+SCOPE_HOLDS=()
+tracked_scope() { # PUSH_INDEX
+  local k=0 low=""
+  local -a open after
+  open=()
+  after=()
+  SCOPE_HOLDS=()
+  SCOPE_ALL_AND=0
+  and_chain 0 "$1" && SCOPE_ALL_AND=1
   GROUP_DEPTH=0
   while [ "$k" -lt "$1" ]; do
     group_depth_step "${SEGS[$k]}"
+    open[k]="$GROUP_OPEN_DEPTH"
+    after[k]="$GROUP_DEPTH"
     k=$((k + 1))
   done
-  group_depth_step "${SEGS[$1]}"
-  depth="$GROUP_OPEN_DEPTH"
-  while :; do
-    [ "$GROUP_DEPTH" -ge "$depth" ] || return 1
-    k=$((k + 1))
-    [ "$k" -lt "$2" ] || return 0
-    group_depth_step "${SEGS[$k]}"
+  while [ "$k" -gt 0 ]; do
+    k=$((k - 1))
+    if [ -z "$low" ] || [ "${after[$k]}" -lt "$low" ]; then low="${after[$k]}"; fi
+    if [ "$low" -ge "${open[$k]}" ]; then SCOPE_HOLDS[k]=1; else SCOPE_HOLDS[k]=0; fi
   done
+  return 0
 }
 
 # Joins a cd or -C path to FOLDER as git and cd do.
@@ -3150,7 +3160,8 @@ target_read() { # FOLDER ARGS...
 # tracks the folder (cd, pushd) and a branch set by checkout -b, only when
 # every delimiter from the first segment to the push is && (C1: an earlier ||
 # can skip the tracked segment while the push still runs) and no group that
-# holds the tracked segment closes before the push (C2).
+# holds the tracked segment closes before the push (C2), as tracked_scope
+# read them for this push.
 EARLIER_UNRESOLVED=0
 EARLIER_FOLDER=""
 EARLIER_BRANCH=""
@@ -3192,8 +3203,8 @@ earlier_segment() { # INDEX PUSH_INDEX
     w="${RS_WORDS[$((cmd + 1))]}"
     raw_word_literal "${RS_RAW[$((cmd + 1))]}" "${RS_OBS[$((cmd + 1))]}" || { EARLIER_UNRESOLVED=1; return 0; }
     case "$w" in ''|-*|'~'*) EARLIER_UNRESOLVED=1; return 0 ;; esac
-    and_chain 0 "$push_idx" || { EARLIER_UNRESOLVED=1; return 0; }
-    group_holds_until "$idx" "$push_idx" || { EARLIER_UNRESOLVED=1; return 0; }
+    [ "$SCOPE_ALL_AND" -eq 1 ] || { EARLIER_UNRESOLVED=1; return 0; }
+    [ "${SCOPE_HOLDS[$idx]:-0}" -eq 1 ] || { EARLIER_UNRESOLVED=1; return 0; }
     join_folder "$EARLIER_FOLDER" "$w"
     EARLIER_FOLDER="$JOINED_FOLDER"
     return 0
@@ -3231,8 +3242,8 @@ earlier_segment() { # INDEX PUSH_INDEX
           case "${RS_WORDS[$((k + 1))]}" in -*) EARLIER_UNRESOLVED=1; return 0 ;; esac
         fi
         [ "${#GW_CPATHS[@]}" -eq 0 ] && [ "$GW_REPO" -eq 0 ] || { EARLIER_UNRESOLVED=1; return 0; }
-        and_chain 0 "$push_idx" || { EARLIER_UNRESOLVED=1; return 0; }
-        group_holds_until "$idx" "$push_idx" || { EARLIER_UNRESOLVED=1; return 0; }
+        [ "$SCOPE_ALL_AND" -eq 1 ] || { EARLIER_UNRESOLVED=1; return 0; }
+        [ "${SCOPE_HOLDS[$idx]:-0}" -eq 1 ] || { EARLIER_UNRESOLVED=1; return 0; }
         EARLIER_BRANCH="$name"
         EARLIER_BRANCH_FOLDER="$EARLIER_FOLDER"
         return 0
@@ -3256,6 +3267,7 @@ resolve_target() { # INDEX NO_REFSPEC
   EARLIER_FOLDER="$cwd_raw"
   EARLIER_BRANCH=""
   EARLIER_BRANCH_FOLDER=""
+  tracked_scope "$idx"
   k=0
   while [ "$k" -lt "$idx" ]; do
     earlier_segment "$k" "$idx"
