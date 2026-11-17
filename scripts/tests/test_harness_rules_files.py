@@ -91,8 +91,10 @@ GRANT_SHAPED = (
 
 # Phrases the rules default must keep, so a rewrite that drops a core rule
 # goes red: the fresh-context review in two passes, falsifiable evidence, the
-# human merge, CI read per job and the merge pinned to its head, live reach,
-# and the pointer to the override file.
+# human merge, CI read per job with every gating job a success and the merge
+# pinned to its head, a bug waiver only from the human who merges and never
+# from the change's own author, live reach, and the pointer to the override
+# file.
 REQUIRED_PHRASES = (
     "fresh-context review",
     "two passes",
@@ -104,6 +106,10 @@ REQUIRED_PHRASES = (
     "live reach",
     "Three review rounds at most",
     "open bug finding",
+    "written or explicitly approved by the human who merges",
+    "never by the change's author or its builder",
+    "Every gating job's conclusion must be success",
+    "a skipped, cancelled or neutral gating job does not count as green",
     "harness-local.md",
 )
 

@@ -8,7 +8,7 @@ Working agreements for every Claude Code session on this machine and every agent
 
 - Every change bound for a merge gets a fresh-context review, by a reviewer that did not write it, before the merge. Review in two passes, in order: does the change do what was asked, then does it meet the standards. Report correctness and requirement gaps.
 - Three review rounds at most. Round 2 and later review the delta since the last round. At the cap the change goes back to planning unless only nits remain, and nothing merges with unreviewed commits after the last round.
-- An open bug finding from any reviewer blocks the merge. Overriding one takes a written waiver in the pull request that says why the path cannot be reached.
+- An open bug finding from any reviewer blocks the merge. Clearing one takes a waiver in the pull request that says why the path cannot be reached, written or explicitly approved by the human who merges (or whoever harness-local.md names as the merge step), never by the change's author or its builder alone.
 
 ## Evidence
 
@@ -20,7 +20,7 @@ Working agreements for every Claude Code session on this machine and every agent
 ## Merge
 
 - A human merges. What counts as the human step is the override's to say; with none, the session stops with the pull request ready and its review attached, and a person merges.
-- CI is green on the final head, on a run created after the pull request was marked ready. Read each job's conclusion (`gh run view --json jobs`): a skipped job shows green.
+- CI is green on the final head, on a run created after the pull request was marked ready. Read each job's conclusion (`gh run view --json jobs`): a skipped job shows green. Every gating job's conclusion must be success; a skipped, cancelled or neutral gating job does not count as green.
 - Pin the merge to the reviewed head (`gh pr merge --match-head-commit <sha>`), so a commit pushed after the review cannot land with it.
 - Ask before anything with live reach, and wait for the answer: deploys, live hooks and wrappers, scheduled jobs, secrets, settings files, and any edit that changes who may approve or merge. This holds even where merging is otherwise granted.
 - Never bypass a safety check (`--no-verify`, skipped hooks). Ask before a destructive operation: a force-push, a history rewrite, a hard reset, a dropped table.
