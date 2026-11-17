@@ -1,0 +1,4 @@
+# This folder holds markdown only, and markdown is what gets versioned. The ledger database is
+# machine-local state kept under the local share folder, not here; if one is ever put in this
+# folder, it is still never committed.
+.ledger/

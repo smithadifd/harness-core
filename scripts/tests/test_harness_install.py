@@ -422,7 +422,8 @@ def test_the_skill_names_every_verb_and_never_approves_everything_at_once():
     text = SKILL.read_text(encoding="utf-8")
     front = text.split("---", 2)[1]
     assert re.search(r"^name: setup$", front, re.MULTILINE)
-    for verb in ("plan", "apply", "doctor", "ledger-init", "remove"):
+    for verb in ("plan", "apply", "doctor", "ledger-init", "remove", "instance-plan",
+                 "instance-create"):
         assert f"setup.py\" {verb} " in text or f"setup.py {verb} " in text, verb
     # The one mention is the rule against it; no command in the skill uses it.
     assert [line for line in text.splitlines()
@@ -450,16 +451,16 @@ def skill_commands(text):
 
 def test_the_skill_single_quotes_every_value_the_model_substitutes():
     text = SKILL.read_text(encoding="utf-8")
-    seen = {"--operator": 0, "--harness": 0, "--approve": 0}
+    seen = {"--operator": 0, "--harness": 0, "--approve": 0, "--path": 0}
     commands = skill_commands(text)
-    assert len(commands) == 5
+    assert len(commands) == 7
     for command in commands:
-        for flag, value in re.findall(r"(--operator|--harness|--approve) (\S+)", command):
+        for flag, value in re.findall(r"(--operator|--harness|--approve|--path) (\S+)", command):
             assert re.fullmatch(r"'<[a-z]+>'", value), f"unquoted {flag} value {value}: {command}"
             seen[flag] += 1
         bare = re.sub(r"'<[a-z]+>'", "", command)
         assert "<" not in bare and ">" not in bare, f"unquoted placeholder: {command}"
-    assert seen == {"--operator": 3, "--harness": 3, "--approve": 2}
+    assert seen == {"--operator": 3, "--harness": 3, "--approve": 2, "--path": 2}
     # The skill says why.
     assert "parentheses" in text and "deny:Read(.env)" in text
 

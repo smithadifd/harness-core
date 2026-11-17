@@ -11,6 +11,12 @@ anything the person has changed since. Ledger-init makes the first ledger
 write, which creates the database file when it is absent. Doctor reads and
 reports: it writes nothing and takes no lock.
 
+Instance-plan and instance-create are the optional instance folder: a new
+folder of the person's choosing, made a local git repository, holding the
+template's markdown. It is the person's own: the setup record never lists it,
+setup holds no lock for it, and doctor and remove never look at it. A create
+that fails rolls back exactly what it made.
+
 The promise, in full, is in KNOWN-LIMITS.md ("Harness setup"). In short:
 
 - a run that completes leaves exactly the documented result;
@@ -53,6 +59,16 @@ PLUGIN_ROOT = Path(__file__).resolve().parent
 FILES_DIR = PLUGIN_ROOT / "files"
 RULES_SOURCE = FILES_DIR / "harness.md"
 OVERRIDE_SOURCE = FILES_DIR / "harness-local.md"
+INSTANCE_SOURCE = FILES_DIR / "instance"
+# Every file of the instance template, as a path inside the instance folder.
+# A test holds this list to the files that are in the template folder.
+INSTANCE_FILES = (
+    ".gitignore",
+    "README.md",
+    "decisions/README.md",
+    "roadmaps/README.md",
+    "standards/README.md",
+)
 
 CLAUDE_REL = ".claude"
 RULES_DIR_REL = ".claude/rules"
@@ -120,6 +136,15 @@ GRANTING_KEYS = frozenset({
 
 PREFIX = "setup:"
 HEX = frozenset("0123456789abcdef")
+
+# Variables that would make git act on another repository than the instance
+# folder; they are dropped from the environment of the one git command.
+GIT_LOCATION_ENV = frozenset({
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR", "GIT_NAMESPACE",
+    "GIT_CEILING_DIRECTORIES", "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT",
+})
 
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 FOLLOW_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
@@ -1714,6 +1739,266 @@ def doctor_verb(home: Path) -> tuple[str, list[str], int]:
 
 
 # ---------------------------------------------------------------------------
+# The instance folder: the person's own. Nothing here is recorded, placed or
+# removed by setup, and doctor and remove never look at it.
+
+
+def instance_sources() -> list[tuple[str, bytes]]:
+    """(path inside the instance folder, bytes) for each template file."""
+    found = []
+    for rel in INSTANCE_FILES:
+        path = INSTANCE_SOURCE.joinpath(*rel.split("/"))
+        if not path.is_file():
+            raise SetupError(f"instance/{rel} is missing from the plugin files folder")
+        found.append((rel, path.read_bytes()))
+    return found
+
+
+def which_git() -> str:
+    found = shutil.which("git")
+    if not found:
+        raise SetupError("git is not on PATH; the instance folder is made a git repository")
+    return found
+
+
+def instance_target(home: Path, raw: str | None) -> tuple[Path, bool]:
+    """The instance folder as an absolute path, and whether it exists now (an
+    empty folder). The folder that holds it is the person's and is followed
+    through symlinks; the instance folder itself is never a symlink, never a
+    file, never holds anything and is never under the home's .claude folder.
+    Nothing is written."""
+    if not raw:
+        raise SetupError("--path is required for instance-plan and instance-create")
+    if not os.path.isabs(raw):
+        raise SetupError("the instance folder must be an absolute path")
+    if ".." in raw.split("/"):
+        raise SetupError("the instance folder path must not hold a .. part")
+    cleaned = Path(os.path.normpath(raw))
+    if not cleaned.name:
+        raise SetupError("the instance folder cannot be the root folder")
+    parent = Path(os.path.realpath(cleaned.parent))
+    if not parent.is_dir():
+        raise SetupError(f"the folder that should hold the instance folder does not exist: {parent}")
+    target = parent / cleaned.name
+    claude = home / CLAUDE_REL
+    for shut in (claude, Path(os.path.realpath(claude))):
+        if target == shut or shut in target.parents:
+            raise SetupError(
+                f"the instance folder cannot be inside {shut}: that folder is Claude Code's")
+    try:
+        info = os.lstat(target)
+    except FileNotFoundError:
+        return target, False
+    if stat.S_ISLNK(info.st_mode):
+        raise SetupError(f"{target} is a symlink; choose a new folder")
+    if not stat.S_ISDIR(info.st_mode):
+        raise SetupError(f"{target} exists and is not a folder")
+    try:
+        entries = os.listdir(target)
+    except OSError as exc:
+        raise SetupError(f"cannot read {target}: {one_line(exc)}") from exc
+    if entries:
+        raise SetupError(f"{target} is not empty; the instance folder must be new or empty")
+    return target, True
+
+
+def instance_plan_verb(home: Path, raw: str | None) -> tuple[str, list[str], int]:
+    target, existed = instance_target(home, raw)
+    files = instance_sources()
+    git = which_git()
+    lines = [
+        f"INSTANCE FOLDER {target}",
+        ("an existing empty folder, which stays" if existed
+         else "a new folder, made now") + "; folders are mode 0700 and files 0600",
+    ]
+    for rel, data in files:
+        lines.extend([f"INSTANCE FILE {rel}", "----", data.decode("utf-8").rstrip("\n"), "----"])
+    lines.extend([
+        "GIT REPOSITORY",
+        "----",
+        f"{shlex.quote(git)} -C {shlex.quote(str(target))} init -q",
+        "----",
+        "NOT DONE: no commit, no remote and no setting is made, and nothing under "
+        f"{home / CLAUDE_REL} changes; setup records nothing about this folder, "
+        "and doctor and uninstall never touch it",
+    ])
+    return "\n".join(lines) + "\n", [], 0
+
+
+class InstanceWrites:
+    """What instance-create has made, in memory, each added as it lands."""
+
+    def __init__(self) -> None:
+        self.root_made = False
+        # The mode an existing empty folder had before it was made private;
+        # None until that mode change has landed.
+        self.root_mode: int | None = None
+        self.dirs: list[str] = []
+        self.files: list[str] = []
+
+
+def instance_git_init(git: str, target: Path) -> None:
+    env = {key: value for key, value in os.environ.items()
+           if key not in GIT_LOCATION_ENV
+           and not key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))}
+    try:
+        done = subprocess.run([git, "-C", str(target), "init", "-q"], env=env,
+                              capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                              timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise SetupError(f"git init failed: {one_line(exc)}") from exc
+    if done.returncode != 0:
+        detail = one_line(done.stderr or done.stdout or f"exit {done.returncode}")
+        raise SetupError(f"git init failed: {detail}")
+
+
+def instance_write(target: Path, existed: bool, files: list[tuple[str, bytes]], git: str,
+                   writes: InstanceWrites, fds: dict[str, int]) -> None:
+    """Make the folder if it is new, write each file into it (never over an
+    entry, never through a symlink), then make it a git repository."""
+    if not existed:
+        try:
+            os.mkdir(str(target), 0o700)
+        except FileExistsError:
+            raise SetupError(
+                f"{target} appeared while setup was running; nothing was written") from None
+        writes.root_made = True
+        outer = os.open(str(target.parent), FOLLOW_DIR_FLAGS)
+        try:
+            sync(outer)
+        finally:
+            os.close(outer)
+    try:
+        fds[""] = os.open(str(target), DIR_FLAGS)
+    except OSError as exc:
+        raise SetupError(f"cannot open {target}: {one_line(exc)}") from exc
+    if os.listdir(fds[""]):
+        raise SetupError(f"{target} is not empty; the instance folder must be new or empty")
+    if existed:
+        # An existing empty folder keeps the mode it had (often 0755); the folder
+        # holds the person's plans, so it is made private like a new one. This is
+        # done before anything, .git included, is made inside it, and the mode it
+        # had is kept so that any later failure puts it back.
+        before = stat.S_IMODE(os.fstat(fds[""]).st_mode)
+        os.fchmod(fds[""], 0o700)
+        writes.root_mode = before
+
+    def folder(rel: str) -> int:
+        if rel in fds:
+            return fds[rel]
+        above, _, name = rel.rpartition("/")
+        parent = folder(above)
+        os.mkdir(name, 0o700, dir_fd=parent)
+        writes.dirs.append(rel)
+        fds[rel] = os.open(name, DIR_FLAGS, dir_fd=parent)
+        return fds[rel]
+
+    for rel, data in files:
+        above, _, name = rel.rpartition("/")
+        parent = folder(above)
+        fd = os.open(name, TEMP_FLAGS, 0o600, dir_fd=parent)
+        writes.files.append(rel)
+        try:
+            write_all(fd, data)
+            sync(fd)
+        finally:
+            os.close(fd)
+    for rel in sorted(fds, key=lambda name: name.count("/"), reverse=True):
+        sync(fds[rel])
+    instance_git_init(git, target)
+    try:
+        made = os.stat(".git", dir_fd=fds[""], follow_symlinks=False)
+    except FileNotFoundError:
+        made = None
+    if made is None or not stat.S_ISDIR(made.st_mode):
+        raise SetupError("git init reported success but made no .git folder")
+
+
+def instance_rollback(target: Path, writes: InstanceWrites, fds: dict[str, int]) -> list[str]:
+    """Undo what instance_write made: each file, then each subfolder it made,
+    then the folder itself if it made it, or the mode an existing folder had
+    if it changed that. Nothing is deleted recursively. A
+    leftover (git's own partial .git, an entry that would not go) is kept and
+    named; returns the names."""
+    kept: list[str] = []
+    root = fds.get("")
+    if root is not None:
+        for rel in reversed(writes.files):
+            above, _, name = rel.rpartition("/")
+            try:
+                os.unlink(name, dir_fd=fds[above])
+            except FileNotFoundError:
+                continue
+            except OSError:
+                kept.append(str(target / rel))
+        for rel in reversed(writes.dirs):
+            above, _, name = rel.rpartition("/")
+            try:
+                os.rmdir(name, dir_fd=fds[above])
+            except FileNotFoundError:
+                continue
+            except OSError:
+                kept.append(str(target / rel))
+        try:
+            os.stat(".git", dir_fd=root, follow_symlinks=False)
+        except OSError:
+            pass
+        else:
+            kept.append(str(target / ".git"))
+        if writes.root_mode is not None:
+            try:
+                os.fchmod(root, writes.root_mode)
+            except OSError:
+                kept.append(str(target))
+    for fd in fds.values():
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    fds.clear()
+    if writes.root_made:
+        try:
+            os.rmdir(str(target))
+        except FileNotFoundError:
+            pass
+        except OSError:
+            if str(target / ".git") not in kept:
+                kept.append(str(target))
+    return kept
+
+
+def instance_create_verb(home: Path, raw: str | None) -> tuple[str, list[str], int]:
+    target, existed = instance_target(home, raw)
+    files = instance_sources()
+    git = which_git()
+    writes = InstanceWrites()
+    fds: dict[str, int] = {}
+    try:
+        instance_write(target, existed, files, git, writes, fds)
+    except Exception as exc:
+        made = writes.root_made or bool(writes.dirs) or bool(writes.files)
+        kept = instance_rollback(target, writes, fds)
+        if isinstance(exc, SetupError):
+            message = str(exc)
+        else:
+            message = f"unexpected error: {type(exc).__name__}: {one_line(exc)}"
+        if kept:
+            raise SetupError(f"{message}; rolled back, except for what is kept: "
+                             f"{', '.join(kept)}") from exc
+        if made:
+            raise SetupError(f"{message}; rolled back, nothing was left") from exc
+        raise SetupError(message) from exc
+    for fd in fds.values():
+        os.close(fd)
+    lines = [f"created: {target} ({'the empty folder' if existed else 'a new folder'})"]
+    lines += [f"created: {target / rel}" for rel, _data in files]
+    lines.append(f"created: git repository at {target / '.git'}")
+    lines.append("no commit was made and no remote was added; "
+                 "setup records nothing about this folder, and doctor and uninstall never touch it")
+    return "".join(line + "\n" for line in lines), [], 0
+
+
+# ---------------------------------------------------------------------------
 # Command line
 
 
@@ -1725,7 +2010,8 @@ class Parser(argparse.ArgumentParser):
 def build_parser() -> argparse.ArgumentParser:
     parser = Parser(description="Plan, apply or remove the default-tier setup.")
     parser.add_argument("verb",
-                        choices=("plan", "apply", "remove", "doctor", "ledger-init"))
+                        choices=("plan", "apply", "remove", "doctor", "ledger-init",
+                                 "instance-plan", "instance-create"))
     parser.add_argument("--home", required=True, help="absolute path of the home folder")
     parser.add_argument("--operator", default=None,
                         help="the ledger operator name (plan, apply and ledger-init)")
@@ -1735,6 +2021,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="approve one optional settings proposal by id")
     parser.add_argument("--approve-all", action="store_true",
                         help="approve every optional settings proposal")
+    parser.add_argument("--path", default=None,
+                        help="the absolute path of the instance folder "
+                             "(instance-plan and instance-create)")
     return parser
 
 
@@ -1756,6 +2045,10 @@ def run(argv: list[str]) -> tuple[str, list[str], int]:
         return out, warnings, 0
     if args.verb == "doctor":
         return doctor_verb(home)
+    if args.verb == "instance-plan":
+        return instance_plan_verb(home, args.path)
+    if args.verb == "instance-create":
+        return instance_create_verb(home, args.path)
     if not args.operator:
         if args.verb == "ledger-init":
             raise SetupError("--operator is required for ledger-init")
