@@ -93,8 +93,8 @@ GRANT_SHAPED = (
 # goes red: the fresh-context review in two passes, falsifiable evidence, the
 # human merge, CI read per job with every gating job a success and the merge
 # pinned to its head, a bug waiver only from the human who merges and never
-# from the change's own author, live reach, and the pointer to the override
-# file.
+# from the change's own author, live reach, sandboxed delegated work, no
+# bypassed safety check, and the pointer to the override file.
 REQUIRED_PHRASES = (
     "fresh-context review",
     "two passes",
@@ -104,6 +104,8 @@ REQUIRED_PHRASES = (
     "a skipped job shows green",
     "--match-head-commit",
     "live reach",
+    "Subagents and background jobs run sandboxed by default",
+    "Never bypass a safety check",
     "Three review rounds at most",
     "open bug finding",
     "written or explicitly approved by the human who merges",
