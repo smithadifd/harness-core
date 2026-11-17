@@ -76,6 +76,9 @@ gg_row "K-41 --reuse-message= is exempt" silent 'git commit --reuse-message=HEAD
 gg_row "K-42 --sq= abbreviation is exempt" silent 'git commit --sq=HEAD -m nope'
 gg_row "K-43 an unknown git option before commit is unreadable" deny:commit_message_unreadable 'git --future commit -m nope'
 gg_row "K-44 the double-quoted-delimiter heredoc subject (one trailing quote stripped)" silent "$HEREDOC_DQ_OK"
+gg_row "K-45 a backslash inside the git word, not conventional" deny:commit_nonconventional 'g\it commit -m nope'
+gg_row "K-46 an empty quote pair inside the git word, not conventional" deny:commit_nonconventional 'g""it commit -m nope'
+gg_row "K-47 a backslash inside the git word, conventional" silent 'g\it commit -m "feat: x"'
 
 printf '%s\n' '== Commit style at the default (off) =='
 GG_COMMIT=off

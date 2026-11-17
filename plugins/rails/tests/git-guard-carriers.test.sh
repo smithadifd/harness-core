@@ -103,6 +103,7 @@ gg_row "C-K11 an argument of echo does not reach" silent 'echo GIT_DIR=/x; git p
 gg_row "C-K12 env with a GIT_ assignment" ask:push_git_environment 'env GIT_WORK_TREE=y git push origin feature'
 gg_row "C-K13 a push mapping with -c" ask:git_config_injection 'git -c remote.origin.push=+HEAD:feature push origin'
 gg_row "C-K14 an unrelated GIT_ name" silent 'GIT_TERMINAL_PROMPT=0 git push origin feature'
+gg_row "C-K15 an alias defined with -c through a backslashed git word" ask:git_config_injection 'g\it -c alias.p=log p'
 
 GG_A_4067="$(python3 -I -c 'import sys; sys.stdout.write("A" * 4067)')"
 GG_A_4069="$(python3 -I -c 'import sys; sys.stdout.write("A" * 4069)')"

@@ -43,6 +43,15 @@ gg_row "M-G6 dashed command word" ask:push_main_branch 'git-push origin main'
 gg_row "M-G7 PUSH in capitals" ask:push_main_branch 'git PUSH origin main'
 gg_row "M-G8 a redirection after the words" ask:push_main_branch 'git push origin main 2>&1'
 gg_row "M-G9 master in capitals" ask:push_main_branch 'git push origin MASTER'
+gg_row_at "$REPO_MAIN" "M-G10 a backslash inside the git word, from main" ask:push_main_branch 'g\it push origin main'
+gg_row "M-G11 a backslash inside the git word" ask:push_main_branch 'g\it push origin main'
+gg_row "M-G12 an empty quote pair inside the git word" ask:push_main_branch 'g""it push origin main'
+gg_row "M-G13 a quoted letter inside the git word" ask:push_main_branch 'g"i"t push origin main'
+gg_row "M-G14 an empty single-quote pair inside the git word" ask:push_main_branch "g''it push origin main"
+gg_row "M-G15 a backslash inside the git word of a path" ask:push_main_branch '/usr/bin/g\it push origin main'
+gg_row "M-G16 a backslash inside the git word, force" ask:push_force 'g\it push --force origin feature'
+gg_row "M-G17 a backslash inside the git word, a feature push" silent 'g\it push origin feature'
+gg_row "M-G18 a backslash inside the git word, -c on the push" ask:push_config_override 'g\it -c core.sshCommand=x push origin feature'
 
 printf '%s\n' '== Force gate (F rows) =='
 gg_row "F-1 -f" ask:push_force 'git push -f origin feature'
@@ -107,6 +116,7 @@ gg_row "W-8 grep mentions push" silent 'grep -n push notes.md'
 gg_row "W-9 a later dashed git-push word" ask:push_beside_wrapper 'chronic git-push origin feature'
 gg_row "W-10 nohup, a feature push" silent 'nohup git push origin feature'
 gg_row "W-11 an assignment, force" ask:push_force 'VAR="some text" git push --force origin main'
+gg_row "W-12 a later git word with a backslash" ask:push_beside_wrapper 'chronic g\it push origin feature'
 
 printf '%s\n' '== Rows moved from the source suite (GT:<line> is the source line) =='
 GG_COMMIT=off

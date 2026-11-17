@@ -2065,6 +2065,17 @@ raw_word_literal() { # RAW OBSCURED
   return 0
 }
 
+# S1: true when the command word RAW names git as bash runs it: its raw
+# spelling is a git spelling, or RAW is literal under P6's raw-word rule (no
+# expansion; OBSCURED is the splitter's mark) and DEQ, the word with its
+# backslash escapes and quote pairs removed as bash removes them, is one. So
+# g\it, g""it and g"i"t read as git, as plain git does.
+git_command_word() { # RAW DEQ OBSCURED
+  is_git_spelling "$1" && return 0
+  raw_word_literal "$1" "${3:-0}" || return 1
+  is_git_spelling "$2"
+}
+
 # A name P6 protects: after removing a leading refs/ and then a leading
 # heads/, main or master in any letter case.
 protected_name() { # NAME
@@ -2313,8 +2324,10 @@ HIDDEN_SEPARATOR_KEPT=0
 # The open { } and ( ) groups after a segment: a segment that begins with
 # ( or with { and a blank opens one each; a segment that is } or ends with )
 # closes one. A count that would go below zero stays at zero. This only ever
-# joins segments into a longer pipeline, never splits one.
+# joins segments into a longer pipeline, never splits one. GROUP_OPEN_DEPTH is
+# the depth after the segment's own openers: the depth its command runs at.
 GROUP_DEPTH=0
+GROUP_OPEN_DEPTH=0
 group_depth_step() { # SEGMENT
   local s
   trim_horizontal "$1"
@@ -2329,6 +2342,7 @@ group_depth_step() { # SEGMENT
     trim_horizontal "$s"
     s="$TRIMMED"
   done
+  GROUP_OPEN_DEPTH="$GROUP_DEPTH"
   while :; do
     while [ "${s% }" != "$s" ] || [ "${s%$'\t'}" != "$s" ]; do s="${s% }"; s="${s%$'\t'}"; done
     case "$s" in
@@ -2760,7 +2774,7 @@ segment_injects_config() { # SEGMENT
   [ "$RS_PREFIX_OK" -eq 1 ] || return 1
   n=${#RS_WORDS[@]}
   [ "$RS_CMD" -lt "$n" ] || return 1
-  is_git_spelling "${RS_RAW[$RS_CMD]}" || return 1
+  git_command_word "${RS_RAW[$RS_CMD]}" "${RS_WORDS[$RS_CMD]}" "${RS_OBS[$RS_CMD]}" || return 1
   git_global_walk $((RS_CMD + 1))
   [ "$GW_INJECT" -eq 0 ] || return 0
   k=$((RS_CMD + 1))
@@ -2807,7 +2821,7 @@ judge_push_segment() { # INDEX
   raw="${RS_RAW[$cmd]}"
   deq="${RS_WORDS[$cmd]}"
   base="${deq##*/}"
-  if is_git_spelling "$raw"; then
+  if git_command_word "$raw" "$deq" "${RS_OBS[$cmd]}"; then
     judge_git_segment "$idx" $((cmd + 1))
     return 0
   fi
@@ -2826,7 +2840,7 @@ judge_push_segment() { # INDEX
   shopt -u nocasematch
   k=$((cmd + 1))
   while [ "$k" -lt "$n" ]; do
-    if is_git_spelling "${RS_RAW[$k]}" || nocase_equals "${RS_WORDS[$k]##*/}" git-push || nocase_equals "${RS_WORDS[$k]##*/}" git-send-pack; then
+    if git_command_word "${RS_RAW[$k]}" "${RS_WORDS[$k]}" "${RS_OBS[$k]}" || nocase_equals "${RS_WORDS[$k]##*/}" git-push || nocase_equals "${RS_WORDS[$k]##*/}" git-send-pack; then
       record_code push_beside_wrapper
       return 0
     fi
@@ -3081,6 +3095,27 @@ and_chain() { # FROM TO
   return 0
 }
 
+# C2: true when no segment from FROM up to TO (not included) closes the ( )
+# or { } group that segment FROM's command runs in. A cd in a subshell ends
+# with the subshell, so a tracked segment whose group closes before the push
+# does not move the push.
+group_holds_until() { # FROM TO
+  local k=0 depth
+  GROUP_DEPTH=0
+  while [ "$k" -lt "$1" ]; do
+    group_depth_step "${SEGS[$k]}"
+    k=$((k + 1))
+  done
+  group_depth_step "${SEGS[$1]}"
+  depth="$GROUP_OPEN_DEPTH"
+  while :; do
+    [ "$GROUP_DEPTH" -ge "$depth" ] || return 1
+    k=$((k + 1))
+    [ "$k" -lt "$2" ] || return 0
+    group_depth_step "${SEGS[$k]}"
+  done
+}
+
 # Joins a cd or -C path to FOLDER as git and cd do.
 JOINED_FOLDER=""
 join_folder() { # FOLDER PATH
@@ -3112,7 +3147,10 @@ target_read() { # FOLDER ARGS...
 # interpreter, eval, source, ., xargs, flock, trap, alias, env -S, a variable
 # command word, find -exec, a reaching GIT_ name, or a git command that
 # switches branches or writes configuration. Sets EARLIER_UNRESOLVED, and
-# tracks the folder (cd, pushd) and a branch set by checkout -b.
+# tracks the folder (cd, pushd) and a branch set by checkout -b, only when
+# every delimiter from the first segment to the push is && (C1: an earlier ||
+# can skip the tracked segment while the push still runs) and no group that
+# holds the tracked segment closes before the push (C2).
 EARLIER_UNRESOLVED=0
 EARLIER_FOLDER=""
 EARLIER_BRANCH=""
@@ -3154,7 +3192,8 @@ earlier_segment() { # INDEX PUSH_INDEX
     w="${RS_WORDS[$((cmd + 1))]}"
     raw_word_literal "${RS_RAW[$((cmd + 1))]}" "${RS_OBS[$((cmd + 1))]}" || { EARLIER_UNRESOLVED=1; return 0; }
     case "$w" in ''|-*|'~'*) EARLIER_UNRESOLVED=1; return 0 ;; esac
-    and_chain "$idx" "$push_idx" || { EARLIER_UNRESOLVED=1; return 0; }
+    and_chain 0 "$push_idx" || { EARLIER_UNRESOLVED=1; return 0; }
+    group_holds_until "$idx" "$push_idx" || { EARLIER_UNRESOLVED=1; return 0; }
     join_folder "$EARLIER_FOLDER" "$w"
     EARLIER_FOLDER="$JOINED_FOLDER"
     return 0
@@ -3166,7 +3205,7 @@ earlier_segment() { # INDEX PUSH_INDEX
     fi
     return 0
   fi
-  if is_git_spelling "$raw"; then
+  if git_command_word "$raw" "$deq" "${RS_OBS[$cmd]}"; then
     git_global_walk $((cmd + 1))
     [ "$GW_UNKNOWN" -eq 0 ] || { EARLIER_UNRESOLVED=1; return 0; }
     [ "$GW_SUB" -lt "$n" ] || return 0
@@ -3175,7 +3214,8 @@ earlier_segment() { # INDEX PUSH_INDEX
     case "$sub" in
       checkout|switch)
         # checkout -b NAME or switch -c NAME, with a literal NAME, no folder
-        # or repository option of its own, and only && up to the push.
+        # or repository option of its own, only && from the first segment to
+        # the push, and no group around it that closes before the push.
         w="${RS_WORDS[$((GW_SUB + 1))]:-}"
         case "$sub:$w" in
           checkout:-b|checkout:-B|switch:-c|switch:-C) ;;
@@ -3191,7 +3231,8 @@ earlier_segment() { # INDEX PUSH_INDEX
           case "${RS_WORDS[$((k + 1))]}" in -*) EARLIER_UNRESOLVED=1; return 0 ;; esac
         fi
         [ "${#GW_CPATHS[@]}" -eq 0 ] && [ "$GW_REPO" -eq 0 ] || { EARLIER_UNRESOLVED=1; return 0; }
-        and_chain "$idx" "$push_idx" || { EARLIER_UNRESOLVED=1; return 0; }
+        and_chain 0 "$push_idx" || { EARLIER_UNRESOLVED=1; return 0; }
+        group_holds_until "$idx" "$push_idx" || { EARLIER_UNRESOLVED=1; return 0; }
         EARLIER_BRANCH="$name"
         EARLIER_BRANCH_FOLDER="$EARLIER_FOLDER"
         return 0
@@ -3368,7 +3409,7 @@ judge_commit_segment() { # SEGMENT
   raw="${RS_RAW[$cmd]}"
   deq="${RS_WORDS[$cmd]}"
   base="${deq##*/}"
-  if is_git_spelling "$raw"; then
+  if git_command_word "$raw" "$deq" "${RS_OBS[$cmd]}"; then
     git_global_walk $((cmd + 1))
     if [ "$GW_UNKNOWN" -eq 1 ]; then
       text_words "$seg"
