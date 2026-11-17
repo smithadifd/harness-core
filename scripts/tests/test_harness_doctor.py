@@ -451,6 +451,60 @@ def test_ledger_init_never_replaces_a_database_that_appeared_while_the_write_ran
     assert database_folder_entries(home) == ["ledger.db"]
 
 
+def symlinked_database_folder(tmp_path, link_rel, made):
+    """An applied home whose folder link_rel (under the home) is a symlink to a
+    folder elsewhere; made are the real folders below the home that exist."""
+    home, bin_dir = applied_home(tmp_path)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    for rel in made:
+        at(home, rel).mkdir()
+    at(home, link_rel).symlink_to(elsewhere)
+    return home, bin_dir, elsewhere
+
+
+def test_ledger_init_follows_a_symlinked_share_folder_and_doctor_passes(tmp_path):
+    home, bin_dir, elsewhere = symlinked_database_folder(
+        tmp_path, ".local/share", [".local"])
+    done = setup_run("ledger-init", home, bin_dir=bin_dir)
+    assert done.rc == 0, done.err
+    assert done.out == f"created: ledger database at {at(home, DB)}\n"
+    assert at(home, ".local/share").is_symlink()
+    assert (elsewhere / "ledger" / "ledger.db").is_file(), "the database is not behind the link"
+    assert sorted(entry.name for entry in (elsewhere / "ledger").iterdir()) == ["ledger.db"]
+    show_stored(bin_dir)
+    rc, lines = doctor(home, bin_dir)
+    assert rc == 0, lines
+    assert lines_of(lines, "ok", "ledger") and lines_of(lines, "FAIL", "ledger") == []
+
+
+def test_ledger_init_follows_a_symlinked_ledger_folder_and_doctor_passes(tmp_path):
+    home, bin_dir, elsewhere = symlinked_database_folder(
+        tmp_path, ".local/share/ledger", [".local", ".local/share"])
+    done = setup_run("ledger-init", home, bin_dir=bin_dir)
+    assert done.rc == 0, done.err
+    assert done.out == f"created: ledger database at {at(home, DB)}\n"
+    assert at(home, ".local/share/ledger").is_symlink()
+    assert (elsewhere / "ledger.db").is_file(), "the database is not behind the link"
+    assert sorted(entry.name for entry in elsewhere.iterdir()) == ["ledger.db"]
+    show_stored(bin_dir)
+    rc, lines = doctor(home, bin_dir)
+    assert rc == 0, lines
+    assert lines_of(lines, "ok", "ledger") and lines_of(lines, "FAIL", "ledger") == []
+
+
+def test_ledger_init_names_a_database_folder_it_cannot_open(tmp_path):
+    home, bin_dir = applied_home(tmp_path)
+    at(home, ".local/share").mkdir(parents=True)
+    at(home, ".local/share/ledger").write_bytes(b"a file where the folder belongs")
+    done = setup_run("ledger-init", home, bin_dir=bin_dir)
+    assert done.rc == 1
+    assert done.err.startswith(
+        f"setup: cannot open the ledger database folder {at(home, '.local/share/ledger')}: ")
+    assert at(home, ".local/share/ledger").read_bytes() == b"a file where the folder belongs"
+    assert not (bin_dir / "ledger-argv").exists(), "the ledger command ran"
+
+
 def test_ledger_init_needs_an_operator(tmp_path):
     home, bin_dir = applied_home(tmp_path)
     done = setup_run("ledger-init", home, bin_dir=bin_dir, operator=None)

@@ -122,6 +122,7 @@ PREFIX = "setup:"
 HEX = frozenset("0123456789abcdef")
 
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+FOLLOW_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
 READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
 TEMP_FLAGS = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
 LOCK_FLAGS = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -446,6 +447,44 @@ class Tree:
             raise
         self.fds[rel] = fd
         return fd
+
+    def follow_dir(self, rel: str) -> int:
+        """The descriptor of the ledger database's folder rel. This is the one
+        folder setup opens by following symlinks, at rel or above it: the
+        database path is the person's, as the ledger command treats it. A
+        folder that is missing is made with ordinary mkdir, one level at a
+        time; the apply and remove walk above never comes here."""
+        key = f"follow:{rel}"
+        if key in self.fds:
+            return self.fds[key]
+        path = self.show(rel)
+        try:
+            try:
+                fd = os.open(path, FOLLOW_DIR_FLAGS)
+            except FileNotFoundError:
+                self.make_followed(rel)
+                fd = os.open(path, FOLLOW_DIR_FLAGS)
+        except OSError as exc:
+            raise SetupError(
+                f"cannot open the ledger database folder {path}: {one_line(exc)}") from exc
+        self.fds[key] = fd
+        return fd
+
+    def make_followed(self, rel: str) -> None:
+        """Make each missing level of rel below the home, each 0700. A level
+        that exists, as a folder or as a symlink, is left as it is."""
+        walked = ""
+        for name in rel.split("/"):
+            walked = f"{walked}/{name}" if walked else name
+            try:
+                os.mkdir(self.show(walked), 0o700)
+            except FileExistsError:
+                continue
+            fd = os.open(self.show(walked.rpartition("/")[0]), FOLLOW_DIR_FLAGS)
+            try:
+                sync(fd)
+            finally:
+                os.close(fd)
 
     def parent_of(self, rel: str) -> tuple[int | None, str]:
         parent_rel, _, name = rel.rpartition("/")
@@ -1414,7 +1453,7 @@ def ledger_init_locked(tree: Tree, operator: str, harness: str | None) -> str:
     # timed-out child can never leave a partial file at the final path that
     # the next run would take for a finished database.
     parent_rel, _, base = DB_REL.rpartition("/")
-    parent = tree.dir(parent_rel, create=True)
+    parent = tree.follow_dir(parent_rel)
     temp = reserve_temp_name(parent, base)
     temp_path = tree.show(f"{parent_rel}/{temp}")
     env = dict(os.environ)
