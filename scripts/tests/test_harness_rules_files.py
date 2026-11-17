@@ -128,17 +128,30 @@ REQUIRED_PHRASES = (
 # dropped "every", an added "no", a changed "never" or any added clause turns
 # the line into one that is not pinned.
 #
-# Each required line must appear exactly once under its heading, and each core
-# section may hold no other line, so a contradicting line added beside a
-# required one is caught too. The four sections not listed here (command
+# Each pinned line is compared whole, against its literal here, and must appear
+# exactly once in the file (a line missing, reworded or copied anywhere else
+# fails and is named). Each core section may then hold no other line, so a
+# contradicting line added beside a pinned one is caught too: that placement
+# check is the only part that reads sections. The four sections not listed here (command
 # shapes, clean up, where people read, tool gotchas) are not core rules: their
-# bodies stay free to change, but their headings are pinned in
+# bodies stay free in content, but their headings are pinned in
 # EXPECTED_HEADINGS, so no section can be added, removed, renamed or moved
 # without this file changing with it (a new section could otherwise
-# contradict a core rule where nothing reads it). Fenced code blocks are not
-# rules: the rules default holds none, a fence is a problem wherever it
-# opens, and a line or heading inside one is never read. A reworded core rule
-# is a deliberate edit to the rules default and to this table together.
+# contradict a core rule where nothing reads it).
+#
+# The rules default is read through a closed line grammar (see _classify):
+# every line must be exactly one of five shapes, judged on its own line, and any
+# other line fails the test with its line number and the shape refused. Nothing
+# here parses Markdown construct by construct (no fence state, no block quote,
+# no indentation rules), so no construct can hide a line from the pins: an
+# indented heading, a block quote, a fence of backticks or tildes, an HTML
+# line, a table row, a numbered list, a setext underline, a tab and a
+# bullet other than "- " are each refused outright. The free sections keep free
+# content, as the design states, but their bodies must use these line shapes.
+# A contradiction written in a free body in those shapes is a stated limit of
+# this test: it holds the shapes and the headings of a free section, not its
+# meaning. A reworded core rule is a deliberate edit to the rules default and to
+# this table together.
 CORE_RULES: dict[str, tuple[str, ...]] = {
     "": (
         "# Harness rules",
@@ -181,42 +194,96 @@ EXPECTED_HEADINGS: tuple[str, ...] = (
     "Tool gotchas",
 )
 
-# A line that opens or closes a fenced code block: up to three spaces, then a
-# run of three or more backticks or tildes.
-FENCE = re.compile(r" {0,3}(`{3,}|~{3,})")
+def _brief(line: str) -> str:
+    return line if len(line) <= 70 else line[:67] + "..."
 
 
-def _parse(text: str) -> tuple[list[str], dict[str, list[str]], list[int]]:
-    """Read the rules text once: the "## " headings in order, the non-blank
-    lines of each section (trailing blanks trimmed), and the line number of
-    each fence that opens. The lines before the first "## " heading are the
-    section named "". A heading that appears twice has both bodies joined, so
-    a repeated heading cannot hide a line. A line inside a fenced code block
-    (opened and closed by a run of backticks or tildes; one that never closes
-    runs to the end) is neither a heading nor a rule line."""
+# The closed line grammar. Every line of the rules default, after its trailing
+# spaces and tabs are trimmed, is exactly one of these, judged on its own:
+#   (a) an empty line;
+#   (b) line 1 only: "# Harness rules";
+#   (c) "## " and a heading, at column 0 (the ordered list of these must equal
+#       EXPECTED_HEADINGS);
+#   (d) a list item: "- " at column 0, then a character that is not a space;
+#   (e) a prose line, at column 0: it starts with an ASCII letter, or with "**"
+#       and a character that is not a space.
+# A line containing a carriage return is refused first: a bare "\r" ends a line
+# in Markdown, so it could start a line this split on "\n" does not see.
+TITLE = "# Harness rules"
+ITEM = re.compile(r"- \S")
+PROSE = re.compile(r"[A-Za-z]|\*\*\S")
+
+
+def _refused_shape(line: str) -> str:
+    """Name the shape of a line the grammar refuses; the line is not empty."""
+    first = line[0]
+    if first == " ":
+        return "leading space (an indented line)"
+    if first == "\t":
+        return "a tab (an indented line)"
+    if first == ">":
+        return "a block quote"
+    if first in "`~":
+        return "a code fence"
+    if first == "<":
+        return "an HTML line"
+    if first == "|":
+        return "a table row"
+    if first.isdigit():
+        return "a numbered list or a line that starts with a digit"
+    if line.strip("=-") == "":
+        return "a setext underline or rule"
+    if first == "-":
+        return "a '-' line that is not '- ' and then text"
+    if first == "#":
+        return "a '#' line that is not the title on line 1 or a '## ' heading"
+    if first in "*+":
+        return "a '*' or '+' bullet, rule or emphasis"
+    return "a line that starts with a character the grammar does not allow"
+
+
+def _classify(number: int, raw: str) -> tuple[str, str]:
+    """Judge one line (1-based line number, raw text): ("empty" | "title" |
+    "heading" | "item" | "prose", the heading text or "") when it fits the
+    grammar, or ("refused", the shape refused)."""
+    line = raw.rstrip(" \t")
+    if "\r" in line:
+        return "refused", "a carriage return (a line break inside a line)"
+    if line == "":
+        return "empty", ""
+    if number == 1 and line == TITLE:
+        return "title", ""
+    if line.startswith("## "):
+        return "heading", line[3:]
+    if ITEM.match(line):
+        return "item", ""
+    if PROSE.match(line):
+        return "prose", ""
+    return "refused", _refused_shape(line)
+
+
+def _parse(text: str) -> tuple[list[str], dict[str, list[str]], list[str]]:
+    """Read the rules text once, line by line through the grammar: the "## "
+    headings in order, the non-empty lines of each section (trailing blanks
+    trimmed), and one message for each refused line, naming its line number and
+    the shape refused. The lines before the first "## " heading are the section
+    named "". A heading that appears twice has both bodies joined, so a repeated
+    heading cannot hide a line."""
     headings: list[str] = []
     sections: dict[str, list[str]] = {"": []}
-    fences: list[int] = []
+    refused: list[str] = []
     current = ""
-    fence: tuple[str, int] | None = None  # (character, length) of the open fence
-    for number, line in enumerate(text.split("\n"), 1):
-        line = line.rstrip(" \t")
-        if fence is not None:
-            close = FENCE.fullmatch(line)
-            if close and close.group(1)[0] == fence[0] and len(close.group(1)) >= fence[1]:
-                fence = None
-            continue
-        opening = FENCE.match(line)
-        if opening:
-            fence = (opening.group(1)[0], len(opening.group(1)))
-            fences.append(number)
-        elif line.startswith("## "):
-            current = line[3:]
-            headings.append(current)
-            sections.setdefault(current, [])
-        elif line:
-            sections[current].append(line)
-    return headings, sections, fences
+    for number, raw in enumerate(text.split("\n"), 1):
+        kind, detail = _classify(number, raw)
+        if kind == "refused":
+            refused.append(f"line {number}: refused shape, {detail}: {_brief(raw)}")
+        elif kind == "heading":
+            current = detail
+            headings.append(detail)
+            sections.setdefault(detail, [])
+        elif kind != "empty":
+            sections[current].append(raw.rstrip(" \t"))
+    return headings, sections, refused
 
 
 def _sections(text: str) -> dict[str, list[str]]:
@@ -227,28 +294,34 @@ def _headings(text: str) -> list[str]:
     return _parse(text)[0]
 
 
-def _brief(line: str) -> str:
-    return line if len(line) <= 70 else line[:67] + "..."
-
-
 def _rule_problems(text: str) -> list[str]:
     """Why the text does not hold the core rules, one message each; an empty
     list when it does."""
     problems: list[str] = []
-    headings, sections, fences = _parse(text)
-    for number in fences:
-        problems.append(f"a fenced code block opens at line {number}: the rules default holds none")
+    headings, sections, refused = _parse(text)
+    problems.extend(refused)
     if headings != list(EXPECTED_HEADINGS):
         problems.append(f"the '## ' headings are {headings}, not the pinned {list(EXPECTED_HEADINGS)}")
+    # Each pinned line, compared whole against its literal in CORE_RULES, must
+    # appear exactly once in the file. This needs no section: a line that is
+    # missing, reworded, or copied anywhere else (a free section included) is
+    # named here.
+    whole = [raw.rstrip(" \t") for raw in text.split("\n")]
+    for line in (line for lines in CORE_RULES.values() for line in lines):
+        count = whole.count(line)
+        if count != 1:
+            problems.append(f"pinned line found {count} times in the file, not once: {_brief(line)}")
+    # Placement, the only part that reads sections: a core section holds its
+    # pinned lines and no other line, so a contradicting line added beside a
+    # pinned one is named too.
     for heading, required in CORE_RULES.items():
         found = sections.get(heading)
         if found is None:
             problems.append(f"section missing: {heading!r}")
             continue
         for line in required:
-            count = found.count(line)
-            if count != 1:
-                problems.append(f"{heading!r}: required line found {count} times: {_brief(line)}")
+            if line not in found and whole.count(line) == 1:
+                problems.append(f"{heading!r}: pinned line is under another heading: {_brief(line)}")
         for line in found:
             if line not in required:
                 problems.append(f"{heading!r}: line that is not a pinned rule: {_brief(line)}")
@@ -348,10 +421,21 @@ MUTATIONS = {
         "- Reproduce a CI-only failure locally before reasoning about it.\n",
     ),
     "contradiction-under-a-repeated-heading": lambda text: text + "\n## Review\n- Skip the review for a small change.\n",
+    "pinned-line-duplicated-in-a-free-section": lambda text: text + "\n" + _REPRODUCE,
+    "pinned-line-reworded": _replace(
+        "- Reproduce a CI-only failure locally before reasoning about it.",
+        "- Reproduce a CI-only failure locally before reasoning about it, where you can.",
+    ),
+    "pinned-line-under-another-heading": _then(
+        _replace(_REPRODUCE, ""),
+        _replace("\n## Command shapes", "- Reproduce a CI-only failure locally before reasoning about it.\n\n## Command shapes"),
+    ),
     "required-line-removed": _replace("- Reproduce a CI-only failure locally before reasoning about it.\n", ""),
     "section-renamed": _replace("## Merge", "## Merge (optional)"),
     # A section the pins do not read must not be a place to hide a rule or a
-    # contradiction: the heading list is pinned, and fenced text is never read.
+    # contradiction: the heading list is pinned, and every line must fit the
+    # closed line grammar, so a line that Markdown could read as something else
+    # (a fence, a quote, an indented heading) is refused, never passed over.
     "section-appended-with-a-contradiction": lambda text: text + "\n## Exceptions\n\n- Skip the review for a small change.\n",
     "section-appended-empty": lambda text: text + "\n## Notes\n",
     "free-heading-repeated": lambda text: text + "\n## Clean up\n",
@@ -375,6 +459,15 @@ MUTATIONS = {
     ),
     "heading-hidden-in-a-fence": lambda text: text + _FENCE_OPEN + "## Exceptions\n- Skip the review for a small change.\n```\n",
     "fence-never-closed": lambda text: text + _FENCE_OPEN + "- Skip the review for a small change.\n",
+    # The shapes the closed line grammar refuses (round 3), each carrying the
+    # contradicting item "Skip the review for a small change."
+    "indented-exceptions-heading": lambda text: text + "\n ## Exceptions\n\n- Skip the review for a small change.\n",
+    "block-quoted-fence": lambda text: text + "\n> ```\n> - Skip the review for a small change.\n> ```\n",
+    "tilde-line-inside-a-backtick-fence": lambda text: text + _FENCE_OPEN + "~~~\n- Skip the review for a small change.\n```\n",
+    "setext-heading-in-a-free-body": lambda text: text + "\nExceptions\n----------\n\n- Skip the review for a small change.\n",
+    "setext-equals-heading-in-a-free-body": lambda text: text + "\nExceptions\n==========\n\n- Skip the review for a small change.\n",
+    "tab-indented-line": lambda text: text + "\n\t- Skip the review for a small change.\n",
+    "carriage-return-line-break": lambda text: text + "\nA line.\r- Skip the review for a small change.\n",
 }
 
 
@@ -496,6 +589,19 @@ def test_a_negated_or_weakened_core_rule_is_found(name):
     assert _rule_problems(mutated) != [], f"mutation {name} still passes the core-rule check"
 
 
+def test_a_missing_reworded_or_copied_pinned_line_is_named():
+    text = _rules_text()
+    line = "- Reproduce a CI-only failure locally before reasoning about it."
+    named = _brief(line)
+    for name, count in (
+        ("required-line-removed", 0),
+        ("pinned-line-reworded", 0),
+        ("pinned-line-duplicated-in-a-free-section", 2),
+    ):
+        problems = _rule_problems(MUTATIONS[name](text))
+        assert f"pinned line found {count} times in the file, not once: {named}" in problems, (name, problems)
+
+
 def test_the_phrase_check_alone_misses_the_negated_review_rule():
     # The reason the line check exists: this change keeps every required phrase.
     mutated = MUTATIONS["review-negated"](_rules_text())
@@ -512,27 +618,130 @@ def test_the_pinned_headings_include_every_core_section():
     assert [heading for heading in CORE_RULES if heading and heading not in EXPECTED_HEADINGS] == []
 
 
-def test_a_heading_or_line_inside_a_fence_is_not_read():
+def test_the_rules_default_is_written_wholly_in_the_line_grammar():
+    text = _rules_text()
+    kinds = [_classify(number, raw)[0] for number, raw in enumerate(text.split("\n"), 1)]
+    assert "refused" not in kinds, _parse(text)[2]
+    assert kinds[0] == "title" and kinds.count("title") == 1
+    assert kinds.count("heading") == len(EXPECTED_HEADINGS)
+
+
+# One line of each shape the grammar accepts: (line number, line, kind).
+ACCEPTED_LINES = (
+    (1, "", "empty"),
+    (7, "", "empty"),
+    (7, "   ", "empty"),
+    (7, "\t", "empty"),
+    (1, "# Harness rules", "title"),
+    (3, "## Review", "heading"),
+    (3, "## Where people read", "heading"),
+    (3, "- x", "item"),
+    (3, "- `code` and more.", "item"),
+    (3, "- - x", "item"),
+    (3, "- x \t", "item"),
+    (3, "Working agreements for every session.", "prose"),
+    (3, "a lowercase line", "prose"),
+    (3, "**The override file.** More.", "prose"),
+)
+
+# One line of each shape the grammar refuses: (line number, line, a phrase the
+# message names the shape with).
+REFUSED_LINES = (
+    (3, " ## Exceptions", "leading space"),
+    (3, " - x", "leading space"),
+    (3, "   x", "leading space"),
+    (3, "\t- x", "a tab"),
+    (3, "\tx", "a tab"),
+    (3, "> quote", "a block quote"),
+    (3, "> ```", "a block quote"),
+    (3, "```", "a code fence"),
+    (3, "````", "a code fence"),
+    (3, "~~~", "a code fence"),
+    (3, "<div>", "an HTML line"),
+    (3, "<!-- note -->", "an HTML line"),
+    (3, "| a | b |", "a table row"),
+    (3, "1. one", "a numbered list"),
+    (3, "2) two", "a numbered list"),
+    (3, "===", "a setext underline"),
+    (3, "---", "a setext underline"),
+    (3, "-", "a setext underline"),
+    (3, "-  x", "a '-' line"),
+    (3, "# Harness rules", "a '#' line"),
+    (2, "# Harness rules", "a '#' line"),
+    (3, "# Other", "a '#' line"),
+    (3, "### Deep", "a '#' line"),
+    (3, "##Tight", "a '#' line"),
+    (3, "##", "a '#' line"),
+    (3, "## ", "a '#' line"),
+    (3, "* item", "a '*' or '+' bullet"),
+    (3, "+ item", "a '*' or '+' bullet"),
+    (3, "*emphasis*", "a '*' or '+' bullet"),
+    (3, "** spaced", "a '*' or '+' bullet"),
+    (3, "**", "a '*' or '+' bullet"),
+    (3, "[ref]: x", "a character the grammar does not allow"),
+    (3, " ", "a character the grammar does not allow"),
+    (3, "\x0c", "a character the grammar does not allow"),
+    (3, "A line.\r- x", "a carriage return"),
+    (3, "A line.\r", "a carriage return"),
+)
+
+
+@pytest.mark.parametrize(("number", "line", "kind"), ACCEPTED_LINES)
+def test_the_line_grammar_accepts_each_shape(number, line, kind):
+    assert _classify(number, line)[0] == kind
+
+
+@pytest.mark.parametrize(("number", "line", "shape"), REFUSED_LINES)
+def test_the_line_grammar_refuses_every_other_shape_and_names_it(number, line, shape):
+    kind, detail = _classify(number, line)
+    assert kind == "refused", f"line {number} {line!r} was read as {kind}"
+    assert shape in detail, detail
+    # The message a failing rules default carries names the line and the shape.
+    text = "\n" * (number - 1) + line
+    messages = _parse(text)[2]
+    assert len(messages) == 1, messages
+    assert messages[0].startswith(f"line {number}: refused shape, "), messages
+    assert shape in messages[0], messages
+
+
+def test_the_heading_text_is_what_follows_the_marker():
+    assert _classify(3, "## Where people read") == ("heading", "Where people read")
+    assert _classify(3, "##  Two spaces") == ("heading", " Two spaces")
+
+
+def test_the_parse_reads_sections_by_the_grammar():
     text = (
-        "## One\n- a\n"
-        "```\n## Two\n- b\n```\n"
-        "- c\n"
-        "~~~~\n## Three\n```\n~~~\n- d\n~~~~\n"
-        "## Four\n"
+        "# Harness rules\n\nIntro.\n\n## One\n- a\n\nprose\n\n"
+        "## Two\n- b\n\n## One\n- c \t\n"
     )
-    assert _headings(text) == ["One", "Four"]
-    assert _sections(text) == {"": [], "One": ["- a", "- c"], "Four": []}
-    assert _parse(text)[2] == [3, 8]
-    # A fence that never closes hides everything after it.
-    assert _sections("## One\n- a\n```\n## Two\n- b\n") == {"": [], "One": ["- a"]}
+    headings, sections, refused = _parse(text)
+    assert headings == ["One", "Two", "One"]
+    assert sections == {
+        "": ["# Harness rules", "Intro."],
+        "One": ["- a", "prose", "- c"],
+        "Two": ["- b"],
+    }
+    assert refused == []
 
 
-def test_a_fenced_block_anywhere_in_the_rules_default_is_a_problem():
+def test_a_refused_line_hides_nothing_around_it():
+    # Every line is judged on its own, so a fence cannot hide the heading or
+    # the item inside it: they are read, and the fence lines are refused.
+    text = "## One\n- a\n```\n## Two\n- b\n```\n - c\n## Three\n"
+    headings, sections, refused = _parse(text)
+    assert headings == ["One", "Two", "Three"]
+    assert sections == {"": [], "One": ["- a"], "Two": ["- b"], "Three": []}
+    assert [message.split(":")[0] for message in refused] == ["line 3", "line 6", "line 7"]
+    assert "a code fence" in refused[0] and "a code fence" in refused[1]
+    assert "leading space" in refused[2]
+
+
+def test_any_refused_line_in_the_rules_default_is_a_problem():
     text = _rules_text()
     assert _rule_problems(text) == []
-    for fence in ("```", "~~~"):
-        problems = _rule_problems(text + f"\n{fence}\nexample\n{fence}\n")
-        assert any("fenced code block" in problem for problem in problems), problems
+    for line in ("```", "~~~", "> quote", " - x", "\t- x", "---", "1. one", "<div>", "| a |", "* b"):
+        problems = _rule_problems(text + f"\n{line}\n")
+        assert any("refused shape" in problem for problem in problems), (line, problems)
 
 
 def test_the_core_rule_check_ignores_trailing_blanks_and_blank_lines():
