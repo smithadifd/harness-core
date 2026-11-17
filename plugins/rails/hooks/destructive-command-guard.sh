@@ -845,11 +845,12 @@ split_command_segments() {
 # @(a)#x), after an escape or inside quotes is text, and so is a # after a
 # blank inside an arithmetic (( )) or $[ ], a ${ } expansion, a [[ ]] test, an
 # extglob or array group glued to a word (@( ), x=( ), a[ ]) or a glob
-# bracket. R1 is true when any of its readings finds a removal word, so this
-# reading can only add denies; the segmenter that judges commands reads # as
-# text. Like split_command_segments it writes SEGMENTS and SEGMENT_DELIMITERS:
-# run_policy splits again after R1 and R2 run, and copies the segments before
-# judging them.
+# bracket. This reading never decides alone: top_level_text and
+# collect_command_words read the segmenter's segments beside it, so it can
+# add command words and segments but never remove them; the segmenter that
+# judges commands reads # as text. Like split_command_segments it writes
+# SEGMENTS and SEGMENT_DELIMITERS: run_policy splits again after R1 and R2
+# run, and copies the segments before judging them.
 split_segments_skipping_comments() {
   local input="$1" length i=0 j k ch next state="plain" segment="" header="" line delimiter redirect_open=0 redirect_before=0
   # word_start is 1 where an unquoted # would begin a word; parens, brackets
@@ -1014,17 +1015,23 @@ split_segments_skipping_comments() {
   SEGMENTS[${#SEGMENTS[@]}]="$segment"
 }
 
-# The command as R1 and R2 read it at the top level: the segments of the
-# comment-skipping reading (split_segments_skipping_comments) with their
-# delimiters, comments reduced to # and line continuations joined, heredoc
-# bodies left out. R1 and R2 read it beside the raw text. A newline delimiter
-# is written after a blank, so R1's line join can never read a segment that
-# ends in an escaped backslash, and the newline after it, as a continuation:
-# this reading does not depend on that join being right.
+# The command as R1 and R2 read it at the top level, in two readings: the
+# segments with their delimiters, line continuations joined and heredoc
+# bodies left out, as the segmenter reads them (TOP_LEVEL_TEXT_G,
+# split_command_segments, where # is text) and as the comment-skipping copy
+# reads them (TOP_LEVEL_TEXT, split_segments_skipping_comments, comments
+# reduced to #). R1 and R2 read both beside the raw text, so the copy can add
+# a reading but never take one away. When TEXT holds no #, the two
+# segmenters give the same segments, so the segmenter is not run for it. A
+# newline delimiter is written after a blank, so R1's line join can never
+# read a segment that ends in an escaped backslash, and the newline after
+# it, as a continuation: these readings do not depend on that join being
+# right.
 TOP_LEVEL_TEXT=""
-top_level_text() { # TEXT
+TOP_LEVEL_TEXT_G=""
+JOINED_SEGMENTS=""
+join_segments() { # reads SEGMENTS and SEGMENT_DELIMITERS
   local k=0 out="" nl=$'\n'
-  split_segments_skipping_comments "$1"
   while [ "$k" -lt "${#SEGMENTS[@]}" ]; do
     if [ "${SEGMENT_DELIMITERS[$k]-}" = "$nl" ]; then
       out="$out${SEGMENTS[$k]} $nl"
@@ -1033,7 +1040,20 @@ top_level_text() { # TEXT
     fi
     k=$((k + 1))
   done
-  TOP_LEVEL_TEXT="$out"
+  JOINED_SEGMENTS="$out"
+}
+top_level_text() { # TEXT
+  case "$1" in
+    *'#'*)
+      split_command_segments "$1"
+      join_segments
+      TOP_LEVEL_TEXT_G="$JOINED_SEGMENTS"
+      ;;
+  esac
+  split_segments_skipping_comments "$1"
+  join_segments
+  TOP_LEVEL_TEXT="$JOINED_SEGMENTS"
+  case "$1" in *'#'*) ;; *) TOP_LEVEL_TEXT_G="$TOP_LEVEL_TEXT" ;; esac
 }
 
 trim_horizontal() {
@@ -4018,9 +4038,13 @@ r1_unreadable_pattern_group() { # TEXT
 }
 
 # The command words of TEXT, for R1 (f), the source carrier's . and the
-# variable_command carrier. For each top-level segment of the comment-skipping
-# reading (split_segments_skipping_comments; heredoc bodies are not segments)
-# with its control openers and redirections removed: the first raw
+# variable_command carrier. For each top-level segment of both readings, the
+# segmenter's (split_command_segments, where # is text) and the
+# comment-skipping copy's (split_segments_skipping_comments), so the copy can
+# add command words but never remove them (heredoc bodies are not segments;
+# when TEXT holds no # the two give the same segments, and the segmenter is
+# not run for it), with its control openers and redirections removed: the
+# first raw
 # word that is not an assignment, and the raw word at PREFIX_INDEX after the
 # known prefixes (only the first when prefix skipping fails). A segment that
 # begins with (( is an arithmetic command and has none.
@@ -4032,8 +4056,15 @@ collect_command_words() { # TEXT
   local -a segs raw deq
   CMD_WORDS_RAW=()
   CMD_WORDS_DEQ=()
+  segs=()
+  case "$1" in
+    *'#'*)
+      split_command_segments "$1"
+      segs=(${SEGMENTS[@]+"${SEGMENTS[@]}"})
+      ;;
+  esac
   split_segments_skipping_comments "$1"
-  segs=(${SEGMENTS[@]+"${SEGMENTS[@]}"})
+  segs+=(${SEGMENTS[@]+"${SEGMENTS[@]}"})
   for segment in ${segs[@]+"${segs[@]}"}; do
     trim_horizontal "$segment"
     segment="$TRIMMED"
@@ -4096,14 +4127,14 @@ command_word_is_pattern() { # RAW
 # R1: true when TEXT holds a removal word. R1 is a union of readings and is
 # true when any of them finds one. The word tests read the raw text; when it
 # holds a backslash, the text with every backslash deleted and every newline
-# kept (a reading that needs no lexer and no line join); the top-level
-# reading of every command (top_level_text), which skips comments; and, when
-# the text holds a #, the comment-continuation reading
-# (r1_split_comment_continuations). (f) reads the top-level segments of the
-# same comment-skipping reading. The top-level reading finds a removal word
-# the segmenter reads as a command word even where R1's line join reads the
-# raw text wrongly. Rule G (run_policy) is gated on R1, so a reading is only
-# ever added here, never taken away.
+# kept (a reading that needs no lexer and no line join); both top-level
+# readings of every command (top_level_text), the segmenter's and the
+# comment-skipping copy's; and, when the text holds a #, the
+# comment-continuation reading (r1_split_comment_continuations). (f) reads
+# the command words of both readings (collect_command_words). The top-level
+# readings find a removal word the segmenter reads as a command word even
+# where R1's line join reads the raw text wrongly. Rule G (run_policy) is
+# gated on R1, so a reading is only ever added here, never taken away.
 removal_word_in_text() { # TEXT
   local text="$1" k
   r1_word_tests "$text" && return 0
@@ -4118,6 +4149,9 @@ removal_word_in_text() { # TEXT
   esac
   top_level_text "$text"
   if [ "$TOP_LEVEL_TEXT" != "$text" ]; then r1_word_tests "$TOP_LEVEL_TEXT" && return 0; fi
+  if [ "$TOP_LEVEL_TEXT_G" != "$text" ] && [ "$TOP_LEVEL_TEXT_G" != "$TOP_LEVEL_TEXT" ]; then
+    r1_word_tests "$TOP_LEVEL_TEXT_G" && return 0
+  fi
   # (f) a command word spelled with a pattern is presumed a removal word.
   collect_command_words "$text"
   k=0
@@ -4163,12 +4197,15 @@ r1_word_tests() { # TEXT
 # case. CARRIER_CLASS is assigned only from these literals. When TEXT holds a
 # backslash, the tokens also come from the text with every backslash deleted
 # and every newline kept. When TEXT holds a
-# #, the tokens also come from the comment-continuation and top-level
-# readings, and the env split is also read in the top-level one, so a comment
-# cannot glue a carrier word to its line or hide it in a quote it opens.
+# #, the tokens also come from the comment-continuation reading and both
+# top-level readings (the segmenter's and the comment-skipping copy's), and
+# the env split is also read in both top-level ones, so a comment cannot
+# glue a carrier word to its line or hide it in a quote it opens, and the
+# comment-skipping copy cannot hide one by dropping text bash runs. The .
+# and variable_command checks read the command words of both readings.
 CARRIER_CLASS=""
 find_carrier() { # TEXT
-  local text="$1" tok k raw top_text=""
+  local text="$1" tok k raw top_text="" top_text_g=""
   local -a toks
   local has_eval=0 has_source=0 has_trap=0 has_alias=0 has_xargs=0 has_find_exec=0 has_shell=0
   local has_git=0 has_submodule=0 has_foreach=0 has_rebase=0 has_exec_option=0 has_bisect=0 has_run=0 has_flock=0
@@ -4198,7 +4235,12 @@ find_carrier() { # TEXT
       toks+=(${R1_TOKENS[@]+"${R1_TOKENS[@]}"})
       top_level_text "$text"
       top_text="$TOP_LEVEL_TEXT"
+      top_text_g="$TOP_LEVEL_TEXT_G"
       r1_normalize "$top_text"
+      r1_split_parameter_operators "$R1_NORMALIZED"
+      r1_tokenize "$R1_OPSPLIT"
+      toks+=(${R1_TOKENS[@]+"${R1_TOKENS[@]}"})
+      r1_normalize "$top_text_g"
       r1_split_parameter_operators "$R1_NORMALIZED"
       r1_tokenize "$R1_OPSPLIT"
       toks+=(${R1_TOKENS[@]+"${R1_TOKENS[@]}"})
@@ -4245,6 +4287,7 @@ find_carrier() { # TEXT
   [ "$has_find_exec" -eq 0 ] || { CARRIER_CLASS=find_exec; return 0; }
   if env_split_in_option_list "$text"; then CARRIER_CLASS=env_split; return 0; fi
   if [ -n "$top_text" ] && env_split_in_option_list "$top_text"; then CARRIER_CLASS=env_split; return 0; fi
+  if [ -n "$top_text_g" ] && env_split_in_option_list "$top_text_g"; then CARRIER_CLASS=env_split; return 0; fi
   [ "$has_shell" -eq 0 ] || { CARRIER_CLASS=shell; return 0; }
   k=0
   while [ "$k" -lt "${#CMD_WORDS_RAW[@]}" ]; do
