@@ -122,12 +122,10 @@ plugin's release tag names now, and fails when it is not the pinned commit
 
 **Status at this tag.** Setup stores three options on the ledger plugin and
 makes the first ledger write through the ledger plugin's `ledger` command. The
-ledger plugin pinned here (`v0.3.1`) declares no options and ships no `ledger`
-command; `v0.4.0` and later do. Until the pin moves, `/harness:setup` stops at
-its ledger options step with the refusal `claude plugin configure failed`.
-That step runs before any file is placed, so no placed file or setting changes;
-only the empty lock file may appear. Install, update and uninstall work as
-written below.
+ledger plugin pinned here (`v0.4.0`) declares those three options
+(`ledger_db`, `ledger_operator` and `ledger_harness`) and ships the `ledger`
+command, so `/harness:setup` gets past its ledger options step. Install,
+update and uninstall work as written below.
 
 You need Claude Code, `git`, network access to GitHub, and Python 3.11 or later
 for the ledger's command. The repository must be public or shared with your
