@@ -18,6 +18,8 @@ import os
 import re
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[2]
 FILES = ROOT / "plugins" / "harness" / "files"
 RULES = FILES / "harness.md"
@@ -89,12 +91,14 @@ GRANT_SHAPED = (
     "waiver:", "standing grant",
 )
 
-# Phrases the rules default must keep, so a rewrite that drops a core rule
-# goes red: the fresh-context review in two passes, falsifiable evidence, the
-# human merge, CI read per job with every gating job a success and the merge
-# pinned to its head, a bug waiver only from the human who merges and never
-# from the change's own author, live reach, sandboxed delegated work, no
-# bypassed safety check, and the pointer to the override file.
+# Phrases the rules default must keep: the fresh-context review in two
+# passes, falsifiable evidence, the human merge, CI read per job with every
+# gating job a success and the merge pinned to its head, a bug waiver only
+# from the human who merges and never from the change's own author, live
+# reach, sandboxed delegated work, no bypassed safety check, and the pointer to
+# the override file. A phrase alone does not hold a rule's meaning (a rule can
+# be negated and keep every phrase), so these only prove that CORE_RULES below,
+# which pins whole lines, still covers each one.
 REQUIRED_PHRASES = (
     "fresh-context review",
     "two passes",
@@ -114,6 +118,145 @@ REQUIRED_PHRASES = (
     "a skipped, cancelled or neutral gating job does not count as green",
     "harness-local.md",
 )
+
+
+# The core rules, pinned as whole lines under their headings, exactly as the
+# rules default words them. A phrase check passes when a rule is negated or
+# weakened around the phrase ("Every change bound for a merge gets a
+# fresh-context review" turned into "No change bound for a merge gets a
+# fresh-context review" keeps the phrase). A whole line cannot: a negation, a
+# dropped "every", an added "no", a changed "never" or any added clause turns
+# the line into one that is not pinned.
+#
+# Each required line must appear exactly once under its heading, and each core
+# section may hold no other line, so a contradicting line added beside a
+# required one is caught too. Sections not listed here (command shapes, clean
+# up, where people read, tool gotchas) are not core rules and stay free to
+# change. A reworded core rule is a deliberate edit to the rules default and
+# to this table together.
+CORE_RULES: dict[str, tuple[str, ...]] = {
+    "": (
+        "# Harness rules",
+        "Working agreements for every Claude Code session on this machine and every agent it starts. A repository's own `AGENTS.md` or `CLAUDE.md` adds to them, and wins where it is stricter.",
+        "**The override file.** `harness-local.md`, in this same rules folder, adds what belongs to one person or one machine: grants, accounts, model choices, a second review family, exceptions to these rules, and stricter local rules. Where it is silent, these rules stand. A second-model-family review applies only when the override names one. With no override, or one that names no second family, the fresh-context review is the whole gate, no code goes to an outside model, and a person merges.",
+    ),
+    "Review": (
+        "- Every change bound for a merge gets a fresh-context review, by a reviewer that did not write it, before the merge. Review in two passes, in order: does the change do what was asked, then does it meet the standards. Report correctness and requirement gaps.",
+        "- Three review rounds at most. Round 2 and later review the delta since the last round. At the cap the change goes back to planning unless only nits remain, and nothing merges with unreviewed commits after the last round.",
+        "- An open bug finding from any reviewer blocks the merge. Clearing one takes a waiver in the pull request that says why the path cannot be reached, written or explicitly approved by the human who merges (or whoever harness-local.md names as the merge step), never by the change's author or its builder.",
+    ),
+    "Evidence": (
+        "- Evidence must be falsifiable: a command a non-author can rerun, in the environment that gates the change.",
+        "- A test counts once it has been seen red under a targeted mutation (production made wrong at the line the test guards) and green after the restore. Running the suite is not enough. Docs-only changes are exempt.",
+        "- Reproduce a CI-only failure locally before reasoning about it.",
+        "- A handed-down diagnosis is a claim: re-read the file and line before it drives a decision.",
+    ),
+    "Merge": (
+        "- A human merges. What counts as the human step is the override's to say; with none, the session stops with the pull request ready and its review attached, and a person merges.",
+        "- CI is green on the final head, on a run created after the pull request was marked ready. Read each job's conclusion (`gh run view --json jobs`): a skipped job shows green. Every gating job's conclusion must be success; a skipped, cancelled or neutral gating job does not count as green.",
+        "- Pin the merge to the reviewed head (`gh pr merge --match-head-commit <sha>`), so a commit pushed after the review cannot land with it.",
+        "- Ask before anything with live reach, and wait for the answer: deploys, live hooks and wrappers, scheduled jobs, secrets, settings files, and any edit that changes who may approve or merge. This holds even where merging is otherwise granted.",
+        "- Never bypass a safety check (`--no-verify`, skipped hooks). Ask before a destructive operation: a force-push, a history rewrite, a hard reset, a dropped table.",
+    ),
+    "Delegated work": (
+        "- Subagents and background jobs run sandboxed by default. A sandbox block is a signal to the session that delegated the work: it widens the sandbox for that one task, with a one-line reason it records, or takes the step itself. It is never a reason to drop the task.",
+    ),
+}
+
+
+def _sections(text: str) -> dict[str, list[str]]:
+    """The non-blank lines of each "## " section, trailing blanks trimmed. The
+    lines before the first "## " heading are the section named "". A heading
+    that appears twice has both bodies joined, so a repeated heading cannot
+    hide a line."""
+    sections: dict[str, list[str]] = {"": []}
+    current = ""
+    for line in text.split("\n"):
+        line = line.rstrip(" \t")
+        if line.startswith("## "):
+            current = line[3:]
+            sections.setdefault(current, [])
+        elif line:
+            sections[current].append(line)
+    return sections
+
+
+def _brief(line: str) -> str:
+    return line if len(line) <= 70 else line[:67] + "..."
+
+
+def _rule_problems(text: str) -> list[str]:
+    """Why the text does not hold the core rules, one message each; an empty
+    list when it does."""
+    problems: list[str] = []
+    sections = _sections(text)
+    for heading, required in CORE_RULES.items():
+        found = sections.get(heading)
+        if found is None:
+            problems.append(f"section missing: {heading!r}")
+            continue
+        for line in required:
+            count = found.count(line)
+            if count != 1:
+                problems.append(f"{heading!r}: required line found {count} times: {_brief(line)}")
+        for line in found:
+            if line not in required:
+                problems.append(f"{heading!r}: line that is not a pinned rule: {_brief(line)}")
+    return problems
+
+
+def _replace(old: str, new: str):
+    """A mutation that swaps one exact piece of the rules text, and fails if
+    that piece is not there exactly once, so it cannot pass by changing
+    nothing."""
+    def mutate(text: str) -> str:
+        assert text.count(old) == 1, f"mutation anchor is not unique: {old!r}"
+        return text.replace(old, new)
+    return mutate
+
+
+# Each mutation negates, weakens or contradicts one core rule. Most keep every
+# phrase of REQUIRED_PHRASES, which is the point: the phrase check alone is
+# blind to them. The review rule's own negation is the first.
+MUTATIONS = {
+    "review-negated": _replace("Every change bound for a merge gets", "No change bound for a merge gets"),
+    "review-every-dropped": _replace("Every change bound for a merge gets", "A change bound for a merge gets"),
+    "review-by-the-author": _replace("by a reviewer that did not write it", "by a reviewer who may have written it"),
+    "review-after-the-merge": _replace("before the merge. Review in two passes", "after the merge. Review in two passes"),
+    "review-one-pass": _replace("Review in two passes, in order", "Review in one pass"),
+    "rounds-at-least": _replace("Three review rounds at most.", "Three review rounds at least."),
+    "cap-lets-it-merge": _replace("and nothing merges with unreviewed commits after the last round", "and anything may merge with unreviewed commits after the last round"),
+    "bug-does-not-block": _replace("An open bug finding from any reviewer blocks the merge.", "An open bug finding from any reviewer does not block the merge."),
+    "waiver-by-the-author": _replace("never by the change's author or its builder.", "or by the change's author or its builder."),
+    "waiver-by-anyone": _replace("written or explicitly approved by the human who merges", "written or approved by anyone"),
+    "evidence-optional": _replace("Evidence must be falsifiable", "Evidence need not be falsifiable"),
+    "suite-is-enough": _replace("Running the suite is not enough.", "Running the suite is enough."),
+    "mutation-dropped": _replace(" under a targeted mutation (production made wrong at the line the test guards)", ""),
+    "human-never-merges": _replace("- A human merges.", "- A human never merges."),
+    "agent-merges": _replace("- A human merges.", "- An agent merges."),
+    "skipped-job-is-green": _replace("a skipped, cancelled or neutral gating job does not count as green", "a skipped, cancelled or neutral gating job counts as green"),
+    "any-gating-job": _replace("Every gating job's conclusion must be success", "Any gating job's conclusion may be success"),
+    "ci-before-ready": _replace("on a run created after the pull request was marked ready", "on any run"),
+    "merge-not-pinned": _replace("Pin the merge to the reviewed head", "Do not pin the merge to the reviewed head"),
+    "live-reach-no-ask": _replace("Ask before anything with live reach, and wait for the answer", "Do not ask before anything with live reach"),
+    "live-reach-grant-wins": _replace(" This holds even where merging is otherwise granted.", ""),
+    "safety-check-bypassed": _replace("Never bypass a safety check", "Always bypass a safety check"),
+    "sandbox-off": _replace("run sandboxed by default", "run unsandboxed by default"),
+    "sandbox-block-drops-task": _replace("It is never a reason to drop the task.", "It is a reason to drop the task."),
+    "second-family-always": _replace("applies only when the override names one", "applies always"),
+    "outside-model-allowed": _replace("no code goes to an outside model, and a person merges.", "code goes to an outside model, and a person merges."),
+    "override-pointer-dropped": _replace("`harness-local.md`, in this same rules folder", "`local.md`, in this same rules folder"),
+    "stricter-repo-rules-lose": _replace("and wins where it is stricter", "and loses where it is stricter"),
+    "contradicting-line-added": _replace("\n## Evidence", "- Skip the review for a small change.\n\n## Evidence"),
+    "required-line-duplicated": _replace(
+        "- Reproduce a CI-only failure locally before reasoning about it.\n",
+        "- Reproduce a CI-only failure locally before reasoning about it.\n"
+        "- Reproduce a CI-only failure locally before reasoning about it.\n",
+    ),
+    "contradiction-under-a-repeated-heading": lambda text: text + "\n## Review\n- Skip the review for a small change.\n",
+    "required-line-removed": _replace("- Reproduce a CI-only failure locally before reasoning about it.\n", ""),
+    "section-renamed": _replace("## Merge", "## Merge (optional)"),
+}
 
 
 def _rules_text() -> str:
@@ -208,9 +351,42 @@ def test_the_rules_default_stays_under_its_byte_ceiling():
     assert size <= RULES_BYTE_CEILING, f"{size} bytes, over the ceiling of {RULES_BYTE_CEILING}"
 
 
-# d. The rules default still states its core rules.
+# d. The rules default still states its core rules, with their meaning.
 
 def test_the_rules_default_states_its_core_rules():
-    text = _rules_text()
-    missing = [phrase for phrase in REQUIRED_PHRASES if phrase not in text]
+    missing = [phrase for phrase in REQUIRED_PHRASES if phrase not in _rules_text()]
     assert missing == [], f"the rules default no longer states: {missing}"
+
+
+def test_the_rules_default_holds_each_core_rule_line_for_line():
+    problems = _rule_problems(_rules_text())
+    assert problems == [], "the rules default no longer holds its core rules:\n" + "\n".join(problems)
+
+
+def test_the_pinned_core_rules_still_cover_every_required_phrase():
+    pinned = "\n".join(line for lines in CORE_RULES.values() for line in lines)
+    uncovered = [phrase for phrase in REQUIRED_PHRASES if phrase not in pinned]
+    assert uncovered == [], f"a required phrase is in no pinned rule line: {uncovered}"
+
+
+@pytest.mark.parametrize("name", sorted(MUTATIONS))
+def test_a_negated_or_weakened_core_rule_is_found(name):
+    text = _rules_text()
+    mutated = MUTATIONS[name](text)
+    assert mutated != text, f"mutation {name} changed nothing"
+    assert _rule_problems(mutated) != [], f"mutation {name} still passes the core-rule check"
+
+
+def test_the_phrase_check_alone_misses_the_negated_review_rule():
+    # The reason the line check exists: this change keeps every required phrase.
+    mutated = MUTATIONS["review-negated"](_rules_text())
+    assert "No change bound for a merge gets a fresh-context review" in mutated
+    assert [phrase for phrase in REQUIRED_PHRASES if phrase not in mutated] == []
+    assert _rule_problems(mutated) != []
+
+
+def test_the_core_rule_check_ignores_trailing_blanks_and_blank_lines():
+    text = _rules_text()
+    padded = text.replace("\n- ", " \t\n\n- ").replace("\n## ", "\n\n## ")
+    assert padded != text
+    assert _rule_problems(padded) == []
