@@ -3,10 +3,11 @@
 # (exit 0, nothing on stdout) and leaves the command to Claude Code's own
 # permission flow.
 #   N1 static: no code line of the guard holds the word allow; the only
-#      permissionDecision values in the file are ask and deny; the git
-#      guard's hooks.json entry sets none; no userConfig option lists allow.
+#      permissionDecision values in the file are ask and deny; neither of the
+#      git guard's two hooks.json entries sets one; no userConfig option lists
+#      allow.
 #   N2 dynamic: a 40-row core corpus under all 27 option combinations prints
-#      ask, deny or nothing, never allow. (Every row of every other git guard
+#      ask, deny or nothing, never allow; N2b the same under --tighten-only. (Every row of every other git guard
 #      suite is checked the same way by the harness.)
 #   N3 an engine stand-in that prints an allow verdict is denied as invalid
 #      engine output.
@@ -33,8 +34,8 @@ if [ "$N1_DECISIONS" = 'permissionDecision":"ask permissionDecision":"deny ' ]; 
 else
   fail "N1 permissionDecision values: $N1_DECISIONS"
 fi
-N1_HOOK="$("$JQ" -r '[.. | objects | select(has("args") and ((.args | map(tostring) | join(" ")) | contains("/hooks/git-guard.sh")))] | if length == 1 then (.[0] | [paths(type == "string") as $p | getpath($p)] | map(select(test("permissionDecision"))) | length | tostring) else "entries=\(length)" end' "$HOOKS" 2>/dev/null)"
-if [ "$N1_HOOK" = 0 ]; then pass "N1 the git guard's hook entry sets no permissionDecision"; else fail "N1 the git guard's hook entry: $N1_HOOK"; fi
+N1_HOOK="$("$JQ" -r '[.. | objects | select(has("args") and ((.args | map(tostring) | join(" ")) | contains("/hooks/git-guard.sh")))] | if length == 2 then ([.[] | [paths(type == "string") as $p | getpath($p)] | map(select(test("permissionDecision"))) | length] | add | tostring) else "entries=\(length)" end' "$HOOKS" 2>/dev/null)"
+if [ "$N1_HOOK" = 0 ]; then pass "N1 neither git guard hook entry sets a permissionDecision"; else fail "N1 the git guard's hook entries: $N1_HOOK"; fi
 N1_OPTIONS="$("$JQ" -r '[.userConfig // {} | .[] | .options // [] | .[] | select(ascii_downcase == "allow")] | length' "$MANIFEST" 2>/dev/null)"
 if [ "$N1_OPTIONS" = 0 ]; then pass "N1 no userConfig option lists allow"; else fail "N1 userConfig options list allow: $N1_OPTIONS"; fi
 N1_DEFAULTS="$("$JQ" -r '[.userConfig // {} | .[] | .default | tostring | ascii_downcase | select(. == "allow")] | length' "$MANIFEST" 2>/dev/null)"
@@ -108,6 +109,26 @@ GG_MAIN=ask
 GG_FORCE=ask
 GG_COMMIT=off
 if [ "$N2_BAD" -eq 0 ] && [ "$N2_RUNS" -eq 1080 ]; then pass "N2 1080 runs: every one an ask, a deny or silence"; else fail "N2 $N2_BAD bad of $N2_RUNS runs"; fi
+
+printf '%s\n' '== N2b the stored-options hook (--tighten-only): 40 rows under 27 option combinations =='
+N2_BAD=0
+N2_RUNS=0
+for main in ask deny off; do
+  for force in ask deny off; do
+    for commit in ask deny off; do
+      for command_data in "${CORPUS[@]}"; do
+        gg_hook_args "$REPO_FEATURE" "$command_data" --tighten-only --push-to-main "$main" --force-push "$force" --commit-style "$commit"
+        N2_RUNS=$((N2_RUNS + 1))
+        case "$DECISION" in
+          ask|deny|silent) ;;
+          *) N2_BAD=$((N2_BAD + 1)); fail "N2b $main/$force/$commit '$command_data': not ask, deny or silent: exit $RC ${OUT:0:160}" ;;
+        esac
+        case "$OUT" in *'"allow"'*) N2_BAD=$((N2_BAD + 1)); fail "N2b $main/$force/$commit '$command_data': an allow" ;; esac
+      done
+    done
+  done
+done
+if [ "$N2_BAD" -eq 0 ] && [ "$N2_RUNS" -eq 1080 ]; then pass "N2b 1080 runs: every one an ask, a deny or silence"; else fail "N2b $N2_BAD bad of $N2_RUNS runs"; fi
 
 printf '%s\n' '== N3 an engine allow is never passed through =='
 gg_hook_args "$REPO_FEATURE" 'git status' --push-to-main ask --force-push ask --commit-style off --adapter-policy "$HERE/fixtures/git-guard/allow-engine.sh"

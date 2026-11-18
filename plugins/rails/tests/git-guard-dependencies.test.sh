@@ -188,8 +188,9 @@ for sig in HUP INT QUIT ILL TRAP ABRT BUS FPE USR1 SEGV USR2 PIPE ALRM TERM XCPU
   fi
 done
 GG_GUARD=""
-# The hook argv of hooks.json's git guard entry, with the plugin root and the
-# option references substituted, and the guard path replaceable.
+# The hook argv of hooks.json's first git guard entry (the floor, which
+# references no option), with the plugin root substituted, and the guard path
+# replaceable.
 GIT_ENTRY_ARGS="$("$JQ" -c --arg root "$PLUGIN_ROOT" '[.hooks.PreToolUse[].hooks[] | select(.type == "command") | select((.args // []) | any(endswith("/hooks/git-guard.sh")))] | .[0] | [.command] + (.args | map(gsub("\\$\\{CLAUDE_PLUGIN_ROOT\\}"; $root) | gsub("\\$\\{user_config\\.[a-z_]+\\}"; "")))' "$HOOKS")" || { fail "D3 fixture: no git guard entry"; exit 1; }
 run_argv() { # GUARD_FILE CWD COMMAND: the hook argv; sets OUT, RC
   local guard="$1" cwd="$2" command_data="$3" word
@@ -203,7 +204,7 @@ run_argv() { # GUARD_FILE CWD COMMAND: the hook argv; sets OUT, RC
 }
 run_argv "$GUARD" "$REPO_FEATURE" "$M1"
 gg_classify
-gg_expect "D3 control: the hook argv with empty option values asks" ask:push_main_branch
+gg_expect "D3 control: the floor's hook argv asks" ask:push_main_branch
 replace_copy "$T/copies/d3-kill.sh" '  GUARD_LOG_INPUT="$normalized"' '  GUARD_LOG_INPUT="$normalized"
   kill -KILL $$'
 run_argv "$T/copies/d3-kill.sh" "$REPO_FEATURE" "$M1"
@@ -215,19 +216,23 @@ printf '%s\n' '== H1 the hook entry =='
 H1="$("$JQ" -r '
   [.hooks | to_entries[] | .key as $event | .value[] | .matcher as $m | .hooks[] | {event: $event, matcher: $m} + .] as $all
   | ($all | map(select((.args // []) | map(tostring) | any(endswith("/hooks/git-guard.sh"))))) as $g
-  | if ($g | length) != 1 then "guard entries: \($g | length)"
-    elif $g[0].event != "PreToolUse" then "event \($g[0].event)"
-    elif $g[0].matcher != "Bash" then "matcher \($g[0].matcher)"
-    elif $g[0].type != "command" then "type \($g[0].type)"
-    elif $g[0].command != "/usr/bin/env" then "command \($g[0].command)"
-    elif $g[0].args != ["-u","BASH_ENV","-u","ENV","/bin/bash","--noprofile","--norc","-p","${CLAUDE_PLUGIN_ROOT}/hooks/git-guard.sh","--push-to-main","${user_config.push_to_main}","--force-push","${user_config.force_push}","--commit-style","${user_config.commit_style}"] then "args \($g[0].args | tostring)"
-    elif $g[0].timeout != 10 then "timeout \($g[0].timeout)"
-    elif $g[0].onFailure != "block" then "onFailure \($g[0].onFailure)"
-    elif $g[0].statusMessage != "Checking git guardrails..." then "statusMessage \($g[0].statusMessage)"
-    elif ($all | length) != 2 then "hooks: \($all | length)"
-    elif ($all[1].args | any(endswith("/hooks/git-guard.sh")) | not) then "the git guard entry is not second"
+  | if ($g | length) != 2 then "guard entries: \($g | length)"
+    elif ($g | map(.event) | unique) != ["PreToolUse"] then "event \($g | map(.event))"
+    elif ($g | map(.matcher) | unique) != ["Bash"] then "matcher \($g | map(.matcher))"
+    elif ($g | map(.type) | unique) != ["command"] then "type \($g | map(.type))"
+    elif ($g | map(.command) | unique) != ["/usr/bin/env"] then "command \($g | map(.command))"
+    elif ($g | map(.timeout) | unique) != [10] then "timeout \($g | map(.timeout))"
+    elif $g[0].args != ["-u","BASH_ENV","-u","ENV","/bin/bash","--noprofile","--norc","-p","${CLAUDE_PLUGIN_ROOT}/hooks/git-guard.sh","--push-to-main","ask","--force-push","ask","--commit-style","off"] then "floor args \($g[0].args | tostring)"
+    elif $g[0].onFailure != "block" then "floor onFailure \($g[0].onFailure)"
+    elif $g[0].statusMessage != "Checking git guardrails..." then "floor statusMessage \($g[0].statusMessage)"
+    elif $g[1].args != ["-u","BASH_ENV","-u","ENV","/bin/bash","--noprofile","--norc","-p","${CLAUDE_PLUGIN_ROOT}/hooks/git-guard.sh","--tighten-only","--push-to-main","${user_config.push_to_main}","--force-push","${user_config.force_push}","--commit-style","${user_config.commit_style}"] then "stored-options args \($g[1].args | tostring)"
+    elif ($g[1] | has("onFailure")) then "stored-options onFailure \($g[1].onFailure)"
+    elif $g[1].statusMessage != "Checking stored git guard options..." then "stored-options statusMessage \($g[1].statusMessage)"
+    elif ($all | length) != 3 then "hooks: \($all | length)"
+    elif ($all[1].args | any(endswith("/hooks/git-guard.sh")) | not) or ($all[1].args | index("--tighten-only")) != null then "the floor is not second"
+    elif ($all[2].args | index("--tighten-only")) == null then "the stored-options hook is not third"
     else "ok" end' "$HOOKS" 2>&1)"
-if [ "$H1" = ok ]; then pass "H1 the git guard entry: second, /usr/bin/env, the exact args, timeout 10, onFailure block"; else fail "H1 hooks.json: $H1"; fi
+if [ "$H1" = ok ]; then pass "H1 the git guard entries: the floor second (literal defaults, onFailure block), the stored-options hook third (--tighten-only, no onFailure)"; else fail "H1 hooks.json: $H1"; fi
 
 printf '%s\n' '== D4 interpreter startup state changes no verdict =='
 ALLOW_JSON='{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}'
