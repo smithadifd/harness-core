@@ -14,6 +14,15 @@
 #       judged rm as rm_roots_untrusted;
 #   M   malformed file: each grammar near miss denies every judged rm as
 #       rm_roots_malformed;
+#   H   a home folder the database spells through a symlink: a row above the
+#       spelled path and a row above the canonical path are each malformed;
+#   C   the 65536-byte cap: 64 well-formed rows that add up to exactly 65536
+#       bytes load (C2); 64 well-formed rows over 65536 bytes are malformed by
+#       the cap alone (C1). C1 needs a folder path over 1023 bytes, which a
+#       host whose PATH_MAX is 1024 (macOS) cannot hold, so C1 runs only where
+#       the host's own [ -d ] accepts such a path, and says so where it does
+#       not: with each row at most 1023 bytes, 64 rows end at 65536 bytes,
+#       the cap itself, so no well-formed file there reaches the cap;
 #   Z   absent file: dormant, every verdict as without the layer;
 #   F   a fake HOME holding a planted file changes nothing (the shipped guard);
 #   P   the pin on the line that finds the account's home folder;
@@ -260,6 +269,79 @@ run_case "M21 64 rows are the limit" no_opinion "$WORKSPACE" "rm -f $ROOT/file.m
 head -c 70000 /dev/zero | tr '\0' 'a' >"$FILE"
 chmod 600 "$FILE"
 run_case "M22 a file over 65536 bytes" deny "$WORKSPACE" "rm -f $ROOT/file.md" rm_roots_malformed
+
+printf '%s\n' '== H a home folder spelled through a symlink =='
+# The database spells the home as $TMP/a/alias, a symlink to $TMP/real/acct.
+mkdir -p "$TMP/a" "$TMP/real/acct/.claude/rails"
+chmod 700 "$TMP/real/acct/.claude/rails"
+ln -s "$TMP/real/acct" "$TMP/a/alias"
+printf 'x\n' >"$TMP/a/f.md"
+printf 'x\n' >"$TMP/real/f.md"
+ALIAS_FILE="$TMP/real/acct/.claude/rails/rm-roots"
+COPY_ALIAS="$TMP/guard-alias-home.sh"
+home_copy "$COPY_ALIAS" "$TMP/a/alias"
+alias_roots() {
+  rm -f "$ALIAS_FILE"
+  printf '%s' "$1" >"$ALIAS_FILE"
+  chmod 600 "$ALIAS_FILE"
+}
+RUN_GUARD="$COPY_ALIAS"
+alias_roots "$ROOT"$'\n'
+run_case "H1 a symlinked home with a good root still loads" no_opinion "$WORKSPACE" "rm -f $ROOT/file.md" accepted
+alias_roots "$TMP/a"$'\n'
+run_case "H2 a folder above the spelled home (not above the canonical one)" deny "$WORKSPACE" "rm -f $TMP/a/f.md" rm_roots_malformed
+alias_roots "$TMP/real"$'\n'
+run_case "H3 a folder above the canonical home (not above the spelled one)" deny "$WORKSPACE" "rm -f $TMP/real/f.md" rm_roots_malformed
+RUN_GUARD="$COPY"
+
+printf '%s\n' '== C the 65536-byte cap =='
+# mk_long BASE LEN: makes nested folders below BASE, entering each one in turn
+# (relative names, so the host's path limit does not stop mkdir), and prints
+# the absolute path, exactly LEN bytes long.
+mk_long() {
+  (
+    p="$1"
+    cd "$1" || exit 1
+    while [ "${#p}" -lt "$2" ]; do
+      n=$(($2 - ${#p} - 1))
+      if [ "$n" -gt 200 ]; then
+        n=200
+        [ $(($2 - ${#p} - 1 - n)) -ne 1 ] || n=199
+      fi
+      seg="$(printf '%*s' "$n" '' | tr ' ' d)"
+      mkdir -p "$seg" && cd "$seg" || exit 1
+      p="$p/$seg"
+    done
+    printf '%s' "$p"
+  )
+}
+# rows_of PATH: 64 rows naming PATH, each ended by a newline (written straight
+# to the file: a command substitution would drop the last newline).
+rows_of() {
+  local i rows=""
+  for i in $(seq 1 64); do rows="$rows$1"$'\n'; done
+  printf '%s' "$rows"
+}
+mkdir -p "$TMP/cap-at" "$TMP/cap-over"
+LONG_AT="$(mk_long "$TMP/cap-at" 1023)" || { fail "C fixture: could not build a 1023-byte folder path"; exit 1; }
+[ "${#LONG_AT}" -eq 1023 ] || { fail "C fixture: the at-cap path is ${#LONG_AT} bytes, not 1023"; exit 1; }
+rm -f "$FILE"
+rows_of "$LONG_AT" >"$FILE"
+chmod 600 "$FILE"
+size="$(wc -c <"$FILE" | tr -d ' ')"
+[ "$size" -eq 65536 ] || { fail "C fixture: the at-cap file is $size bytes, not 65536"; exit 1; }
+run_case "C2 64 well-formed 1023-byte rows, exactly 65536 bytes, load" no_opinion "$REPO" "rm -rf ./build" accepted
+LONG_OVER="$(mk_long "$TMP/cap-over" 1100)" || { fail "C fixture: could not build a 1100-byte folder path"; exit 1; }
+if [ -d "$LONG_OVER" ]; then
+  rm -f "$FILE"
+  rows_of "$LONG_OVER" >"$FILE"
+  chmod 600 "$FILE"
+  size="$(wc -c <"$FILE" | tr -d ' ')"
+  [ "$size" -gt 65536 ] || { fail "C fixture: the over-cap file is $size bytes, not over 65536"; exit 1; }
+  run_case "C1 64 well-formed 1100-byte rows, $size bytes, are over the cap" deny "$REPO" "rm -rf ./build" rm_roots_malformed
+else
+  printf 'NOTE: C1 not reachable on this host: a 1100-byte folder path is not a folder to [ -d ], so 64 well-formed rows end at 65536 bytes (C2), the cap itself\n'
+fi
 
 printf '%s\n' '== Z an absent file is dormant =='
 RUN_GUARD="$COPY_NOFILE"
