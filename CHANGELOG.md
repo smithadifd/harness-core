@@ -3,6 +3,17 @@
 Each tag of this repository gets an entry: what changed in the vendored files,
 and any pin move of the vendored ledger.
 
+## Unreleased
+
+- The destructive-command guard now names `unsafe_rm`, with its hint, when it
+  denies an rm that holds a home-folder spelling it does not expand (`~`,
+  `~/x`, `~user/x`, `$HOME`, `$HOME/x`, `${HOME}`, `${HOME}/x`, quoted or
+  not), as the README says. It named `unsupported_syntax`, whose hint speaks
+  of an over-long or unbalanced command, which read as a misfire. Only the
+  reason changes: every command that denied still denies, and no silent
+  command changes. Every other rm that does not parse keeps
+  `unsupported_syntax`. The `rails` plugin's version moves to 0.1.1.
+
 ## v0.1.3
 
 - The `rails` plugin, a second plugin in the `harness-core` marketplace

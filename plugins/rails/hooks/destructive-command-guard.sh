@@ -1593,6 +1593,22 @@ strip_leading_negation() {
   done
 }
 
+# On the failed-parse path of an explicit rm only: true when a word of TEXT,
+# as split_shell_words dequotes it, is a home-folder spelling the guard does
+# not expand (~ and anything after it, $HOME, $HOME/..., ${HOME} and
+# ${HOME}/...). The caller denies either way; this picks unsafe_rm over
+# unsupported_syntax and never changes whether the command denies.
+rm_home_spelling_word() { # TEXT
+  local word
+  split_shell_words "$1" || return 1
+  for word in ${SPLIT_WORDS[@]+"${SPLIT_WORDS[@]}"}; do
+    case "$word" in
+      '~'*|'$HOME'|'$HOME/'*|'${HOME}'|'${HOME}/'*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
 looks_explicit_rm() {
   analyze_rm_segment "$1" || return 1
   [ "$KNOWN_RM" -eq 1 ]
@@ -4561,7 +4577,10 @@ run_policy() {
     if looks_explicit_rm "$detect_segment"; then
       if [ "$stripped" -eq 0 ]; then
         strip_leading_negation "$segment"
-        parse_simple_command "$RM_PARSE_INPUT" || policy_deny unsupported_syntax
+        if ! parse_simple_command "$RM_PARSE_INPUT"; then
+          rm_home_spelling_word "$RM_PARSE_INPUT" && policy_deny unsafe_rm
+          policy_deny unsupported_syntax
+        fi
         normalize_explicit_rm_words || policy_deny unsupported_syntax
       else
         parse_simple_command "$segment" || policy_deny unsafe_rm

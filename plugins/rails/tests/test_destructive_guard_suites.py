@@ -32,6 +32,7 @@ SUITES = [
     "destructive-command-guard-dependencies.test.sh",
     "destructive-command-guard-dormant.test.sh",
     "destructive-command-guard-git-forms.test.sh",
+    "destructive-command-guard-home-spelling.test.sh",
     "destructive-command-guard-lane-remove.test.sh",
     "destructive-command-guard-linked-worktree.test.sh",
     "destructive-command-guard-merged-remove.test.sh",

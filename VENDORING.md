@@ -100,6 +100,7 @@ the text itself.
 | `plugins/rails/tests/destructive-command-guard-dependencies.test.sh` | tests that a missing program denies by name, that programs are found only in the trusted roots, the crash and signal traps, the hook entry, inherited git variables and interpreter startup state |
 | `plugins/rails/tests/destructive-command-guard-dormant.test.sh` | tests that the lane-registry layer and the guard log are dormant unarmed and deny by name when armed and broken |
 | `plugins/rails/tests/destructive-command-guard-git-forms.test.sh` | tests of git worktree remove spelled through git options and prefixes, and of the stat flavours |
+| `plugins/rails/tests/destructive-command-guard-home-spelling.test.sh` | tests, through the real hook form, that an rm holding a home-folder spelling (~, $HOME, ${HOME}, quoted or not) denies as unsafe_rm with its hint, and that every other parse failure keeps unsupported_syntax |
 | `plugins/rails/tests/destructive-command-guard-lane-remove.test.sh` | tests of the lane-registry removal and its identity binding |
 | `plugins/rails/tests/destructive-command-guard-linked-worktree.test.sh` | tests of the explicitly authorized linked-worktree removal |
 | `plugins/rails/tests/destructive-command-guard-merged-remove.test.sh` | regressions of the removed merged-or-pushed route, the graft case among them |
