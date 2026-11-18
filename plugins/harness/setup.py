@@ -11,6 +11,12 @@ anything the person has changed since. Ledger-init makes the first ledger
 write, which creates the database file when it is absent. Doctor reads and
 reports: it writes nothing and takes no lock.
 
+Plan, apply and ledger-init take --db, the ledger database's absolute path,
+for an account that already keeps its ledger somewhere else. Without it the
+database is at the default path below the home. Apply stores the path as the
+ledger_db option, and a database already at the path is used as it is: it is
+never re-created and never written to.
+
 Instance-plan and instance-create are the optional instance folder: a new
 folder of the person's choosing, made a local git repository, holding the
 template's markdown. It is the person's own: the setup record never lists it,
@@ -274,9 +280,20 @@ def database_path(home: Path) -> Path:
     return home.joinpath(*DB_REL.split("/"))
 
 
-def ledger_values(home: Path, operator: str, harness: str | None) -> dict[str, str]:
+def chosen_database(home: Path, raw: str | None) -> Path:
+    """The ledger database path: the path --db gives, which must be absolute,
+    or the default path below the home when --db is not given. The path is
+    the person's and is not resolved: it is stored and used as given."""
+    if raw is None:
+        return database_path(home)
+    if not os.path.isabs(raw):
+        raise SetupError("--db must be an absolute path")
+    return Path(raw)
+
+
+def ledger_values(database: Path, operator: str, harness: str | None) -> dict[str, str]:
     values = {
-        OPTION_DB: str(database_path(home)),
+        OPTION_DB: str(database),
         OPTION_OPERATOR: operator,
     }
     if harness:
@@ -284,8 +301,8 @@ def ledger_values(home: Path, operator: str, harness: str | None) -> dict[str, s
     return values
 
 
-def first_write_command(home: Path) -> list[str]:
-    return ["ledger", "--db", str(database_path(home)), *FIRST_WRITE]
+def first_write_command(database: Path) -> list[str]:
+    return ["ledger", "--db", str(database), *FIRST_WRITE]
 
 
 def optional_items() -> list[tuple[str, str]]:
@@ -388,9 +405,12 @@ def approved_ids(approve: list[str], approve_all: bool) -> set[str]:
     return found
 
 
-def format_plan(home: Path, operator: str, harness: str | None) -> str:
+def format_plan(home: Path, database: Path, operator: str, harness: str | None) -> str:
     rules, override = check_proposals()
-    values = ledger_values(home, operator, harness)
+    values = ledger_values(database, operator, harness)
+    # The default database is listed below the home like the other files; a
+    # path --db gives is listed whole, since it may be anywhere.
+    shown_database = DB_REL if database == database_path(home) else str(database)
     lines = [
         f"FILE {RULES_REL}",
         "----",
@@ -404,7 +424,7 @@ def format_plan(home: Path, operator: str, harness: str | None) -> str:
         "record of this apply",
         f"FILE {LOCK_REL}",
         "the lock file, created empty; uninstall keeps it",
-        f"FILE {DB_REL}",
+        f"FILE {shown_database}",
         "the ledger database, made by the first ledger write below only when it is "
         "absent; uninstall keeps it",
         "LEDGER",
@@ -414,7 +434,7 @@ def format_plan(home: Path, operator: str, harness: str | None) -> str:
         "----",
         "FIRST LEDGER WRITE",
         "----",
-        " ".join(shlex.quote(part) for part in first_write_command(home)),
+        " ".join(shlex.quote(part) for part in first_write_command(database)),
         "----",
         f"SETTINGS {SETTINGS_REL}",
         "changed only by an optional item below that you approve; Claude Code also "
@@ -488,21 +508,22 @@ class Tree:
         self.fds[rel] = fd
         return fd
 
-    def follow_dir(self, rel: str) -> int:
-        """The descriptor of the ledger database's folder rel. This is the one
-        folder setup opens by following symlinks, at rel or above it: the
-        database path is the person's, as the ledger command treats it. A
-        folder that is missing is made with ordinary mkdir, one level at a
-        time; the apply and remove walk above never comes here."""
-        key = f"follow:{rel}"
+    def follow_dir(self, folder: Path) -> int:
+        """The descriptor of the ledger database's folder, an absolute path.
+        This is the one folder setup opens by following symlinks, at the
+        folder or above it: the database path is the person's, as the ledger
+        command treats it. A folder that is missing is made with ordinary
+        mkdir, one level at a time; the apply and remove walk above never
+        comes here."""
+        key = f"follow:{folder}"
         if key in self.fds:
             return self.fds[key]
-        path = self.show(rel)
+        path = str(folder)
         try:
             try:
                 fd = os.open(path, FOLLOW_DIR_FLAGS)
             except FileNotFoundError:
-                self.make_followed(rel)
+                self.make_followed(folder)
                 fd = os.open(path, FOLLOW_DIR_FLAGS)
         except OSError as exc:
             raise SetupError(
@@ -510,17 +531,21 @@ class Tree:
         self.fds[key] = fd
         return fd
 
-    def make_followed(self, rel: str) -> None:
-        """Make each missing level of rel below the home, each 0700. A level
-        that exists, as a folder or as a symlink, is left as it is."""
-        walked = ""
-        for name in rel.split("/"):
-            walked = f"{walked}/{name}" if walked else name
+    def make_followed(self, folder: Path) -> None:
+        """Make each missing level of folder, each 0700, from the deepest
+        level that exists down. A level that exists, as a folder or as a
+        symlink, is left as it is."""
+        missing = []
+        for level in (folder, *folder.parents):
+            if os.path.lexists(level):
+                break
+            missing.append(level)
+        for level in reversed(missing):
             try:
-                os.mkdir(self.show(walked), 0o700)
+                os.mkdir(level, 0o700)
             except FileExistsError:
                 continue
-            fd = os.open(self.show(walked.rpartition("/")[0]), FOLLOW_DIR_FLAGS)
+            fd = os.open(str(level.parent), FOLLOW_DIR_FLAGS)
             try:
                 sync(fd)
             finally:
@@ -1045,20 +1070,21 @@ class Changes:
         self.settings: dict[str, Any] | None = None
 
 
-def apply_verb(home: Path, operator: str, harness: str | None,
+def apply_verb(home: Path, database: Path, operator: str, harness: str | None,
                approve: list[str], approve_all: bool) -> tuple[str, list[str]]:
     tree = Tree(home)
     try:
         lock = take_lock(tree)
         try:
-            return apply_locked(tree, lock, operator, harness, approve, approve_all)
+            return apply_locked(tree, lock, database, operator, harness, approve,
+                                approve_all)
         finally:
             os.close(lock)
     finally:
         tree.close()
 
 
-def apply_locked(tree: Tree, lock: int, operator: str, harness: str | None,
+def apply_locked(tree: Tree, lock: int, database: Path, operator: str, harness: str | None,
                  approve: list[str], approve_all: bool) -> tuple[str, list[str]]:
     # Preconditions: no writes.
     rules_bytes, override_bytes = check_proposals()
@@ -1079,7 +1105,7 @@ def apply_locked(tree: Tree, lock: int, operator: str, harness: str | None,
     check_types(tree, read_settings(tree), ids)
 
     # Configure, then the settings bytes apply builds on.
-    configure_ledger(claude, ledger_values(tree.root, operator, harness), lock)
+    configure_ledger(claude, ledger_values(database, operator, harness), lock)
     try:
         base = read_settings(tree)
         check_types(tree, base, ids)
@@ -1417,13 +1443,13 @@ def remove_locked(tree: Tree) -> tuple[str, list[str]]:
 # Ledger-init: the first ledger write
 
 
-def ledger_init_verb(home: Path, operator: str,
+def ledger_init_verb(home: Path, database: Path, operator: str,
                      harness: str | None) -> tuple[str, list[str], int]:
     tree = Tree(home)
     try:
         lock = take_lock(tree)
         try:
-            return ledger_init_locked(tree, operator, harness), [], 0
+            return ledger_init_locked(tree, database, operator, harness), [], 0
         finally:
             os.close(lock)
     finally:
@@ -1484,16 +1510,16 @@ def drop_temp_database(parent: int, temp: str) -> list[str]:
     return left
 
 
-def ledger_init_locked(tree: Tree, operator: str, harness: str | None) -> str:
+def ledger_init_locked(tree: Tree, database: Path, operator: str,
+                       harness: str | None) -> str:
     """Make the first ledger write when the database file is absent. Setup
     must have completed: the write is part of it. A database that already
-    exists is never written to."""
+    exists at the path is never written to."""
     raw, head, body = read_record(tree)
     if raw is None:
         raise SetupError(f"no record at {tree.show(RECORD_REL)}; run apply first")
     if body is None:
         raise hard_stop_refusal(tree, head)
-    database = database_path(tree.root)
     if os.path.lexists(database):
         return (f"kept: ledger database already exists at {database}; "
                 "no first write was made\n")
@@ -1508,10 +1534,10 @@ def ledger_init_locked(tree: Tree, operator: str, harness: str | None) -> str:
     # after the child has succeeded and the topic is in it, so a failed or
     # timed-out child can never leave a partial file at the final path that
     # the next run would take for a finished database.
-    parent_rel, _, base = DB_REL.rpartition("/")
-    parent = tree.follow_dir(parent_rel)
+    folder, base = database.parent, database.name
+    parent = tree.follow_dir(folder)
     temp = reserve_temp_name(parent, base)
-    temp_path = tree.show(f"{parent_rel}/{temp}")
+    temp_path = str(folder / temp)
     env = dict(os.environ)
     env["LEDGER_DB"] = temp_path
     env["LEDGER_OPERATOR"] = operator
@@ -1551,7 +1577,7 @@ def ledger_init_locked(tree: Tree, operator: str, harness: str | None) -> str:
     if left:
         raise SetupError(
             f"the ledger database was created, but these temporary files could not be "
-            f"removed: {', '.join(tree.show(f'{parent_rel}/{name}') for name in left)}")
+            f"removed: {', '.join(str(folder / name) for name in left)}")
     return f"created: ledger database at {database}\n"
 
 
@@ -2052,6 +2078,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="approve one optional settings proposal by id")
     parser.add_argument("--approve-all", action="store_true",
                         help="approve every optional settings proposal")
+    parser.add_argument("--db", default=None,
+                        help="the absolute path of the ledger database (plan, apply and "
+                             "ledger-init); a database already there is used as it is")
     parser.add_argument("--path", default=None,
                         help="the absolute path of the instance folder "
                              "(instance-plan and instance-create)")
@@ -2085,11 +2114,13 @@ def run(argv: list[str]) -> tuple[str, list[str], int]:
             raise SetupError("--operator is required for ledger-init")
         raise SetupError("--operator is required for plan and apply")
     harness = args.harness or None
+    database = chosen_database(home, args.db)
     if args.verb == "ledger-init":
-        return ledger_init_verb(home, args.operator, harness)
+        return ledger_init_verb(home, database, args.operator, harness)
     if args.verb == "plan":
-        return format_plan(home, args.operator, harness), [], 0
-    out, warnings = apply_verb(home, args.operator, harness, args.approve, args.approve_all)
+        return format_plan(home, database, args.operator, harness), [], 0
+    out, warnings = apply_verb(home, database, args.operator, harness, args.approve,
+                               args.approve_all)
     return out, warnings, 0
 
 

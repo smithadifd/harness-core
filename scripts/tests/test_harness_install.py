@@ -11,6 +11,10 @@ are the checkpoint's own observation and are not here.
 3. The install never edits a file the person already had.
 4. Grants start empty.
 
+The --db option is held to the same promises: a ledger database the person
+keeps at another path is listed by the plan, used as it is and stored as the
+ledger_db option, and no second database is made.
+
 The README and the setup skill are also held to what the script does, so a
 newcomer's instructions cannot drift from it.
 """
@@ -19,6 +23,7 @@ from __future__ import annotations
 import json
 import re
 import shlex
+import sqlite3
 import subprocess
 from pathlib import Path
 
@@ -375,6 +380,116 @@ def test_install_4_no_plugin_hook_returns_allow(tmp_path):
                                                           encoding="utf-8")
     assert hooks_that_allow(plugins) == ["bad/hooks/allow.sh", "bad/hooks/legacy.json"]
     assert hooks_that_allow(ROOT / "plugins") == []
+
+
+# ---------------------------------------------------------------------------
+# The --db option: a ledger the person keeps at another path is used, and no
+# second database is made.
+
+SQLITE_SIDE_FILES = ("-wal", "-shm", "-journal")
+
+
+def database_files(folder):
+    """Every SQLite database file, or file SQLite keeps beside one, under folder."""
+    return {path for path in folder.rglob("*")
+            if path.is_file() and (path.suffix == ".db"
+                                   or path.name.endswith(SQLITE_SIDE_FILES))}
+
+
+def seed_database(path):
+    path.parent.mkdir(parents=True)
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("CREATE TABLE kept (note TEXT)")
+        conn.execute("INSERT INTO kept VALUES ('the person keeps this ledger')")
+        conn.commit()
+    finally:
+        conn.close()
+    return path.read_bytes()
+
+
+def test_db_a_database_seeded_elsewhere_is_used_and_no_new_database_is_made(tmp_path):
+    home, bin_dir = fixture(tmp_path)
+    elsewhere = tmp_path / "elsewhere"
+    seeded = elsewhere / "my-ledger.db"
+    seeded_bytes = seed_database(seeded)
+    before_home, before_elsewhere = snap(home), snap(elsewhere)
+    given = ("--db", str(seeded))
+
+    plan = do("plan", home, bin_dir, *given)
+    assert plan.rc == 0, plan.err
+    assert snap(home) == before_home and snap(elsewhere) == before_elsewhere, (
+        "the plan wrote something")
+    # The plan lists the given path, and nothing at the default path.
+    assert plan_files(plan.out) == [RULES, OVERRIDE, RECORD, LOCK, str(seeded)]
+    _argv, values = plan_configure(plan.out)
+    assert values["ledger_db"] == str(seeded)
+    lines = plan.out.splitlines()
+    command = shlex.split(lines[lines.index("FIRST LEDGER WRITE") + 2])
+    assert command[1:3] == ["--db", str(seeded)]
+
+    applied = do("apply", home, bin_dir, *given, *approve_args(ALL_IDS))
+    assert applied.rc == 0, applied.err
+    # The stored ledger_db option is the given path.
+    assert show_stored(bin_dir)["ledger_db"] == str(seeded)
+    init = do("ledger-init", home, bin_dir, *given)
+    assert init.rc == 0, init.err
+    assert init.out == (f"kept: ledger database already exists at {seeded}; "
+                        "no first write was made\n")
+    assert not (bin_dir / "ledger-argv").exists(), "the ledger command ran"
+
+    # The seeded database is used as it is, and no database file is new
+    # anywhere: not at the default path, not beside the seeded one.
+    assert seeded.read_bytes() == seeded_bytes
+    assert snap(elsewhere) == before_elsewhere
+    assert database_files(tmp_path) == {seeded}
+    assert not at(home, DB).exists()
+    after_home = snap(home)
+    assert changed_files(before_home, after_home) == {RULES, OVERRIDE, RECORD, LOCK, SETTINGS}
+    assert not any(name.startswith(".local") for name in after_home)
+
+
+def test_db_a_new_path_gets_the_first_write_there_and_doctor_checks_it(tmp_path):
+    home, bin_dir = fixture(tmp_path)
+    chosen = tmp_path / "other" / "nested" / "ledger.db"
+    given = ("--db", str(chosen))
+    plan = do("plan", home, bin_dir, *given)
+    assert plan.rc == 0, plan.err
+    assert str(chosen) in plan_files(plan.out)
+    assert do("apply", home, bin_dir, *given).rc == 0
+    show_stored(bin_dir)
+    init = do("ledger-init", home, bin_dir, *given)
+    assert init.rc == 0, init.err
+    assert init.out == f"created: ledger database at {chosen}\n"
+    assert chosen.read_bytes()[:15] == b"SQLite format 3"
+    assert database_files(tmp_path) == {chosen}
+    assert not at(home, DB).exists()
+    doctor = do("doctor", home, bin_dir)
+    assert doctor.rc == 0, doctor.out
+    assert f"ok options: ledger_db is set: {chosen}" in doctor.out.splitlines()
+    assert any(line.startswith(f"ok ledger: the ledger database exists: {chosen} ")
+               for line in doctor.out.splitlines())
+
+
+@pytest.mark.parametrize("verb", ["plan", "apply", "ledger-init"])
+@pytest.mark.parametrize("raw", ["ledger.db", "./ledger/ledger.db", ""],
+                         ids=["bare-name", "dot-relative", "empty"])
+def test_db_a_relative_path_is_refused_with_nothing_written(tmp_path, verb, raw):
+    home, bin_dir = fixture(tmp_path)
+    before = snap(home)
+    done = do(verb, home, bin_dir, "--db", raw)
+    assert done.rc == 1
+    assert done.err == "setup: --db must be an absolute path\n"
+    assert done.out == ""
+    assert snap(home) == before
+    assert database_files(tmp_path) == set()
+    assert not (bin_dir / "claude-stdin").exists(), "configure ran before the refusal"
+
+
+def test_the_skill_passes_the_same_db_path_to_plan_apply_and_ledger_init():
+    text = " ".join(SKILL.read_text(encoding="utf-8").split())
+    assert "add `--db '<path>'`" in text
+    assert "to the `plan`, `apply` and `ledger-init` commands" in text
 
 
 # ---------------------------------------------------------------------------
