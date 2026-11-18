@@ -29,6 +29,10 @@ Rules that hold in every mode:
 - Run each script command as one Bash call, exactly as written below. Home is
   the person's home folder, as an absolute path: `"$HOME"`.
 - Show the script's output to the person as it is. Never summarize a plan.
+  A Bash result is collapsed in the person's terminal and is not read unless
+  they expand it, so "show" always means: copy the output into your own reply
+  text, in full, as a fenced block. Do this before you ask any question that
+  depends on it.
 - If the script refuses (one line starting `setup:`), show that line, say
   nothing was changed beyond what it names, and stop. Do not retry, do not edit
   `settings.json` or any file by hand, and do not work around the refusal.
@@ -44,8 +48,13 @@ Rules that hold in every mode:
 ## Set up
 
 1. **Who the ledger's writes are for.** Ask the person for the operator name:
-   the name the ledger stamps on what they write. The harness name is
-   `claude-code` unless they give another; use it wherever `<harness>` appears.
+   the name the ledger stamps on what they write. Ask it as a plain question
+   in your own reply, such as "What name should the ledger stamp on what you
+   write? Type it as your next message.", and stop and wait for their next
+   message to be the name. Never ask for it with a picker, option list or
+   question dialog: its free-text choice dismisses the question. The harness
+   name is `claude-code` unless they give another; use it wherever
+   `<harness>` appears.
 
 2. **Print the plan.** Nothing is written by this step:
 
@@ -53,7 +62,10 @@ Rules that hold in every mode:
    python3 "${CLAUDE_SKILL_DIR}/../../setup.py" plan --home "$HOME" --operator '<operator>' --harness '<harness>'
    ```
 
-   Show the whole output. Say what it holds: each `FILE` is a file that will be
+   Copy the whole output into your own reply, in full (every `FILE`, the
+   `LEDGER` options, the `FIRST LEDGER WRITE` command and each `OPTIONAL`
+   item with its exact text), before you ask the yes. Then say what it holds:
+   each `FILE` is a file that will be
    created (the rules default, the override starter, the setup record, the lock
    file and the ledger database); `LEDGER` is the three ledger options that
    Claude Code will store, which is the one change made to the person's
@@ -62,7 +74,8 @@ Rules that hold in every mode:
    a settings change that is only made if the person says yes to that item.
    Nothing the plan lists grants permission to anything.
 
-3. **Take the yes.** First ask one yes or no for the files, the ledger options
+3. **Take the yes.** The plan must already be in your own reply, in full, from
+   step 2. First ask one yes or no for the files, the ledger options
    and the first ledger write together. On no, stop: nothing was written.
    Then ask about each `OPTIONAL` item on its own, in the order printed, as a
    separate question showing that item's exact text. A yes to one item is never
@@ -182,13 +195,21 @@ themselves, after this one, because no hook runs when a plugin is uninstalled.
    python3 "${CLAUDE_SKILL_DIR}/../../setup.py" remove --home "$HOME"
    ```
 
-   Show the output. Every `kept for a manual check` line names a file the
+   Show the output. Report only what it names: the `kept for a manual check`
+   lines, the `already gone` lines, the kept ledger database and the removed
+   setup record. It does not name the placed files or settings items it took
+   out, so do not say it removed them, and do not say it removed the options:
+   say that the files and items the earlier `doctor` marked unchanged or in
+   place are the ones it removes, and that the person can look in their rules
+   folder to confirm. The ledger's stored options stay until the plugin is
+   uninstalled. Every `kept for a manual check` line names a file the
    person has changed: tell them it was left, and that they can delete it
    themselves. If they ask you to delete the ledger database, show its full
    path first, say it holds all their ledger entries and cannot be recovered,
    and delete only that one file after a second, separate yes.
 4. Tell the person the two commands that finish the uninstall, to run in a
-   terminal and in this order:
+   terminal and in this order (the second one also removes `rails`, if they
+   installed it, and leaves the list showing none of the four):
 
    ```text
    claude plugin uninstall harness@harness-core --prune -y
