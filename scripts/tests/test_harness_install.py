@@ -133,7 +133,8 @@ def test_install_1_the_record_apply_leaves_equals_the_plan(tmp_path):
     for item in body["files"]:
         source = ROOT / "plugins" / "harness" / "files" / item["path"].rsplit("/", 1)[1]
         assert item["sha256"] == sha(source.read_bytes())
-    recorded = {"sandbox" if item["kind"] == "key" else f"deny:{item['value']}"
+    key_ids = {"sandbox": "sandbox", "promptSuggestionEnabled": "prompt-suggestions"}
+    recorded = {key_ids[item["name"]] if item["kind"] == "key" else f"deny:{item['value']}"
                 for item in body["settings"]["items"]}
     assert recorded == set(plan_option_ids(plan.out))
 
@@ -274,8 +275,9 @@ def test_install_3_approved_items_are_added_and_nothing_else_in_settings_changes
     assert done.rc == 0, done.err
     now = json.loads(at(home, SETTINGS).read_text(encoding="utf-8"))
     seeded = SEEDED_SETTINGS
-    assert set(now) == set(seeded) | {"sandbox"}
+    assert set(now) == set(seeded) | {"sandbox", "promptSuggestionEnabled"}
     assert now["sandbox"] == {"enabled": True}
+    assert now["promptSuggestionEnabled"] is False
     assert now["model"] == seeded["model"]
     assert now["additionalDirectories"] == seeded["additionalDirectories"]
     assert now["permissions"]["allow"] == seeded["permissions"]["allow"]
@@ -450,6 +452,16 @@ def test_the_skill_names_every_verb_and_never_approves_everything_at_once():
     assert "start a new session" in text.lower()
 
 
+def test_the_skill_says_what_the_prompt_suggestions_item_is_for():
+    step = " ".join(skill_step(SKILL.read_text(encoding="utf-8"), 3).split())
+    item = step[step.index("`prompt-suggestions`"):]
+    assert "suggested reply already typed into the prompt box" in item
+    assert "pressing Enter sends it" in item
+    assert "`promptSuggestionEnabled` set to `false`" in item
+    assert "No leaves Claude Code's suggestions as they are" in item
+    assert "uninstall takes it out again" in item
+
+
 def test_the_readme_names_every_optional_setting_the_plan_proposes():
     text = README.read_text(encoding="utf-8")
     for rule in setup.DENY_RULES:
@@ -457,6 +469,18 @@ def test_the_readme_names_every_optional_setting_the_plan_proposes():
     assert '`{"enabled": true}`' in text
     for key in ("ledger_db", "ledger_operator", "ledger_harness"):
         assert f"`{key}`" in text, key
+
+
+def test_the_readme_names_the_prompt_suggestions_setting_and_how_it_is_applied_and_removed():
+    text = one_line(README.read_text(encoding="utf-8"))
+    assert "(`promptSuggestionEnabled` set to `false`)" in text
+    bullet = text[text.index("**Prompt suggestions off.**"):]
+    bullet = bullet.split("Claude Code 2.1.326 makes auto mode")[0]
+    assert "Yes sets `promptSuggestionEnabled` to `false`" in bullet
+    assert "No leaves the suggestions as they are" in bullet
+    assert "applied only on your yes" in bullet
+    assert "only when you have not set that key yourself" in bullet
+    assert "uninstall takes it out again" in bullet
 
 
 SKILL_COMMAND = 'python3 "${CLAUDE_SKILL_DIR}/../../setup.py"'

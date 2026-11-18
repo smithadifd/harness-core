@@ -126,6 +126,16 @@ SANDBOX_VALUE: dict[str, Any] = {"enabled": True}
 # any other value (an extra key, a nested setting, `1` for `true`) refuses.
 SAFE_SANDBOX = '{"enabled":true}'
 
+# The prompt-suggestions proposal: Claude Code's user setting
+# `promptSuggestionEnabled`, which its own settings schema describes as "When
+# false, prompt suggestions are disabled. When absent or true, prompt
+# suggestions are enabled." Setup proposes only `false`, and only adds the key
+# when it is absent: a value the person already set is never changed.
+PROMPT_SUGGESTION_ID = "prompt-suggestions"
+PROMPT_SUGGESTION_KEY = "promptSuggestionEnabled"
+PROMPT_SUGGESTION_VALUE = False
+SAFE_PROMPT_SUGGESTION = "false"
+
 GRANTING_KEYS = frozenset({
     "allow",
     "additionalDirectories",
@@ -283,6 +293,8 @@ def optional_items() -> list[tuple[str, str]]:
     items = [("sandbox", json.dumps({"sandbox": dict(SANDBOX_VALUE)}, indent=2))]
     for rule in DENY_RULES:
         items.append((f"deny:{rule}", rule))
+    items.append((PROMPT_SUGGESTION_ID,
+                  json.dumps({PROMPT_SUGGESTION_KEY: PROMPT_SUGGESTION_VALUE}, indent=2)))
     return items
 
 
@@ -302,6 +314,9 @@ def granting_proposals() -> list[str]:
     for rule in DENY_RULES:
         if proposal_is_granting("deny", "deny", rule):
             found.append(f"deny:{rule}")
+    if (canonical(PROMPT_SUGGESTION_VALUE) != SAFE_PROMPT_SUGGESTION
+            or proposal_is_granting("key", PROMPT_SUGGESTION_KEY, PROMPT_SUGGESTION_VALUE)):
+        found.append(PROMPT_SUGGESTION_ID)
     return found
 
 
@@ -740,7 +755,9 @@ def valid_item(item: Any) -> bool:
         return False
     if item.get("kind") == "key":
         return (set(item) == {"kind", "name", "value", "index", "before", "after"}
-                and item["name"] == "sandbox" and same(item["value"], SANDBOX_VALUE))
+                and ((item["name"] == "sandbox" and same(item["value"], SANDBOX_VALUE))
+                     or (item["name"] == PROMPT_SUGGESTION_KEY
+                         and same(item["value"], PROMPT_SUGGESTION_VALUE))))
     if item.get("kind") == "deny":
         return (set(item) == {"kind", "value", "index", "before", "after"}
                 and any(same(item["value"], rule) for rule in DENY_RULES))
@@ -860,6 +877,10 @@ def wrong_type(settings: dict[str, Any], ids: set[str]) -> str | None:
     overwritten, and apply refuses before its first write."""
     if "sandbox" in ids and "sandbox" in settings and not isinstance(settings["sandbox"], dict):
         return f"sandbox is {json_type(settings['sandbox'])}, not an object"
+    if (PROMPT_SUGGESTION_ID in ids and PROMPT_SUGGESTION_KEY in settings
+            and not isinstance(settings[PROMPT_SUGGESTION_KEY], bool)):
+        return (f"{PROMPT_SUGGESTION_KEY} is {json_type(settings[PROMPT_SUGGESTION_KEY])}, "
+                "not a boolean")
     if any(f"deny:{rule}" in ids for rule in DENY_RULES) and "permissions" in settings:
         permissions = settings["permissions"]
         if not isinstance(permissions, dict):
@@ -889,6 +910,9 @@ def add_items(settings: dict[str, Any],
     added_sandbox = "sandbox" in ids and "sandbox" not in settings
     if added_sandbox:
         settings["sandbox"] = dict(SANDBOX_VALUE)
+    added_prompt = PROMPT_SUGGESTION_ID in ids and PROMPT_SUGGESTION_KEY not in settings
+    if added_prompt:
+        settings[PROMPT_SUGGESTION_KEY] = PROMPT_SUGGESTION_VALUE
     created_permissions = created_deny = False
     added: list[int] = []
     for rule in DENY_RULES:
@@ -912,6 +936,13 @@ def add_items(settings: dict[str, Any],
         index = keys.index("sandbox")
         before, after = neighbours(keys, index)
         items.append({"kind": "key", "name": "sandbox", "value": dict(SANDBOX_VALUE),
+                      "index": index, "before": before, "after": after})
+    if added_prompt:
+        keys = list(settings)
+        index = keys.index(PROMPT_SUGGESTION_KEY)
+        before, after = neighbours(keys, index)
+        items.append({"kind": "key", "name": PROMPT_SUGGESTION_KEY,
+                      "value": PROMPT_SUGGESTION_VALUE,
                       "index": index, "before": before, "after": after})
     for index in added:
         deny = settings["permissions"]["deny"]
