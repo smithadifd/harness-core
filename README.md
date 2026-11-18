@@ -1,16 +1,177 @@
 # Harness core
 
-Running Claude Code on many projects gets repetitive. Every project needs the
-same rules for security, review and deploys. Every session has to find its
-configuration and work out where things stand. Done by hand, that upkeep grows
-until it is the job.
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-This repository is the part of one person's harness that handles it. That
-harness grew over months of daily use. The core is the piece carved out of it so
-that other people can, in time, install a default tier into their own Claude
-Code setup in a safe and controlled way. The install path is described under
-"Install the default tier" below. The repository also holds the shared files,
-kept separate from everything that belongs to one person.
+One install that gives every Claude Code session on your machine the same
+working agreements, a record of the work that outlives the session, and guards
+on the commands you cannot take back.
+
+**New here?** [Why](#why) says what it is for. [How it fits
+together](#how-it-fits-together) shows the pieces on one diagram. [Install the
+default tier](#install-the-default-tier-alpha) is a few commands and one setup
+skill. This is an alpha, so read [Status](#status-alpha) before you install.
+
+## Why
+
+A coding agent starts each session knowing nothing about how you work. It does
+not know that a change is read by someone who did not write it before it
+merges, that a test counts only once it has been seen to fail, or that a push
+to main waits for you. It does not know what was decided yesterday, or where
+the last session stopped. So you tell it: in one project's instructions file,
+in a prompt, in the next project's instructions file, and again when a long
+session has forgotten.
+
+On one project that is a chore. Across many, the upkeep grows until it is the
+job. The rules drift apart from project to project. The state of the work
+lives in notes that one session wrote and the next one has to trust. And an
+instructions file can ask but cannot stop: an agent that was told never to
+delete outside the project can still run the `rm`.
+
+A harness is the layer around the agent that carries all of this, so that
+neither you nor the session has to: the rules every session reads, the record
+every session writes to, and the checks that run whether or not the agent
+remembers the rules. This repository is the default tier of one such harness.
+It grew over months of daily use on one person's machines, and it is the part
+of that setup that is not about that person, packaged so that someone else can
+install it and take it out again.
+
+What that looks like in practice:
+
+- **The same agreements in every session.** Setup places one rules file that
+  every session and general-purpose subagent reads. It says that a change is
+  reviewed by something that did not write it, that evidence is a command
+  someone else can rerun, and that a person merges. Your own rules go in a
+  second file beside it, and setup never overwrites a file you already have.
+- **Work that survives the session.** The `ticket` skill writes each piece of
+  work to the ledger, a local database of items and decisions, and stops
+  twice for your go: once on the plan, and once before anything leaves your
+  machine. End the session part way through, say "Resume the ticket" with its
+  id in a new one, and the work carries on from where it stopped. If the
+  earlier session crashed, the skill first asks you to confirm it is gone.
+- **Guards that do not rely on the agent remembering.** With the `rails`
+  plugin, an `rm` that reaches outside the current worktree is denied, and a
+  push to main or a force-push asks first, or is denied if you set it so. In
+  Claude Code's auto mode an ask is not yet a sure stop, so set deny where you
+  need one. A guard never allows a command on its own, and each guard's
+  default hook blocks the command when it cannot run.
+- **An install you can read first and take back out.** Setup shows every file
+  and every setting it will write before it writes one, and proposes nothing
+  that grants a permission. Uninstall removes what setup placed, keeps and
+  names any file you have changed since, and leaves your ledger database,
+  because that is your data.
+- **One tag, one tested set.** The two plugins that come from other
+  repositories are each fixed to a full commit id, and the two in this
+  repository by the tag you install from. Nothing follows a branch, and
+  nothing updates by itself.
+
+The purpose and the thirteen principles the rules come from are written down
+in [harness-definition.md](skills/_lib/standards/harness-definition.md).
+
+## What this is
+
+A Claude Code plugin marketplace with four plugins, and the shared files they
+are built on.
+
+| Plugin | What it gives you | Where it comes from |
+|---|---|---|
+| `harness` | The one you install. It carries the setup skill, which also checks and uninstalls, the rules default and a starter for your own overrides. | this repository |
+| `sdlc` | The skills and agents, including `ticket`. Installing `harness` brings it. | the public [skills](https://github.com/smithadifd/skills) repository, at a pinned commit |
+| `ledger-hooks` | The ledger's hooks, which print where work stands when a session starts, and the `ledger` command. Installing `harness` brings it. | the public [ledger](https://github.com/smithadifd/ledger) repository, at a pinned commit |
+| `rails` | Two guard hooks that run on every shell command. At this tag you install it on its own. | this repository |
+
+The shared files are the written standards agents work to, small Python
+modules that find the harness and read its configuration, a local index for
+recalling past sessions, and a copy of the ledger. Other repositories take
+them by copying them at a pinned tag, which [For repositories that vendor the
+core](#for-repositories-that-vendor-the-core) describes. Someone who only
+installs the plugins never needs that part.
+
+The difference is in how it is built. Every change here passed two independent
+model reviews and tests that fail without it. What this page says about the
+files setup writes, what uninstall leaves behind and which versions an install
+shows is checked by tests against the code, so the page cannot drift from the
+behaviour unnoticed. A CI check fails the build when any file names a person,
+a machine or a home folder. What the guards do not catch is written down, one
+line per limit, in [KNOWN-LIMITS.md](KNOWN-LIMITS.md).
+
+## How it fits together
+
+The pieces, and what stays yours:
+
+```mermaid
+flowchart TB
+    subgraph yours["Yours: never in this repository"]
+        direction LR
+        O["Your override file<br>your own rules, accounts and grants"]
+        D[("Your ledger database<br>your items and decisions")]
+    end
+    subgraph tier["The default tier: one tag of this repository"]
+        direction LR
+        H["harness<br>setup skill, rules default"]
+        S["sdlc<br>skills and agents"]
+        L["ledger-hooks<br>session brief, ledger command"]
+        R["rails<br>guard hooks"]
+        H -. brings .-> S
+        H -. brings .-> L
+    end
+    C["Claude Code"]
+    yours -->|laid over| tier
+    tier -->|installed into| C
+```
+
+One piece of work, from the first session to the next:
+
+```mermaid
+flowchart LR
+    A["Session starts<br>rules are read<br>ledger says where work stands"]
+    B["ticket<br>plans the work"]
+    G1{"Your go"}
+    C["Build, then a review<br>by a fresh reviewer"]
+    G2{"Your go"}
+    E["Push or<br>pull request"]
+    L[("ledger")]
+    A --> B --> G1 --> C --> G2 --> E
+    B -.-> L
+    C -.-> L
+    E -.-> L
+    L -.->|a later session resumes| A
+```
+
+With `rails` installed, both guards check every shell command along the way.
+
+Two sibling repositories are published separately, and both are public:
+
+- **[ledger](https://github.com/smithadifd/ledger)** is the item ledger, a
+  tracker and decision log for agents. It works on its own, and a copy of it
+  lives inside this repository (see "The ledger inside" below).
+- **[skills](https://github.com/smithadifd/skills)** holds the skills and
+  agents, each usable on its own. This repository holds none of them: its
+  `skills/` folder has only shared library files and standards.
+
+This repository is what ties them into one install.
+
+## Who it is for
+
+Someone who uses Claude Code on more than one project, sets their own rules,
+and wants the habits of review, evidence and a human merge to hold without
+restating them in every project. At this stage you should be comfortable
+reading shell and Python, because the code is the last word on what it does.
+
+## What it is not
+
+- **Not a way to run many agents at once.** The harness this came from also has
+  a delegation loop, which plans sprints and runs many agents in parallel. It
+  is a heavier setup that sits on top of the core, and it is not what someone
+  else installs. A few standards here mention it, but its machinery is not in
+  this repository.
+- **Not one person's setup.** Nothing here may name a person, a machine or a
+  home folder, and a CI check fails the build if it does. Each person's own
+  accounts and settings go in an override layer on top of the core, which this
+  repository does not hold.
+- **Not a sandbox.** The guards catch a destructive command written by
+  mistake. They do not see one that is hidden on purpose, and
+  [KNOWN-LIMITS.md](KNOWN-LIMITS.md) lists what they miss. Confinement is
+  Claude Code's own sandbox, which setup offers to switch on.
 
 ## Status: alpha
 
@@ -21,82 +182,6 @@ This is the working core of my own agent harness, published as it is.
 - **Not done:** docs, onboarding, and any promise of stability. Interfaces
   change between tags without notice.
 - **If you use it:** pin a tag and expect to read the code. There is no support.
-
-## What it is
-
-The harness core is the shared, person-neutral part of an AI coding-agent
-harness: the written standards agents work to, the small Python modules that
-find the harness and read its configuration, a session recall index, and an
-append-only item ledger, together with the tests that exercise them.
-
-## What it is not
-
-- **Not the delegation loop.** The loop plans sprints and runs many agents at
-  once. It is a heavier setup that sits on top of the core, and it is not what
-  someone else installs. A few standards here mention it, but its machinery is
-  not in this repository.
-- **Not one person's setup.** Nothing here may name a person, a machine or a
-  home folder, and a CI check fails the build if it does. Each person's own
-  accounts and settings go in an override layer on top of the core, which this
-  repository does not hold.
-
-## Where it sits
-
-Two sibling repositories are published separately, and both are public:
-
-- **ledger** is the item ledger, a tracker and decision log for agents. A copy
-  of it lives inside this repository (see "The ledger inside" below).
-- **skills** holds the skills themselves. This repository does not: its
-  `skills/` folder holds only shared library files and standards.
-
-## What is in it
-
-| Path | What it is |
-|---|---|
-| `skills/_lib/standards/` | the standards: security, trust ladder, CI, deploy, prompting and the rest |
-| `skills/_lib/*.py`, `skills/_lib/*.json`, `skills/_lib/*.tsv` | modules that resolve the harness root, configuration paths, overrides and model pool settings |
-| `skills/_lib/recall/` | a local full-text index over agent session transcripts, with a guard that refuses private folders |
-| `skills/_lib/ledger/` | the item ledger, itself vendored from the public ledger repository (see below) |
-| `.claude-plugin/marketplace.json`, `plugins/harness/` | the plugin marketplace and the `harness` plugin, including its setup skill and the script behind it (see "Install the default tier") |
-| `plugins/rails/` | the `rails` plugin: the destructive-command guard and git guard hooks and their tests (see "The rails plugin") |
-| `scripts/`, `install-profiles/` | two maintenance scripts and an install profile |
-| `skills/_lib/tests/`, `skills/_lib/recall/tests/`, `scripts/tests/` | the tests of the vendored modules |
-
-## How it is used: vendored, byte for byte
-
-The vendored files are not installed on their own. A consuming repository
-vendors these files: it copies each one, byte for byte and at the same relative path, from a
-tagged commit of this repository, and never edits them. `.core-manifest` at
-the root is the list of what is vendored: first the folders this repository
-owns entirely in every consumer (`tree <folder>/` lines), then every vendored
-path, one per line, sorted.
-
-The consumer records the tag, the commit and one git blob id per vendored file
-in a pin file, and runs a drift check in its CI. The check fails when a
-vendored file differs from the pin (one edited byte, a missing, extra,
-re-moded, symlinked or shadowed file), and, against a checkout of this
-repository, when the pin differs from `.core-manifest` and the tree at the
-pinned commit, or when the commit is not the pinned tag on this repository's
-main branch. A change therefore lands here first, is tagged, and reaches each
-consumer as one pull request that moves its pin and re-copies the files.
-
-## What is checked where
-
-- Here: the vendored modules' tests run stand-alone, in a tree that holds only
-  the vendored files, so a test that reaches outside the vendored set fails.
-- In the consumer: closure, the rule that no vendored module reaches a file
-  outside the vendored set, is checked by the consumer's layer check at every
-  pin move, until this repository grows its own closure check (a planned
-  follow-up).
-
-## The ledger inside
-
-`skills/_lib/ledger/` is vendored here from the public ledger repository in
-the same way: `ledger-vendor.pin` pins its tag, commit and blob ids,
-`scripts/check-ledger-vendor.py` is its drift check, and
-`scripts/ledger-vendor-bump.py` moves it. A ledger fix reaches a consumer of
-this repository in two steps: a pin move here, then a pin move in the
-consumer.
 
 ## Install the default tier (alpha)
 
@@ -648,6 +733,60 @@ it. The code names the gate
 or the fault (`push_main_branch`, `push_force`, `push_beside_substitution`,
 `commit_nonconventional`, `option_invalid_force_push`,
 `dependency_missing_git`, and so on); the hint never carries the command.
+
+## For repositories that vendor the core
+
+This part is for someone who maintains a repository that copies the shared
+files. If you only installed the plugins, you can skip it.
+
+### What is in the repository
+
+| Path | What it is |
+|---|---|
+| `skills/_lib/standards/` | the standards: security, trust ladder, CI, deploy, prompting and the rest |
+| `skills/_lib/*.py`, `skills/_lib/*.json`, `skills/_lib/*.tsv` | modules that resolve the harness root, configuration paths, overrides and model pool settings |
+| `skills/_lib/recall/` | a local full-text index over agent session transcripts, with a guard that refuses private folders |
+| `skills/_lib/ledger/` | the item ledger, itself vendored from the public ledger repository (see below) |
+| `.claude-plugin/marketplace.json`, `plugins/harness/` | the plugin marketplace and the `harness` plugin, including its setup skill and the script behind it (see "Install the default tier") |
+| `plugins/rails/` | the `rails` plugin: the destructive-command guard and git guard hooks and their tests (see "The rails plugin") |
+| `scripts/`, `install-profiles/` | two maintenance scripts and an install profile |
+| `skills/_lib/tests/`, `skills/_lib/recall/tests/`, `scripts/tests/` | the tests of the vendored modules |
+
+### Vendored, byte for byte
+
+The vendored files are not installed on their own. A consuming repository
+vendors these files: it copies each one, byte for byte and at the same relative path, from a
+tagged commit of this repository, and never edits them. `.core-manifest` at
+the root is the list of what is vendored: first the folders this repository
+owns entirely in every consumer (`tree <folder>/` lines), then every vendored
+path, one per line, sorted.
+
+The consumer records the tag, the commit and one git blob id per vendored file
+in a pin file, and runs a drift check in its CI. The check fails when a
+vendored file differs from the pin (one edited byte, a missing, extra,
+re-moded, symlinked or shadowed file), and, against a checkout of this
+repository, when the pin differs from `.core-manifest` and the tree at the
+pinned commit, or when the commit is not the pinned tag on this repository's
+main branch. A change therefore lands here first, is tagged, and reaches each
+consumer as one pull request that moves its pin and re-copies the files.
+
+### What is checked where
+
+- Here: the vendored modules' tests run stand-alone, in a tree that holds only
+  the vendored files, so a test that reaches outside the vendored set fails.
+- In the consumer: closure, the rule that no vendored module reaches a file
+  outside the vendored set, is checked by the consumer's layer check at every
+  pin move, until this repository grows its own closure check (a planned
+  follow-up).
+
+### The ledger inside
+
+`skills/_lib/ledger/` is vendored here from the public ledger repository in
+the same way: `ledger-vendor.pin` pins its tag, commit and blob ids,
+`scripts/check-ledger-vendor.py` is its drift check, and
+`scripts/ledger-vendor-bump.py` moves it. A ledger fix reaches a consumer of
+this repository in two steps: a pin move here, then a pin move in the
+consumer.
 
 ## The default-tier load probe
 
