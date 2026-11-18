@@ -112,9 +112,19 @@ At this tag it lists four plugins:
 - `ledger-hooks`, the ledger's hooks, from the public ledger repository.
 - `rails`, a folder in this repository (`plugins/rails/`): the guard hooks.
   `harness` does not depend on it yet, so installing `harness` does not bring
-  it; install it on its own with `claude plugin install rails@harness-core`.
-  The git guard asks before a push to main or a force-push as soon as it is
-  installed; you need not set its options. See "The rails plugin" below.
+  it; install it on its own, and store its three options at their defaults:
+
+  ```text
+  claude plugin install rails@harness-core
+  printf '{"push_to_main":"ask","force_push":"ask","commit_style":"off"}' | claude plugin configure rails@harness-core --values-stdin
+  ```
+
+  A bare install, with no options stored, still guards: the git guard asks
+  before a push to main or a force-push as soon as it is installed. But until
+  all three options are stored, an interactive session shows a non-blocking
+  "Plugin option push_to_main isn't set" hook error on Bash calls, so store
+  them as above. Start a new session, or run `/reload-plugins`, to load it.
+  See "The rails plugin" below.
 
 `sdlc` and `ledger-hooks` are each fixed to one full commit id on a release
 tag, and `harness` and `rails` are fixed by the tag of this repository you add
@@ -131,8 +141,11 @@ plugin's release tag names now, and fails when it is not the pinned commit
 makes the first ledger write through the ledger plugin's `ledger` command. The
 ledger plugin pinned here (`v0.4.0`) declares those three options
 (`ledger_db`, `ledger_operator` and `ledger_harness`) and ships the `ledger`
-command, so `/harness:setup` gets past its ledger options step. Install,
-update and uninstall work as written below.
+command, so `/harness:setup` gets past its ledger options step. The skills
+plugin pinned here is `sdlc` at `v1.5.0` (commit
+`5abfc37a5cac57f454ab3fbae7bd407b3f7f7b33`); it carries the `ticket` skill
+that "First use" below names. Install, update and uninstall work as written
+below.
 
 You need Claude Code, `git`, network access to GitHub, and Python 3.11 or later
 for the ledger's command. The repository must be public or shared with your
@@ -145,14 +158,16 @@ clone is served from it, so the clone can never move.
 ### Install
 
 ```text
-claude plugin marketplace add https://github.com/<owner>/harness-core.git#vX.Y.Z
+claude plugin marketplace add https://github.com/smithadifd/harness-core.git#vX.Y.Z
 claude plugin install harness@harness-core
 claude plugin list
 ```
 
 `vX.Y.Z` is a release tag of this repository. The list shows `harness`, `sdlc`
 and `ledger-hooks` enabled. Start a new session, or run `/reload-plugins` in an
-open one, to load them.
+open one, to load them. On its first run in a folder, Claude Code asks whether
+you trust it, and the highlighted answer is "No, exit": move to "Yes" before
+you press Enter.
 
 Claude Code, not this repository, writes the install's records: the
 marketplace's declaration and one `enabledPlugins` entry per plugin in your user
@@ -167,17 +182,21 @@ In a session, run:
 /harness:setup
 ```
 
-The skill asks for the operator name the ledger stamps on what you write, then
-prints a plan: every file it will create, the three ledger options, the command
-that makes the first ledger write, and each optional settings change as the
-exact text to be added. Nothing is written until you answer. You give one yes
-for the files, the ledger options and the first ledger write together, then
-one yes or no for each optional settings change on its own. Saying no to every
+The skill asks you to type the operator name the ledger stamps on what you
+write, as a plain question in the chat: type the name as your next message
+(a picker's "Type something" choice can dismiss the question in Claude Code
+2.1.326). It then prints a plan in its own reply, where you can read it
+without expanding anything: every file it will create, the three ledger
+options, the command that makes the first ledger write, and each optional
+settings change as the exact text to be added. Nothing is written until you
+answer. You give one yes for the files, the ledger options and the first ledger
+write together, then one yes or no for each optional settings change on its
+own. Saying no to every
 optional change leaves a complete setup. Setup then applies the plan, makes the
-first ledger write, checks the result (the placed files, the stored options and
-the database file) and ends by telling you to start a new session: the ledger's
-options reach a session's commands, and the rules default is read, only when a
-session starts.
+first ledger write, checks the result (it runs the doctor itself, so you need
+not run `doctor` again straight after) and ends by telling you to start a new
+session: the ledger's options reach a session's commands, and the rules default
+is read, only when a session starts.
 
 If a file is already at the rules default's path, setup stops and writes
 nothing; it never overwrites or merges. If you already have an override file
@@ -213,6 +232,12 @@ or reordered, and each addition is recorded so uninstall can take out exactly
 it. Setup never proposes anything that grants: no allow rule, no extra
 directory, no automatic permission for sandboxed commands.
 
+Claude Code 2.1.326 makes auto mode the default permission mode for new
+accounts. In auto mode a command that you expect to prompt can simply run, so
+where this README says a command asks or prompts, it means the manual
+permission mode: press shift+tab in a session to cycle to it, and the prompts
+appear.
+
 The built-in Explore and Plan agents do not read the rules folder, so the rules
 default does not reach them. They are read-only, and the guard hooks will apply
 inside them when `rails` arrives.
@@ -228,6 +253,39 @@ since setup, or missing), the settings items setup added, the stored ledger
 options, whether the ledger database file exists, and whether Python 3.11 or
 later and the `ledger` command are found. A line starting `FAIL` is a problem;
 `note` is information.
+
+### First use
+
+The ledger is where your work's state lives, and the `ticket` skill (from the
+`sdlc` plugin) is how you put work into it.
+
+- **File an item and work it.** Ask in plain words in a session, for example:
+  "file one small item to add a README line, and work it with the ticket
+  skill". The skill writes the item to the ledger, prints a plan, and stops
+  twice for your go: once on the plan, and once before anything leaves your
+  machine (a push or a pull request). It prints the item's id; keep it.
+- **Stop and resume.** You can leave a ticket in a session and pick it up in
+  another. In the new session say "Resume the ticket <id>". If the first
+  session was ended with `/exit` while work was running, the ticket still
+  looks live: the skill asks you to confirm the old session is gone and to
+  choose release and resume. Answer that and it carries on from where it
+  stopped. The ledger's `resume` subcommand (below) prints where work stopped
+  and the command that continues it.
+- **The `ledger` command.** It is on the PATH of a Claude Code session, not of
+  your own shell: in a terminal, `ledger` is "command not found". Run it
+  through a session (ask for the command by name), and the session already
+  holds your stored database path and operator. The subcommands a person
+  needs:
+
+  | Command | What it shows |
+  |---|---|
+  | `ledger resume` | where each open item stopped, and the command that continues it |
+  | `ledger decisions` | the decision records, with their current standing |
+  | `ledger events --item <id>` | every event of one item, newest first, including those `export-item` hides |
+  | `ledger export-item <id>` | one item's events; ephemeral ones decay after the item closes, so this can show fewer than `events` |
+  | `ledger search <words>` | full-text search over items, decisions, standards and ADRs |
+
+  `ledger --help` lists the rest.
 
 ### Make an instance folder (optional)
 
@@ -280,19 +338,19 @@ Confirmed on Claude Code 2.1.325:
   marketplace's recorded entry.
 
 So the only way to move is to remove the marketplace, add it again at the newer
-tag and install `harness` again. This sequence was confirmed, and it brings all
-three plugins back:
+tag and install `harness` again. This sequence was confirmed, and it brings the
+three plugins back (`rails` too only when you install it again as above):
 
 ```text
 claude plugin marketplace remove harness-core
-claude plugin marketplace add https://github.com/<owner>/harness-core.git#vX.Y.Z
+claude plugin marketplace add https://github.com/smithadifd/harness-core.git#vX.Y.Z
 claude plugin install harness@harness-core
 ```
 
 Removing a marketplace uninstalls every plugin installed from it (`harness`,
-`sdlc` and `ledger-hooks`). The command says it also deletes their saved
-options, secrets and data where it can, so check any option you had set
-afterwards. Whether an option survives the remove was not tested: the ledger
+`sdlc`, `ledger-hooks` and `rails`, when you installed it). The command says it
+also deletes their saved options, secrets and data where it can, so check any
+option you had set afterwards. Whether an option survives the remove was not tested: the ledger
 hooks declare no option at this tag. `claude plugin configure` takes the full
 plugin id, for example `ledger-hooks@harness-core`. Start a new session, or run
 `/reload-plugins`, to load the new set.
@@ -306,8 +364,11 @@ Three steps, in this order:
    files if they are unchanged since setup, and each settings change it added
    that is still where it put it. A file you have edited, and a settings item
    you have moved or changed, is kept and named. The ledger database is kept,
-   and its path is shown, because it is your data. No hook runs at uninstall,
-   which is why this comes first.
+   and its path is shown, because it is your data. The command's own output
+   names only what it kept, what was already gone, the ledger database and the
+   setup record it removed; it does not list the placed files and settings
+   items it took out one by one. No hook runs at uninstall, which is why this
+   comes first.
 2. In a terminal, uninstall the plugin and the dependencies its install pulled
    in: `claude plugin uninstall harness@harness-core --prune -y`. The `-y` is
    needed when the command is not run from an interactive terminal. Without
@@ -317,7 +378,8 @@ Three steps, in this order:
    `harness` is kept by `--prune`.
 3. Remove the marketplace: `claude plugin marketplace remove harness-core`.
    This uninstalls every plugin installed from the marketplace, the
-   dependencies included, and also a plugin you installed on its own.
+   dependencies included, and also a plugin you installed on its own
+   (`rails`, if you installed it).
 
 ```text
 /harness:setup uninstall
@@ -326,8 +388,8 @@ claude plugin marketplace remove harness-core
 claude plugin list
 ```
 
-The list then shows none of the three. Steps 2 and 3 were confirmed on Claude
-Code 2.1.325.
+The list then shows none of the four (`harness`, `sdlc`, `ledger-hooks` and
+`rails`). Steps 2 and 3 were confirmed on Claude Code 2.1.325.
 
 #### What is left after uninstall
 
@@ -339,6 +401,8 @@ this, and nothing else:
 |---|---|
 | `.claude/harness-setup.lock` | the empty lock file, which setup never deletes |
 | `.local/share/ledger/ledger.db` | the ledger database: your data, kept unless you ask for it to be deleted |
+| `.local/share/ledger/search.db` | the ledger's search index, made beside the database; it can be rebuilt, so it is yours to delete |
+| `.local/share/ledger/ledger.db.session-models` | a folder the ledger makes beside the database, of per-session records; it goes with the database if you delete that |
 | `.local` | made to hold the database, if it did not exist before |
 | `.local/share` | the same |
 | `.local/share/ledger` | the same |
@@ -458,12 +522,15 @@ to do. It never carries the command or a path from it. Known limits are in
   Configuration that can define a git alias or re-point a push
   (`git -c alias.…`, `--config-env`, `GIT_CONFIG_*`) asks even with no push
   word.
-- **Options.** Three, and setting them is optional: `push_to_main` and
-  `force_push` take `ask` (the default, and the floor) or `deny`, and
-  `commit_style` takes `off` (the default), `ask` or `deny`. Set them in
-  `/config` or with `claude plugin configure rails@harness-core`. Until all
-  three are stored, Claude Code does not run the hook that reads them, and the
-  defaults apply. A push the guard cannot read takes the stricter of
+- **Options.** Three. A bare install works with the defaults, but store all
+  three: `push_to_main` and `force_push` take `ask` (the default, and the
+  floor) or `deny`, and `commit_style` takes `off` (the default), `ask` or
+  `deny`. Set them with the command under "Install the default tier" above, in
+  `/config`, or with `claude plugin configure rails@harness-core`. Until all
+  three are stored, Claude Code does not run the hook that reads them, the
+  defaults apply, and an interactive session shows a non-blocking "Plugin
+  option push_to_main isn't set" hook error on Bash calls. A push the guard
+  cannot read takes the stricter of
   the first two. With `commit_style` on, the first `-m` message of a top-level
   `git commit` must start with a conventional prefix (`feat:`, `fix:`, `docs:`,
   `refactor:`, `chore:`, `test:`, `ci:`, `build:`, `perf:`, `style:` or
@@ -477,6 +544,9 @@ to do. It never carries the command or a path from it. Known limits are in
   environment variable, and so no project setting, changes either. A stored
   value other than `ask`, `deny` or `off` denies when its check fires, and
   the reason names the option.
+- **Auto mode.** In Claude Code's default auto mode, a guard ask left
+  unanswered for about 13 to 14 seconds lets the command run, so an ask is not
+  a hard stop there, and a deny is.
 - **Never allows.** It asks, denies or stays silent, and Claude Code's own
   permission flow decides the rest.
 - **It fails closed.** As the destructive guard: a missing program, an

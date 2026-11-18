@@ -43,6 +43,11 @@ DB_FOLDERS = {".local", ".local/share", ".local/share/ledger"}
 # hold it are the person's data.
 OURS = {LOCK, DB} | DB_FOLDERS
 
+# What the real ledger leaves beside its database, which the stub the fixtures
+# use does not make: the README's leftovers table names them too.
+LEDGER_LEFTOVERS = {".local/share/ledger/search.db",
+                    ".local/share/ledger/ledger.db.session-models"}
+
 SKILL_CONFIG = ".claude/skill-config/ticket.json"
 OWN_RULES = ".claude/rules/mine.md"
 
@@ -388,6 +393,18 @@ def table_paths(lines):
             if (match := re.match(r"\| `([^`]+)` \|", line))}
 
 
+def marketplace_manifest():
+    return json.loads((ROOT / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8"))
+
+
+def marketplace_owner():
+    entry = next(e for e in marketplace_manifest()["plugins"] if e["name"] == "sdlc")
+    return re.fullmatch(r"https://github\.com/([^/]+)/skills\.git", entry["source"]["url"]).group(1)
+
+
+OWN_URL = f"https://github.com/{marketplace_owner()}/harness-core.git"
+
+
 def test_the_readme_lists_the_files_the_plan_lists(tmp_path):
     home, bin_dir = fixture(tmp_path, settings=None)
     plan = do("plan", home, bin_dir)
@@ -397,13 +414,13 @@ def test_the_readme_lists_the_files_the_plan_lists(tmp_path):
 
 def test_the_readme_lists_what_uninstall_leaves_as_the_test_does():
     text = README.read_text(encoding="utf-8")
-    assert table_paths(section(text, "#### What is left after uninstall")) == OURS
+    assert table_paths(section(text, "#### What is left after uninstall")) == OURS | LEDGER_LEFTOVERS
 
 
 def test_the_readme_carries_the_install_and_the_three_uninstall_steps():
     text = README.read_text(encoding="utf-8")
     for command in (
-            "claude plugin marketplace add https://github.com/<owner>/harness-core.git#vX.Y.Z",
+            f"claude plugin marketplace add {OWN_URL}#vX.Y.Z",
             "claude plugin install harness@harness-core",
             "/harness:setup",
             "/harness:setup doctor",
@@ -480,3 +497,140 @@ def test_the_documented_apply_command_runs_through_bash_with_a_deny_id(tmp_path)
     stored = json.loads(at(home, SETTINGS).read_text(encoding="utf-8"))
     assert stored["permissions"]["deny"] == ["Read(.env)"]
     assert stored["sandbox"]["enabled"] is True
+
+
+# ---------------------------------------------------------------------------
+# The walk's README and skill friction: each claim a newcomer meets is pinned.
+
+NUMBER_WORDS = {1: "one", 2: "two", 3: "three", 4: "four", 5: "five", 6: "six"}
+
+
+def skill_step(text, number):
+    """The text of one numbered step of the skill's Set up section."""
+    body = text.split("## Set up", 1)[1].split("## Instance folder", 1)[0]
+    pieces = re.split(r"^(\d+)\. \*\*", body, flags=re.MULTILINE)
+    steps = {int(pieces[i]): pieces[i + 1] for i in range(1, len(pieces) - 1, 2)}
+    return steps[number]
+
+
+def test_the_readme_install_commands_name_this_repository_not_a_placeholder():
+    text = README.read_text(encoding="utf-8")
+    assert "<owner>" not in text
+    adds = [line for line in text.splitlines() if line.startswith("claude plugin marketplace add ")]
+    assert adds == [f"claude plugin marketplace add {OWN_URL}#vX.Y.Z"] * 2
+
+
+def test_the_readme_names_the_sdlc_pin_the_marketplace_holds():
+    source = next(e for e in marketplace_manifest()["plugins"] if e["name"] == "sdlc")["source"]
+    text = README.read_text(encoding="utf-8")
+    status = text[text.index("**Status at this tag.**"):].split("\n\n", 3)
+    status = "\n\n".join(status[:2])
+    assert f"`{source['ref']}`" in status and source["sha"] in status
+
+
+def test_the_readme_count_of_what_uninstall_removes_is_the_marketplaces_plugin_count():
+    plugins = marketplace_manifest()["plugins"]
+    word = NUMBER_WORDS[len(plugins)]
+    text = README.read_text(encoding="utf-8")
+    assert f"none of the {word}" in text
+    for other in NUMBER_WORDS.values():
+        if other != word:
+            assert f"none of the {other}" not in text, other
+    steps = "\n".join(section(text, "### Uninstall"))
+    for plugin in plugins:
+        assert f"`{plugin['name']}`" in steps, plugin["name"]
+
+
+def test_the_readme_first_use_says_how_to_file_stop_resume_and_where_ledger_runs():
+    lines = "\n".join(section(README.read_text(encoding="utf-8"), "### First use"))
+    assert "`ticket` skill" in lines
+    assert "Resume the ticket" in lines
+    assert "not of\n  your own shell" in lines or "not of your own shell" in lines.replace("\n  ", " ")
+    for command in ("ledger resume", "ledger decisions", "ledger events --item",
+                    "ledger export-item", "ledger search"):
+        assert f"`{command}" in lines, command
+
+
+def test_the_readme_says_where_it_talks_about_grants_that_auto_mode_is_the_default():
+    text = README.read_text(encoding="utf-8")
+    grants = "\n".join(section(text, "#### What setup writes"))
+    assert "Setup never proposes anything that grants" in grants
+    assert "auto mode" in grants and "2.1.326" in grants and "shift+tab" in grants
+
+
+def test_the_readme_says_an_ask_is_not_a_hard_stop_in_auto_mode_and_a_deny_is():
+    text = README.read_text(encoding="utf-8")
+    guard = "\n".join(section(text, "### The git guard")).replace("\n  ", " ")
+    assert "13 to 14 seconds" in guard
+    assert "an ask is not a hard stop there, and a deny is" in guard
+    # The ticket that tracks the fix is cited in the pull request, not here.
+    assert "DT-RAILS-AUTOMODE-ASK1" not in text
+
+
+def rails_defaults():
+    manifest = json.loads((ROOT / "plugins" / "rails" / ".claude-plugin" / "plugin.json")
+                          .read_text(encoding="utf-8"))
+    return {key: spec["default"] for key, spec in manifest["userConfig"].items()}
+
+
+def test_the_readme_rails_install_stores_all_three_options_at_their_defaults():
+    text = README.read_text(encoding="utf-8")
+    commands = [line.strip() for line in text.splitlines()
+                if "claude plugin configure rails@harness-core --values-stdin" in line
+                and line.strip().startswith("printf ")]
+    assert len(commands) == 1
+    assert "| claude plugin configure rails@harness-core --values-stdin" in commands[0]
+    payload = shlex.split(commands[0])[1]
+    assert json.loads(payload) == rails_defaults()
+    assert "claude plugin install rails@harness-core" in text.splitlines()[
+        next(i for i, line in enumerate(text.splitlines()) if line.strip() == commands[0]) - 1]
+
+
+def test_the_readme_does_not_call_the_rails_options_optional_without_the_hook_error():
+    text = README.read_text(encoding="utf-8")
+    flat = text.replace("\n  ", " ").replace("\n", " ")
+    assert "setting them is optional" not in flat
+    assert "you need not set its options" not in flat
+    options = flat[flat.index("**Options.**"):].split("- **Never allows.**")[0]
+    assert "Plugin option push_to_main isn't set" in options
+    assert "non-blocking" in options
+    install = flat[flat.index("- `rails`, a folder"):flat.index("`sdlc` and `ledger-hooks` are each fixed")]
+    assert "Plugin option push_to_main isn't set" in install
+
+
+def test_known_limits_no_longer_carries_the_project_allow_hook_line():
+    text = (ROOT / "KNOWN-LIMITS.md").read_text(encoding="utf-8")
+    assert "a project's own PreToolUse hook that returns allow" not in text
+    assert "L5a" not in text
+
+
+def test_the_skill_asks_for_the_operator_by_typed_text_not_a_picker():
+    step = skill_step(SKILL.read_text(encoding="utf-8"), 1)
+    flat = " ".join(step.split())
+    assert "Type it as your next message" in flat
+    assert "Never ask for it with a picker" in flat
+
+
+def test_the_skill_shows_the_plan_in_its_own_reply_before_the_yes():
+    text = SKILL.read_text(encoding="utf-8")
+    plan = " ".join(skill_step(text, 2).split())
+    assert "Copy the whole output into your own reply" in plan
+    for part in ("`FILE`", "`LEDGER`", "`FIRST LEDGER WRITE`", "`OPTIONAL`"):
+        assert part in plan, part
+    assert "before you ask the yes" in plan
+    assert "already be in your own reply" in " ".join(skill_step(text, 3).split())
+    # The rule that holds in every mode: "show" means copy into the reply.
+    assert "copy the output into your own reply" in " ".join(text.split())
+
+
+def test_the_skill_claims_no_removal_the_remove_output_does_not_name(tmp_path):
+    text = " ".join(SKILL.read_text(encoding="utf-8").split())
+    assert "It does not name the placed files or settings items it took out, so do not say it removed them" in text
+    # What the script's remove output does name is what the skill lists.
+    home, bin_dir = fixture(tmp_path, settings=None)
+    set_up(home, bin_dir)
+    removed = do("remove", home, bin_dir)
+    assert removed.rc == 0, removed.err
+    names = {line.split(":", 1)[0] for line in removed.out.splitlines()}
+    assert names <= {"kept for a manual check", "already gone", "kept", "removed"}
+    assert RULES not in removed.out and OVERRIDE not in removed.out
