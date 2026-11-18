@@ -24,6 +24,7 @@ Working agreements for every Claude Code session on this machine and every agent
 - Pin the merge to the reviewed head (`gh pr merge --match-head-commit <sha>`), so a commit pushed after the review cannot land with it.
 - Ask before anything with live reach, and wait for the answer: deploys, live hooks and wrappers, scheduled jobs, secrets, settings files, and any edit that changes who may approve or merge. This holds even where merging is otherwise granted.
 - Never bypass a safety check (`--no-verify`, skipped hooks). Ask before a destructive operation: a force-push, a history rewrite, a hard reset, a dropped table.
+- A guard's deny is final. Never use or offer a way around it: a `!` command at the prompt, a sandbox override, or a settings, permission or allowlist change. Tell the person the guard denied it; running the command themselves is their own call.
 
 ## Delegated work
 

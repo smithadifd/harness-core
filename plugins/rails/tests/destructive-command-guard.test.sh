@@ -61,6 +61,7 @@ DENY_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z event=destructi
 HINT_UNSAFE_RM='an rm target is not a literal path strictly below the current worktree or the named session scratchpad; spell a worktree target relative to the current folder, because an absolute home path is refused by spelling'
 HINT_ENGINE_TIMEOUT='the guard did not finish within 8 seconds; retry the same command once and keep commands under about 4 KB'
 HINT_DEFAULT='see the reason code'
+NO_BYPASS='This deny is final: never use or offer a ! command at the prompt, a sandbox override, or a settings, permission or allowlist change to get around it; tell the person the guard denied it, and that running the command themselves is their own call.'
 
 FAILURES=0
 DENIALS=0
@@ -594,7 +595,7 @@ run_command "A2 adapter_no_opinion_is_silent" none "cat $WORKTREE/fixture.txt"
 expect_silent A2 adapter_no_opinion_is_silent
 run_command "A3 deny_names_unsafe_rm" deny "rm -rf $OUTSIDE/x"
 expect_reason A3 deny_names_unsafe_rm unsafe_rm
-expect_text A3 unsafe_rm "Destructive command guard denied the command (reason=unsafe_rm): $HINT_UNSAFE_RM."
+expect_text A3 unsafe_rm "Destructive command guard denied the command (reason=unsafe_rm): $HINT_UNSAFE_RM. $NO_BYPASS"
 run_command "A4 deny_names_unsafe_worktree_remove" deny "git worktree remove --force $DISPOSABLE"
 expect_reason A4 deny_names_unsafe_worktree_remove unsafe_worktree_remove
 A5_CMD="printf $(head -c 5994 /dev/zero | tr '\0' a)"
@@ -619,7 +620,7 @@ standin allow-foreign-policy.sh "printf '%s\\n' '{\"decision\":\"allow\",\"reaso
 standin no-opinion-foreign-policy.sh "printf '%s\\n' '{\"decision\":\"no_opinion\",\"reason\":\"unsafe_rm\"}'"
 run_command "A10 unknown_well_formed_code_passes_through" deny 'printf safe' --adapter-policy "$TEST_ROOT/future-code-policy.sh"
 expect_reason A10 unknown_well_formed_code_passes_through some_future_code
-expect_text A10 some_future_code "Destructive command guard denied the command (reason=some_future_code): $HINT_DEFAULT."
+expect_text A10 some_future_code "Destructive command guard denied the command (reason=some_future_code): $HINT_DEFAULT. $NO_BYPASS"
 run_command "A11 allow_with_foreign_reason_is_invalid" deny 'printf safe' --adapter-policy "$TEST_ROOT/allow-foreign-policy.sh"
 expect_reason A11 allow_with_foreign_reason_is_invalid engine_output_invalid
 run_command "A12 no_opinion_with_foreign_reason_is_invalid" deny 'printf safe' --adapter-policy "$TEST_ROOT/no-opinion-foreign-policy.sh"
@@ -627,7 +628,7 @@ expect_reason A12 no_opinion_with_foreign_reason_is_invalid engine_output_invali
 expect_text_of() { # ID LABEL SAVED_TEXT WANT
   if [ "$3" = "$4" ]; then pass "C1 $1 $2: text is the template plus the code's hint"; else fail "C1 $1 $2: text differs: $3"; fi
 }
-expect_text_of B1 engine_timeout "$B1_TEXT" "Destructive command guard denied the command (reason=engine_timeout): $HINT_ENGINE_TIMEOUT."
+expect_text_of B1 engine_timeout "$B1_TEXT" "Destructive command guard denied the command (reason=engine_timeout): $HINT_ENGINE_TIMEOUT. $NO_BYPASS"
 
 printf '%s\n' '== reason codes: engine stderr noise (warn wrapper) =='
 run_command "B11 stderr_noise_with_no_opinion_is_engine_failed" deny "cat $WORKTREE/fixture.txt" --adapter-policy "$WARN"

@@ -4,7 +4,9 @@
 # placeholder), no double quote, no backslash and never the word allow; the
 # dependency hints name the trusted roots through the guard's own ROOTS_HINT;
 # the adapter prints only its two templates; and the hook timeout in
-# hooks.json is at least the engine budget plus 2 seconds.
+# hooks.json is at least the engine budget plus 2 seconds. Every deny line,
+# and no ask line, ends with the one sentence that says the deny is final and
+# offers no way around it, and no hint invites a way around the guard.
 set -u
 LC_ALL=C
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -80,10 +82,11 @@ else
 fi
 
 printf '%s\n' '== a printed reason is valid JSON with its fixed hint =='
+NO_BYPASS='This deny is final: never use or offer a ! command at the prompt, a sandbox override, or a settings, permission or allowlist change to get around it; tell the person the guard denied it, and that running the command themselves is their own call.'
 GG_COMMIT=deny
 gg_hook "$REPO_FEATURE" 'git commit -m "$MSG"'
 HINT="$(printf '%s' "$OUT" | "$JQ" -r '.hookSpecificOutput.permissionDecisionReason' 2>/dev/null)"
-if [ "$HINT" = "Git guard denied the command (reason=commit_message_unreadable): the guard cannot read the commit message (a variable, a substitution or an unquoted heredoc), so it cannot check its conventional prefix; write the message literally, or to a file and use git commit -F." ]; then
+if [ "$HINT" = "Git guard denied the command (reason=commit_message_unreadable): the guard cannot read the commit message (a variable, a substitution or an unquoted heredoc), so it cannot check its conventional prefix; write the message literally, or to a file and use git commit -F. $NO_BYPASS" ]; then
   pass "R4 the deny reason, verbatim"
 else
   fail "R4 the deny reason: $HINT"
@@ -96,6 +99,39 @@ if [ "$HINT" = "Git guard asks before this command (reason=push_beside_substitut
 else
   fail "R4 the ask reason: $HINT"
 fi
+
+printf '%s\n' '== the deny is final and invites no way around it =='
+CODE_LINES="$(grep -v '^[[:space:]]*#' "$GUARD")"
+DENY_LINES="$(printf '%s\n' "$CODE_LINES" | grep -F '"permissionDecision":"deny"')"
+DENY_COUNT="$(printf '%s\n' "$DENY_LINES" | grep -c .)"
+FINAL_COUNT="$(printf '%s\n' "$DENY_LINES" | grep -cF ". $NO_BYPASS\"}}")"
+if [ "$DENY_COUNT" -eq 3 ] && [ "$FINAL_COUNT" -eq 3 ]; then
+  pass "R6 all three deny lines (the template and the two crash-trap lines) end with the no-bypass sentence"
+else
+  fail "R6 deny lines: $DENY_COUNT, of which end with the no-bypass sentence: $FINAL_COUNT"
+fi
+if printf '%s\n' "$CODE_LINES" | grep -F '"permissionDecision":"ask"' | grep -qF "$NO_BYPASS"; then
+  fail "R6 the ask template carries the no-bypass sentence"
+else
+  pass "R6 the ask template does not carry the no-bypass sentence"
+fi
+HINT_LINES="$(printf '%s\n' "$CODE_LINES" | grep -E '^    [a-z_|]+\) VERDICT_HINT=')"
+BYPASS_HINTS="$(printf '%s\n' "$HINT_LINES" | grep -iE 'yourself|outside claude code|sandbox|settings|allowlist|permission|dangerously|(^|[^a-z])set (it|the) |confirm it')"
+if [ -n "$HINT_LINES" ] && [ -z "$BYPASS_HINTS" ]; then
+  pass "R6 no hint invites a way around the guard ($(printf '%s\n' "$HINT_LINES" | grep -c .) hint lines)"
+else
+  fail "R6 a hint invites a way around the guard: ${BYPASS_HINTS:-no hint lines found}"
+fi
+GG_COMMIT=off
+GG_FORCE=deny
+gg_hook "$REPO_FEATURE" 'git push --force origin feature'
+HINT="$(printf '%s' "$OUT" | "$JQ" -r '.hookSpecificOutput.permissionDecisionReason' 2>/dev/null)"
+if [ "$HINT" = "Git guard denied the command (reason=push_force): this is a force-push (--force, --force-with-lease, --force-if-includes, -f or a + refspec), which the rails plugin's force_push option guards. $NO_BYPASS" ]; then
+  pass "R6 a force-push denied by force_push=deny: the hint names the option and offers no settings change"
+else
+  fail "R6 the force_push deny reason: $HINT"
+fi
+GG_FORCE=ask
 
 printf '%s\n' '== the hook timeout covers the engine budget =='
 BUDGET="$(sed -n 's/^TIMEOUT_SECONDS=\([0-9][0-9]*\)$/\1/p' "$GUARD")"

@@ -25,13 +25,14 @@ SUITE=unattended
 
 SEAT="$T/seat"
 mkdir -p "$SEAT"
-FORCE_HINT="this is a force-push (--force, --force-with-lease, --force-if-includes, -f or a + refspec); confirm it, or set the rails plugin's force_push option"
-MAIN_HINT="this push updates main or master; confirm it, or set the rails plugin's push_to_main option"
+FORCE_HINT="this is a force-push (--force, --force-with-lease, --force-if-includes, -f or a + refspec), which the rails plugin's force_push option guards"
+MAIN_HINT="this push updates main or master, which the rails plugin's push_to_main option guards"
+NO_BYPASS='This deny is final: never use or offer a ! command at the prompt, a sandbox override, or a settings, permission or allowlist change to get around it; tell the person the guard denied it, and that running the command themselves is their own call.'
 
 printf '%s\n' '== U1 an ask becomes a deny and owes one line =='
 : >"$SEAT/owed.log"
 gg_hook "$REPO_FEATURE" 'git push --force origin main' CLAUDE_SEAT_UNATTENDED=1 "SEAT_SCRATCH=$SEAT"
-WANT='{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Git guard denied the command (reason=push_force): the session is unattended, so a confirmation is a denial; '"$FORCE_HINT"'."}}'
+WANT='{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Git guard denied the command (reason=push_force): the session is unattended, so a confirmation is a denial; '"$FORCE_HINT"'. '"$NO_BYPASS"'"}}'
 if [ "$OUT" = "$WANT" ]; then pass "U1 the exact unattended deny line"; else fail "U1 the deny line: $OUT"; fi
 LINE="$(cat "$SEAT/owed.log")"
 IFS=$'\t' read -r STAMP REASON COMMAND_TEXT <<<"$LINE"

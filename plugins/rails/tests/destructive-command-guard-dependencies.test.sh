@@ -287,9 +287,9 @@ else
 fi
 
 printf '%s\n' '== D2 the crash trap =='
-FAIL_LINE='{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Destructive command guard denied the command (reason=adapter_failed): the guard'"'"'s adapter failed; retry once and report the code if it repeats."}}'
-INT_LINE='{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Destructive command guard denied the command (reason=adapter_interrupted): the guard'"'"'s adapter was stopped by a signal; retry once."}}'
-RM_DENY_LINE='{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Destructive command guard denied the command (reason=unsafe_rm): an rm target is not a literal path strictly below the current worktree or the named session scratchpad; spell a worktree target relative to the current folder, because an absolute home path is refused by spelling."}}'
+FAIL_LINE='{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Destructive command guard denied the command (reason=adapter_failed): the guard'"'"'s adapter failed; retry once and report the code if it repeats. This deny is final: never use or offer a ! command at the prompt, a sandbox override, or a settings, permission or allowlist change to get around it; tell the person the guard denied it, and that running the command themselves is their own call."}}'
+INT_LINE='{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Destructive command guard denied the command (reason=adapter_interrupted): the guard'"'"'s adapter was stopped by a signal; retry once. This deny is final: never use or offer a ! command at the prompt, a sandbox override, or a settings, permission or allowlist change to get around it; tell the person the guard denied it, and that running the command themselves is their own call."}}'
+RM_DENY_LINE='{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Destructive command guard denied the command (reason=unsafe_rm): an rm target is not a literal path strictly below the current worktree or the named session scratchpad; spell a worktree target relative to the current folder, because an absolute home path is refused by spelling. This deny is final: never use or offer a ! command at the prompt, a sandbox override, or a settings, permission or allowlist change to get around it; tell the person the guard denied it, and that running the command themselves is their own call."}}'
 replace_copy "$T/copies/d2a.sh" '  GUARD_LOG_INPUT="$normalized"' '  GUARD_LOG_INPUT="$normalized"
   : "$D2_UNBOUND_VARIABLE"'
 hook "$T/copies/d2a.sh" "$WT" "$WT" 'rm -rf build'
@@ -333,7 +333,7 @@ forkless() { # GUARD_FILE: sets OUT, RC; a 60 s alarm bounds it
     /usr/bin/perl -e 'alarm 60; exec @ARGV' /bin/bash -c 'ulimit -u 1; exec /bin/bash --noprofile --norc -p "$0"' "$1" 2>/dev/null)"
   RC=$?
 }
-JQ_MISSING_LINE='{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Destructive command guard denied the command (reason=dependency_missing_jq): jq was not found in '"$ROOTS_TEXT"'; install jq in one of them."}}'
+JQ_MISSING_LINE='{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Destructive command guard denied the command (reason=dependency_missing_jq): jq was not found in '"$ROOTS_TEXT"'; install jq in one of them. This deny is final: never use or offer a ! command at the prompt, a sandbox override, or a settings, permission or allowlist change to get around it; tell the person the guard denied it, and that running the command themselves is their own call."}}'
 forkless "$T/copies/no-roots.sh"
 if [ "$RC" -eq 0 ] && [ "$OUT" = "$JQ_MISSING_LINE" ]; then
   pass "D2 (d1) no fork left, no jq in any root: one dependency_missing_jq line, exit 0"
