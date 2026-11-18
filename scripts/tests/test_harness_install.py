@@ -558,11 +558,18 @@ def test_the_readme_says_where_it_talks_about_grants_that_auto_mode_is_the_defau
     assert "auto mode" in grants and "2.1.326" in grants and "shift+tab" in grants
 
 
-def test_the_readme_says_an_ask_is_not_a_hard_stop_in_auto_mode_and_a_deny_is():
+def test_the_readme_says_an_ask_may_not_stop_a_push_in_auto_mode_and_makes_no_timing_claim():
     text = README.read_text(encoding="utf-8")
     guard = "\n".join(section(text, "### The git guard")).replace("\n  ", " ")
-    assert "13 to 14 seconds" in guard
-    assert "an ask is not a hard stop there, and a deny is" in guard
+    bullet = guard[guard.index("**Auto mode.**"):].split("- **Never allows.**")[0]
+    assert "a push was seen to run after a guard ask with no recorded answer" in bullet
+    assert "not yet confirmed" in bullet
+    assert "Use `deny` for a hard stop" in bullet
+    # No timing claim: no figure of seconds in the bullet, and the old sentence is gone.
+    assert not re.search(r"\bseconds?\b", bullet)
+    assert not re.search(r"\d", bullet)
+    assert "unanswered" not in bullet
+    assert "13 to 14" not in text
     # The ticket that tracks the fix is cited in the pull request, not here.
     assert "DT-RAILS-AUTOMODE-ASK1" not in text
 
