@@ -10,7 +10,10 @@ and blocks on a failure; and the git guard's stored-options hook, whose
 arguments are --tighten-only and the three option references, with no
 onFailure key. None carries a test seam. Claude Code's plugin validator does
 not check a ${user_config.KEY} reference against userConfig, so the keys are
-pinned here.
+pinned here. The destructive guard's arguments are pinned whole and reference
+no option: Claude Code does not run a hook while an option it references is
+unstored, so an option there would turn the guard off on a plain install (its
+rm-roots file is read from the account's home folder instead).
 """
 from __future__ import annotations
 
@@ -140,6 +143,21 @@ def test_hooks_file():
     referenced = re.findall(r"\$\{user_config\.([A-Za-z0-9_]+)\}", " ".join(stored["args"]))
     assert referenced == OPTION_KEYS
     assert set(referenced) == set(load(".claude-plugin", "plugin.json")["userConfig"])
+
+
+DESTRUCTIVE_ARGS = ["-u", "BASH_ENV", "-u", "ENV", "/bin/bash", "--noprofile", "--norc", "-p",
+                    "${CLAUDE_PLUGIN_ROOT}/hooks/destructive-command-guard.sh"]
+
+
+def test_the_destructive_guard_references_no_option():
+    hooks = load("hooks", "hooks.json")
+    entries = [entry for group in hooks["hooks"]["PreToolUse"] for entry in group["hooks"]
+               if any(word.endswith("/hooks/destructive-command-guard.sh") for word in entry.get("args", []))]
+    assert len(entries) == 1
+    [entry] = entries
+    assert entry["args"] == DESTRUCTIVE_ARGS
+    assert "user_config" not in json.dumps(entry)
+    assert "rm_roots" not in json.dumps(load(".claude-plugin", "plugin.json"))
 
 
 def git_guard_entries():

@@ -108,7 +108,7 @@ for code in non_literal_rm_targets path_repointing_substitution path_repointing_
     pass "C6 the retired code $code has no hint label"
   fi
 done
-for code in $(printf '%s\n' $CARRIERS | sed 's/^/removal_beside_/') path_repointing_popd hidden_separator lane_registry_absent_armed cleanup_registry_absent_armed cleanup_registry_untrusted cleanup_registry_malformed cleanup_seat_missing inherited_git_environment; do
+for code in $(printf '%s\n' $CARRIERS | sed 's/^/removal_beside_/') path_repointing_popd hidden_separator lane_registry_absent_armed cleanup_registry_absent_armed cleanup_registry_untrusted cleanup_registry_malformed cleanup_seat_missing inherited_git_environment rm_roots_untrusted rm_roots_malformed; do
   if printf '%s\n' "$BASH_KEYS" | grep -qx "$code"; then
     pass "C6 the new code $code has its own hint"
   else

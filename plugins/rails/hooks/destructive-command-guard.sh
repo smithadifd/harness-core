@@ -43,7 +43,10 @@
 # re-point path resolution fail closed.
 # From a working folder in no git repository (a workspace folder), only
 # literal absolute rm targets strictly below the session scratchpad are
-# accepted; see validate_target_outside_worktree.
+# accepted; see validate_target_outside_worktree. The account's optional
+# rm-roots file (load_rm_roots) adds, from such a folder only, a regular file
+# strictly below a folder it lists, for a non-recursive rm; with no file the
+# guard judges exactly as it does without this layer.
 # git worktree remove accepts an explicitly authorized tree, a lane-registry
 # tree with its identity grant, the exact six-word non-force `git -C REPO
 # worktree remove TARGET` form for a clean linked tree registered to this seat
@@ -386,7 +389,7 @@ exit((defined $wrote && $wrote == length $line) ? 0 : 1);
 # configuration faults are other.
 guard_log_class() {
   case "$1" in
-    unsafe_rm|unsupported_rm_prefix|non_literal_rm_targets|path_repointing_*) GUARD_LOG_CLASS=rm ;;
+    unsafe_rm|unsupported_rm_prefix|non_literal_rm_targets|path_repointing_*|rm_roots_*) GUARD_LOG_CLASS=rm ;;
     unsafe_worktree_remove|lane_registry_*|lane_ids_*|cleanup_*) GUARD_LOG_CLASS=git-worktree-remove ;;
     unsafe_redirect) GUARD_LOG_CLASS=redirect ;;
     *) GUARD_LOG_CLASS=other ;;
@@ -445,6 +448,8 @@ deny_hint() {
     removal_beside_flock) DENY_HINT='an rm or git worktree remove shares the command with flock, which the guard does not read inside; run the removal as its own plain command' ;;
     unsafe_redirect) DENY_HINT='an output redirection targets an existing path reached through a symlink' ;;
     invalid_cwd|invalid_scratchpad|invalid_authorized_worktree|invalid_configuration) DENY_HINT="the guard's working folder or options are invalid; this is a configuration fault, not the command" ;;
+    rm_roots_untrusted) DENY_HINT='the rm-roots file (.claude/rails/rm-roots in the account home folder) is not a regular file, or it or its folder is a symlink, not owned by this user, or group- or world-writable; every rm denies until the file is fixed or removed' ;;
+    rm_roots_malformed) DENY_HINT='the rm-roots file (.claude/rails/rm-roots in the account home folder) must hold one existing absolute folder per line, spelled canonically, none of them the root folder, /Users, the home folder or a folder above it, with no blank line; every rm denies until the file is fixed or removed' ;;
     cwd_outside_worktree) DENY_HINT='the working folder is not inside a git worktree, so only absolute targets strictly below the session scratchpad are accepted; run the command from a worktree' ;;
     inherited_git_environment) DENY_HINT='a GIT_ variable that selects a repository is set in the session; unset it and retry' ;;
     dependency_missing_jq) DENY_HINT="jq was not found in $ROOTS_HINT; install jq in one of them" ;;
@@ -1756,6 +1761,9 @@ path_in_git_repo() {
 #     git repository or worktree (registered lane roots included) is refused;
 #   - anything strictly below the session scratchpad is accepted, as it is
 #     from a worktree;
+#   - a regular, non-symlink file strictly below a folder the account's
+#     rm-roots file lists is accepted, for a non-recursive rm only
+#     (rm_roots_accept); with no rm-roots file there is no such folder;
 #   - everything else is refused.
 validate_target_outside_worktree() {
   local target="$1" resolved status
@@ -1772,11 +1780,45 @@ validate_target_outside_worktree() {
   case "$resolved" in */.[gG][iI][tT]|*/.[gG][iI][tT]/*) return 1 ;; esac
   path_in_git_repo "$resolved" && return 1
   [ -n "$SCRATCH_ROOT" ] && strict_descendant "$resolved" "$SCRATCH_ROOT" && return 0
+  rm_roots_accept "$resolved" && return 0
   return 1
 }
 
+# True when $1, a canonical absolute target, is a regular, non-symlink file
+# strictly below a folder load_rm_roots read, and the rm is not recursive.
+# The file check runs before rm does, so a recursive flag could still remove
+# a directory swapped in after it; only a non-recursive rm is accepted here.
+rm_roots_accept() { # RESOLVED
+  local root
+  [ "$RM_RECURSIVE" -eq 0 ] || return 1
+  for root in ${RM_ROOTS[@]+"${RM_ROOTS[@]}"}; do
+    if strict_descendant "$1" "$root"; then
+      [ -f "$1" ] && [ ! -L "$1" ]
+      return
+    fi
+  done
+  return 1
+}
+
+# Set by validate_rm before any target is judged: 1 when any option word
+# (before --) asks for a recursive removal, wherever it sits on the line. It
+# starts at 1, so a target judged outside validate_rm counts as recursive.
+RM_RECURSIVE=1
+
 validate_rm() {
   local i=1 token chars end_options=0 saw_option=0 targets=0
+  RM_RECURSIVE=0
+  while [ "$i" -lt "${#WORDS[@]}" ]; do
+    token="${WORDS[$i]}"
+    [ "$token" != "--" ] || break
+    case "$token" in
+      --recursive) RM_RECURSIVE=1 ;;
+      --*) ;;
+      -*[rR]*) RM_RECURSIVE=1 ;;
+    esac
+    i=$((i + 1))
+  done
+  i=1
   while [ "$i" -lt "${#WORDS[@]}" ]; do
     token="${WORDS[$i]}"
     if [ "$end_options" -eq 0 ] && [ "$token" = "--" ]; then
@@ -1885,6 +1927,93 @@ owned_and_private() {
 canonical_dir() {
   [ -d "$1" ] || return 1
   (cd -- "$1" 2>/dev/null && pwd -P)
+}
+
+# The rm-roots file: extra folders below which a no-repo working folder's rm
+# may remove a regular file (rm_roots_accept). The guard reads exactly one
+# file, .claude/rails/rm-roots in the account's home folder. That folder comes
+# from the password database: a bare ~ expanded by a fresh /bin/bash started
+# with an empty environment, so HOME is unset there. (bash 5 keeps the HOME it
+# started with for a ~ expanded after `unset HOME`, so the expansion is never
+# done in this process.) HOME, any other variable, an argument and the command
+# text never move it.
+#   - No file there (or no home folder the database names as an absolute
+#     path): dormant. Every verdict is the one the guard gives without this
+#     layer.
+#   - Untrusted: the file is not a regular file, the file or its folder is a
+#     symlink, or either is not owned by this user or is group- or
+#     world-writable (owned_and_private). Every judged rm denies as
+#     rm_roots_untrusted.
+#   - Malformed: the grammar below is broken. Every judged rm denies as
+#     rm_roots_malformed.
+# Grammar: rows, each ended by a newline (the last row's newline may be left
+# off), each row one absolute folder path that exists and is spelled exactly
+# as its canonical path (no symlink, . or .. component, no repeated or
+# trailing slash). The root folder, /Users, the home folder and every folder
+# above the home folder are refused. A blank row, an empty file, a NUL byte,
+# more than RM_ROOTS_MAX_ROWS rows or more than RM_ROOTS_MAX_BYTES bytes is
+# malformed. The file is read once per command, only when an rm is judged,
+# and never written.
+RM_ROOTS_RELATIVE=".claude/rails/rm-roots"
+RM_ROOTS_MAX_ROWS=64
+RM_ROOTS_MAX_BYTES=65536
+RM_ROOTS=()
+RM_ROOTS_READY=0
+
+# Prints the account's home folder as the password database names it.
+rm_roots_account_home() {
+  local home
+  # The single quotes keep ~ for the fresh shell; its stderr never reaches ours.
+  # shellcheck disable=SC2016,SC2088
+  home="$(/usr/bin/env -i /bin/bash --noprofile --norc -p -c 'printf "%s" ~' 2>/dev/null)" || return 1
+  printf '%s' "$home"
+}
+
+# True when $1 is a row the grammar accepts; $2 is the home folder as the
+# database names it, $3 its canonical path.
+rm_roots_row_ok() { # ROW HOME HOME_CANON
+  local row="$1" canon
+  case "$row" in /?*) ;; *) return 1 ;; esac
+  case "$row" in "$USERS_ROOT"|"$2"|"$3") return 1 ;; esac
+  strict_descendant "$2" "$row" && return 1
+  strict_descendant "$3" "$row" && return 1
+  canon="$(canonical_dir "$row")" || return 1
+  [ "$canon" = "$row" ]
+}
+
+# Reads the rm-roots file into RM_ROOTS, or denies by name. Run for every
+# judged rm, after initialize_context and before validate_rm.
+load_rm_roots() {
+  local home home_canon file dir row size rows=0 bytes=0
+  [ "$RM_ROOTS_READY" -eq 0 ] || return 0
+  RM_ROOTS_READY=1
+  RM_ROOTS=()
+  home="$(rm_roots_account_home)" || return 0
+  case "$home" in /?*) ;; *) return 0 ;; esac
+  case "$home/" in *//*|*/./*|*/../*) return 0 ;; esac
+  file="$home/$RM_ROOTS_RELATIVE"
+  dir="${file%/*}"
+  [ -e "$file" ] || [ -L "$file" ] || return 0
+  [ -d "$dir" ] && [ ! -L "$dir" ] || policy_deny rm_roots_untrusted
+  [ -f "$file" ] && [ ! -L "$file" ] || policy_deny rm_roots_untrusted
+  owned_and_private "$dir" || policy_deny rm_roots_untrusted
+  owned_and_private "$file" || policy_deny rm_roots_untrusted
+  size="$(stat_fields '%z' '%s' "$file")" || policy_deny rm_roots_untrusted
+  is_small_decimal "$size" || policy_deny rm_roots_malformed
+  [ "$size" -gt 0 ] || policy_deny rm_roots_malformed
+  [ "$size" -le "$RM_ROOTS_MAX_BYTES" ] || policy_deny rm_roots_malformed
+  home_canon="$(canonical_dir "$home")" || home_canon="$home"
+  while IFS= read -r row || [ -n "$row" ]; do
+    rows=$((rows + 1))
+    [ "$rows" -le "$RM_ROOTS_MAX_ROWS" ] || policy_deny rm_roots_malformed
+    # LC_ALL=C (set at the top) makes this a byte count.
+    bytes=$((bytes + ${#row} + 1))
+    rm_roots_row_ok "$row" "$home" "$home_canon" || policy_deny rm_roots_malformed
+    RM_ROOTS[${#RM_ROOTS[@]}]="$row"
+  done < "$file"
+  # read drops a NUL byte, so the rows then add up to fewer bytes than the
+  # file holds.
+  [ "$bytes" -eq "$size" ] || [ "$bytes" -eq $((size + 1)) ] || policy_deny rm_roots_malformed
 }
 
 trusted_lane_registry() {
@@ -4587,6 +4716,7 @@ run_policy() {
         normalize_explicit_rm_words || policy_deny unsafe_rm
       fi
       initialize_context
+      load_rm_roots
       validate_rm || policy_deny unsafe_rm
       saw_explicit=1
       saw_rm=1
