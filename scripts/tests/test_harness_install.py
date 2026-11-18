@@ -641,3 +641,113 @@ def test_the_skill_claims_no_removal_the_remove_output_does_not_name(tmp_path):
     names = {line.split(":", 1)[0] for line in removed.out.splitlines()}
     assert names <= {"kept for a manual check", "already gone", "kept", "removed"}
     assert RULES not in removed.out and OVERRIDE not in removed.out
+
+
+# ---------------------------------------------------------------------------
+# The second walk's README friction (v0.1.5): each claim a newcomer meets is pinned.
+
+CHANGELOG = ROOT / "CHANGELOG.md"
+
+
+def one_line(text):
+    return " ".join(text.split())
+
+
+def changelog_text():
+    return CHANGELOG.read_text(encoding="utf-8")
+
+
+def changelog_headings():
+    return re.findall(r"^## (.+)$", changelog_text(), re.MULTILINE)
+
+
+def changelog_top_entry():
+    return changelog_text().split("\n## ")[1]
+
+
+def plugin_version(name):
+    manifest = ROOT / "plugins" / name / ".claude-plugin" / "plugin.json"
+    return json.loads(manifest.read_text(encoding="utf-8"))["version"]
+
+
+def test_the_changelog_has_a_release_entry_on_top_and_no_unreleased_heading():
+    headings = changelog_headings()
+    assert re.fullmatch(r"v\d+\.\d+\.\d+", headings[0]), headings[0]
+    assert not [heading for heading in headings if "unreleased" in heading.lower()]
+
+
+def test_the_readme_names_the_current_release_tag_and_one_command_to_read_it():
+    readme = README.read_text(encoding="utf-8")
+    text = one_line(readme)
+    found = re.search(r"use the current one, which is `(v\d+\.\d+\.\d+)`\.", text)
+    assert found, "the install block does not name the current tag"
+    assert found.group(1) == changelog_headings()[0]
+    assert "Each release moves it" in text and "Tags page" in text
+    assert f"git ls-remote --tags {OWN_URL}" in readme.splitlines()
+
+
+def test_the_readme_prerequisites_name_a_git_name_and_email():
+    intro = one_line("\n".join(section(README.read_text(encoding="utf-8"),
+                                       "## Install the default tier (alpha)")))
+    needs = intro[intro.index("You need Claude Code"):].split("network access")[0]
+    assert "git config --global user.name" in needs
+    assert "git config --global user.email" in needs
+    assert "makes commits" in needs
+
+
+def test_the_readme_says_to_ask_a_session_to_paste_a_ledger_commands_output():
+    first_use = one_line("\n".join(section(README.read_text(encoding="utf-8"), "### First use")))
+    bullet = first_use[first_use.index("**The `ledger` command.**"):]
+    assert "ask the session to paste the command's output into its reply" in bullet
+    assert "collapses a tool's output" in bullet
+
+
+def test_the_readme_says_what_to_answer_to_the_sandbox_switch_and_the_deny_rules():
+    assert len(setup.DENY_RULES) == 6
+    written = one_line("\n".join(section(README.read_text(encoding="utf-8"),
+                                         "#### What setup writes")))
+    sandbox = written[written.index("**The sandbox switch.**"):written.index("**The six deny rules.**")]
+    deny = written[written.index("**The six deny rules.**"):written.index("Claude Code 2.1.326 makes")]
+    assert "No is safe" in sandbox and "you give up that confinement" in sandbox
+    assert "Yes is recommended" in deny
+    assert "No is safe: you give up that stop" in deny
+
+
+def test_the_readme_version_labels_match_the_manifests_and_the_pin():
+    text = one_line(README.read_text(encoding="utf-8"))
+    own = re.search(r"`harness` and `rails` show (\d+\.\d+\.\d+), the version in their manifests",
+                    text)
+    assert own, "the README does not say what harness and rails show"
+    assert own.group(1) == plugin_version("harness") == plugin_version("rails")
+    skills = re.search(r"`sdlc` shows (\d+\.\d+\.\d+), which is the skills release `(v[^`]+)` "
+                       r"at the pinned commit", text)
+    assert skills, "the README does not say what sdlc shows"
+    source = next(e for e in marketplace_manifest()["plugins"] if e["name"] == "sdlc")["source"]
+    assert skills.group(2) == source["ref"]
+    # The skills plugin's own version is not in this repository; the CHANGELOG records which
+    # version sits at each pinned commit, and the README must agree with it for the pin it names.
+    recorded = {sha: version for version, sha in re.findall(
+        r"`sdlc` plugin at (\d+\.\d+\.\d+), commit `([0-9a-f]{40})`", one_line(changelog_text()))}
+    assert recorded[source["sha"]] == skills.group(1)
+
+
+def test_the_readme_gives_the_command_that_confirms_the_rules_files_are_gone():
+    lines = section(README.read_text(encoding="utf-8"), "### Uninstall")
+    assert [line for line in lines if line.startswith("ls ")] == [f"ls $HOME/{RULES} $HOME/{OVERRIDE}"]
+    assert "No such file or directory" in one_line("\n".join(lines))
+
+
+def test_the_readme_marks_search_db_as_present_only_if_ledger_search_ran():
+    rows = [line for line in section(README.read_text(encoding="utf-8"),
+                                     "#### What is left after uninstall")
+            if line.startswith("| `.local/share/ledger/search.db`")]
+    assert len(rows) == 1
+    assert "only if `ledger search` ever ran" in rows[0]
+
+
+def test_the_release_entry_corrects_the_v0_1_4_known_limits_claim_and_moves_no_plugin():
+    entry = one_line(changelog_top_entry())
+    assert "KNOWN-LIMITS.md" in entry and "the file only gained the five lines" in entry
+    stays = re.search(r"`harness` and `rails` stay at (\d+\.\d+\.\d+)", entry)
+    assert stays, "the entry does not say the plugin versions stay"
+    assert stays.group(1) == plugin_version("harness") == plugin_version("rails")
