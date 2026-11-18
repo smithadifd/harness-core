@@ -471,6 +471,18 @@ def test_the_readme_names_every_optional_setting_the_plan_proposes():
         assert f"`{key}`" in text, key
 
 
+def test_the_readme_names_the_prompt_suggestions_setting_and_how_it_is_applied_and_removed():
+    text = one_line(README.read_text(encoding="utf-8"))
+    assert "(`promptSuggestionEnabled` set to `false`)" in text
+    bullet = text[text.index("**Prompt suggestions off.**"):]
+    bullet = bullet.split("Claude Code 2.1.326 makes auto mode")[0]
+    assert "Yes sets `promptSuggestionEnabled` to `false`" in bullet
+    assert "No leaves the suggestions as they are" in bullet
+    assert "applied only on your yes" in bullet
+    assert "only when you have not set that key yourself" in bullet
+    assert "uninstall takes it out again" in bullet
+
+
 SKILL_COMMAND = 'python3 "${CLAUDE_SKILL_DIR}/../../setup.py"'
 
 
