@@ -241,12 +241,13 @@ Setup also asks Claude Code to store the ledger plugin's three options
 in your user `settings.json` and deletes when the plugin is uninstalled.
 
 The optional settings changes are the sandbox switch (`sandbox` set to
-`{"enabled": true}`) and six deny rules that stop the agent reading secret
+`{"enabled": true}`), six deny rules that stop the agent reading secret
 files: `Read(.env)`, `Read(.env.*)`, `Read(**/.env)`, `Read(**/.env.*)`,
-`Read(**/*.pem)` and `Read(**/*.key)`. Each is added only when absent, a deny
-rule is appended after the ones you have, nothing you have is changed, removed
-or reordered, and each addition is recorded so uninstall can take out exactly
-it. Setup never proposes anything that grants: no allow rule, no extra
+`Read(**/*.pem)` and `Read(**/*.key)`, and turning off Claude Code's prompt
+suggestions (`promptSuggestionEnabled` set to `false`). Each is added only
+when absent, a deny rule is appended after the ones you have, nothing you
+have is changed, removed or reordered, and each addition is recorded so
+uninstall can take out exactly it. Setup never proposes anything that grants: no allow rule, no extra
 directory, no automatic permission for sandboxed commands.
 
 If you are unsure what to answer to the optional changes:
@@ -260,6 +261,11 @@ If you are unsure what to answer to the optional changes:
   `.env` files and `.pem` and `.key` files, and the cost is a refused read when
   you do want it to see one, in which case you paste what it needs. No is
   safe: you give up that stop.
+- **Prompt suggestions off.** Claude Code can type a grey suggested reply into
+  the prompt box, such as a "yes", and pressing Enter sends it. Yes sets
+  `promptSuggestionEnabled` to `false`, so an empty prompt stays empty. No
+  leaves the suggestions as they are. It is applied only on your yes, only
+  when you have not set that key yourself, and uninstall takes it out again.
 
 Claude Code 2.1.326 makes auto mode the default permission mode for new
 accounts. In auto mode a command that you expect to prompt can simply run, so
