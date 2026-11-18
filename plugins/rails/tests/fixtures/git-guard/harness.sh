@@ -159,6 +159,99 @@ gg_policy() {
   RC=$?
 }
 
+# gg_pair MAIN FORCE COMMIT COMMAND [ENV=VAL...]: every git guard entry of
+# hooks.json, in file order, run on one hook input from REPO_FEATURE the way
+# the walk's probes saw Claude Code run plugin hooks: an entry runs only when
+# every ${user_config.KEY} its arguments reference is stored, with the stored
+# values in place of the references; MAIN, FORCE and COMMIT are the stored
+# push_to_main, force_push and commit_style, and "-" is unstored. Every entry
+# that runs gets the same environment. Sets, per entry (0 is the floor, 1 the
+# stored-options hook), PAIR_DECISIONS (skipped, silent, ask, deny or other),
+# PAIR_CODES, PAIR_OUTS and PAIR_ERRS; PAIR_RAN lists the entries that ran;
+# DECISION, CODE and OUT are the strictest of them (deny over ask over
+# silent, the first entry to reach it; any other result is other), the model
+# of Claude Code combining several PreToolUse verdicts.
+PAIR_RAN=""
+PAIR_DECISIONS=()
+PAIR_CODES=()
+PAIR_OUTS=()
+PAIR_ERRS=()
+gg_pair() {
+  local main="$1" force="$2" commit="$3" command_data="$4" stored entries line input word
+  local index=0 level best=-1 best_code="" best_out="" other=0
+  local -a argv
+  shift 4
+  PAIR_RAN=""
+  PAIR_DECISIONS=()
+  PAIR_CODES=()
+  PAIR_OUTS=()
+  PAIR_ERRS=()
+  DECISION=other
+  CODE=""
+  OUT=""
+  stored="$("$JQ" -cn --arg m "$main" --arg f "$force" --arg c "$commit" \
+    '{push_to_main: $m, force_push: $f, commit_style: $c} | with_entries(select(.value != "-"))')" \
+    || { fail "gg_pair fixture: the stored values"; return 0; }
+  entries="$("$JQ" -c --arg root "$PLUGIN_ROOT" --argjson stored "$stored" '
+    [.hooks.PreToolUse[] | select(.matcher == "Bash") | .hooks[]
+      | select(.type == "command" and ((.args // []) | any(endswith("/hooks/git-guard.sh"))))]
+    | .[]
+    | ([.args[] | scan("\\$\\{user_config\\.([A-Za-z0-9_]+)\\}") | .[0]] | unique) as $refs
+    | if ($refs | all(. as $k | $stored | has($k))) then
+        [.command] + (.args | map(gsub("\\$\\{CLAUDE_PLUGIN_ROOT\\}"; $root)
+          | gsub("\\$\\{user_config\\.(?<k>[A-Za-z0-9_]+)\\}"; $stored[.k] // "")))
+      else "skipped" end' "$HOOKS")" || { fail "gg_pair fixture: hooks.json"; return 0; }
+  [ -n "$entries" ] || { fail "gg_pair fixture: hooks.json has no git guard entry"; return 0; }
+  input="$(gg_payload "$REPO_FEATURE" "$command_data")"
+  while IFS= read -r line; do
+    if [ "$line" = '"skipped"' ]; then
+      PAIR_DECISIONS[index]=skipped
+      PAIR_CODES[index]=""
+      PAIR_OUTS[index]=""
+      PAIR_ERRS[index]=""
+      index=$((index + 1))
+      continue
+    fi
+    argv=()
+    while IFS= read -r word; do
+      case "$word" in */hooks/git-guard.sh) [ -z "$GG_GUARD" ] || word="$GG_GUARD" ;; esac
+      argv+=("$word")
+    done < <("$JQ" -r '.[]' <<<"$line")
+    OUT="$(cd "$T" && printf '%s' "$input" | /usr/bin/env -i HOME="$GG_HOME" PATH="$GG_PATH" "$@" "${argv[@]}" 2>"$T/stderr")"
+    RC=$?
+    ERR="$(cat "$T/stderr")"
+    gg_classify
+    PAIR_RAN="${PAIR_RAN:+$PAIR_RAN }$index"
+    PAIR_DECISIONS[index]="$DECISION"
+    PAIR_CODES[index]="$CODE"
+    PAIR_OUTS[index]="$OUT"
+    PAIR_ERRS[index]="$ERR"
+    case "$DECISION" in
+      silent) level=0 ;;
+      ask) level=1 ;;
+      deny) level=2 ;;
+      *) other=1; level=-1 ;;
+    esac
+    if [ "$level" -gt "$best" ]; then best="$level"; best_code="$CODE"; best_out="$OUT"; fi
+    index=$((index + 1))
+  done <<<"$entries"
+  CODE="$best_code"
+  OUT="$best_out"
+  if [ "$other" -eq 1 ] || [ "$best" -lt 0 ]; then
+    DECISION=other
+  else
+    case "$best" in 0) DECISION=silent ;; 1) DECISION=ask ;; *) DECISION=deny ;; esac
+  fi
+}
+
+# gg_pair_hook N WANT LABEL: entry N's own verdict in the last gg_pair; WANT is
+# skipped, silent, ask, deny, ask:CODE or deny:CODE.
+gg_pair_hook() {
+  local got="${PAIR_DECISIONS[$1]:-missing}"
+  case "$2" in *:*) got="$got:${PAIR_CODES[$1]:-}" ;; esac
+  if [ "$got" = "$2" ]; then pass "$3 -> $2"; else fail "$3: expected $2, got $got"; fi
+}
+
 # replace_copy DEST OLD NEW [SOURCE]: a copy of SOURCE (the guard) with OLD,
 # which must occur exactly once, replaced by NEW.
 replace_copy() {

@@ -17,12 +17,21 @@
             "type": "command",
             "command": "/usr/bin/env",
             "args": ["-u", "BASH_ENV", "-u", "ENV", "/bin/bash", "--noprofile", "--norc", "-p", "${CLAUDE_PLUGIN_ROOT}/hooks/git-guard.sh",
+                     "--push-to-main", "ask", "--force-push", "ask", "--commit-style", "off"],
+            "timeout": 10,
+            "onFailure": "block",
+            "statusMessage": "Checking git guardrails..."
+          },
+          {
+            "type": "command",
+            "command": "/usr/bin/env",
+            "args": ["-u", "BASH_ENV", "-u", "ENV", "/bin/bash", "--noprofile", "--norc", "-p", "${CLAUDE_PLUGIN_ROOT}/hooks/git-guard.sh",
+                     "--tighten-only",
                      "--push-to-main", "${user_config.push_to_main}",
                      "--force-push", "${user_config.force_push}",
                      "--commit-style", "${user_config.commit_style}"],
             "timeout": 10,
-            "onFailure": "block",
-            "statusMessage": "Checking git guardrails..."
+            "statusMessage": "Checking stored git guard options..."
           }
         ]
       }

@@ -14,11 +14,19 @@
 # engine output, engine stderr beside silence, an adapter fault, a signal,
 # malformed hook input or an invalid option) denies by name.
 #
-# Options. push_to_main, force_push and commit_style each take ask, deny or
+# Options. push_to_main, force_push and commit_style each read ask, deny or
 # off. They reach the guard only as its own arguments (--push-to-main,
-# --force-push, --commit-style), which Claude Code fills from the person's
-# user or managed settings; no environment variable and no file is read for
-# them. A value outside the three denies when its gate fires, by name.
+# --force-push, --commit-style); no environment variable and no file is read
+# for them. A value outside the three denies when its gate fires, by name.
+# hooks.json runs the guard twice on every Bash call. Hook A, the floor,
+# passes the literal defaults (ask, ask, off) and references no option, so
+# Claude Code runs it on every install, stored options or not; a failure
+# there blocks the call. Hook B passes the person's stored options, which
+# Claude Code fills from user or managed settings (it skips the hook until
+# all three are stored), with --tighten-only: every value no stricter than
+# its option's default is lowered to off, so B speaks only where a stored
+# option is stricter than the floor, and a failure there does not block.
+# A stored option can therefore make a gate stricter, never weaker.
 #
 # Command text is data: it is never run, evaluated or sourced. Every program
 # run by name (jq, wc, tr, git) comes from the fixed trusted roots of
@@ -218,6 +226,8 @@ OPT_COMMIT=""
 SEEN_MAIN=0
 SEEN_FORCE=0
 SEEN_COMMIT=0
+# --tighten-only (hook B): at most once, and in adapter mode only.
+TIGHTEN_ONLY=0
 # The adapter's normalized input, kept so the guard log can name its cwd and
 # the owed record can name the command; empty until normalized.
 GUARD_LOG_INPUT=""
@@ -229,6 +239,10 @@ while [ "$#" -gt 0 ]; do
     --policy)
       [ "$MODE" = "adapter" ] || ARG_ERROR=1
       MODE="policy"
+      shift
+      ;;
+    --tighten-only)
+      TIGHTEN_ONLY=$((TIGHTEN_ONLY + 1))
       shift
       ;;
     --push-to-main|--force-push|--commit-style|--adapter-policy|--timeout-runner)
@@ -246,6 +260,7 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 { [ "$SEEN_MAIN" -eq 1 ] && [ "$SEEN_FORCE" -eq 1 ] && [ "$SEEN_COMMIT" -eq 1 ]; } || ARG_ERROR=1
+{ [ "$TIGHTEN_ONLY" -eq 0 ] || { [ "$TIGHTEN_ONLY" -eq 1 ] && [ "$MODE" = "adapter" ]; }; } || ARG_ERROR=1
 
 # ---------------------------------------------------------------------------
 # Verdict text.
@@ -3773,7 +3788,9 @@ exit 0;
 
 # Reads one option argument as the adapter received it: empty, or exactly the
 # unsubstituted text ${user_config.KEY} of its own key, is the option's
-# default; ask, deny and off are themselves; anything else is invalid.
+# default; ask, deny and off are themselves; anything else is invalid. Hook A
+# passes literal defaults, so only hook B's arguments come from Claude Code;
+# the empty and unsubstituted cases stay the default, fail-safe.
 OPTION_VALUE=""
 adapter_option_value() { # RAW KEY DEFAULT
   case "$1" in
@@ -3783,6 +3800,17 @@ adapter_option_value() { # RAW KEY DEFAULT
       if [ "$1" = "\${user_config.$2}" ]; then OPTION_VALUE="$3"; else OPTION_VALUE=invalid; fi
       ;;
   esac
+}
+
+# Hook B's mapping under --tighten-only: VALUE stays when its level is higher
+# than DEFAULT's and is off otherwise (levels as option_level: off < ask <
+# deny < invalid), so B never repeats hook A's floor and never goes below it.
+tighten_option_value() { # VALUE DEFAULT
+  local value_level
+  option_level "$1"
+  value_level="$LEVEL"
+  option_level "$2"
+  if [ "$value_level" -gt "$LEVEL" ]; then OPTION_VALUE="$1"; else OPTION_VALUE=off; fi
 }
 
 # Every denial names its reason code. A fault is still a denial (fail
@@ -3827,6 +3855,14 @@ run_adapter() {
   force_value="$OPTION_VALUE"
   adapter_option_value "$OPT_COMMIT" commit_style off
   commit_value="$OPTION_VALUE"
+  if [ "$TIGHTEN_ONLY" -eq 1 ]; then
+    tighten_option_value "$main_value" ask
+    main_value="$OPTION_VALUE"
+    tighten_option_value "$force_value" ask
+    force_value="$OPTION_VALUE"
+    tighten_option_value "$commit_value" off
+    commit_value="$OPTION_VALUE"
+  fi
   # Only the runner's stdout is captured. The engine's stderr never reaches
   # it, and the runner's own stderr is discarded.
   response="$(printf '%s\n' "$normalized" | "$TIMEOUT_RUNNER" -e "$GUARD_RUNNER_PROGRAM" "$TIMEOUT_SECONDS" /bin/bash --noprofile --norc -p "$POLICY_PATH" --policy --push-to-main "$main_value" --force-push "$force_value" --commit-style "$commit_value" 2>/dev/null)" || runner_rc=$?

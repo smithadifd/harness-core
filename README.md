@@ -113,7 +113,8 @@ At this tag it lists four plugins:
 - `rails`, a folder in this repository (`plugins/rails/`): the guard hooks.
   `harness` does not depend on it yet, so installing `harness` does not bring
   it; install it on its own with `claude plugin install rails@harness-core`.
-  See "The rails plugin" below.
+  The git guard asks before a push to main or a force-push as soon as it is
+  installed; you need not set its options. See "The rails plugin" below.
 
 `sdlc` and `ledger-hooks` are each fixed to one full commit id on a release
 tag, and `harness` and `rails` are fixed by the tag of this repository you add
@@ -365,6 +366,20 @@ the marketplace file.
 every Bash call: the destructive-command guard and the git guard. Claude Code
 runs both, and a deny from either wins. Neither ever returns an allow.
 
+### If you installed v0.1.3
+
+At v0.1.3 the git guard's one hook read all three of its options, and Claude
+Code does not run a hook until every option it reads is stored: unless you had
+stored them, the git guard did not run at all in `claude -p`, and in an
+interactive session it failed and blocked every Bash command. Move to a newer
+tag as "Update to a newer tag" above says (remove the marketplace and add it
+again at the newer tag), then install `rails` again with
+`claude plugin install rails@harness-core`, since removing the marketplace
+uninstalls it. Until you move, store the three options once
+(`claude plugin configure rails@harness-core`, keeping the defaults).
+`push_to_main` and `force_push` no longer take `off`: a stored `off` from
+v0.1.3 now reads as `ask`.
+
 ### The destructive-command guard
 
 - **What it denies.** An explicit `rm` whose targets are not literal paths
@@ -443,26 +458,34 @@ to do. It never carries the command or a path from it. Known limits are in
   Configuration that can define a git alias or re-point a push
   (`git -c alias.…`, `--config-env`, `GIT_CONFIG_*`) asks even with no push
   word.
-- **Options.** Three, set in `/config` or with
-  `claude plugin configure rails@harness-core`: `push_to_main` (default
-  `ask`), `force_push` (default `ask`) and `commit_style` (default `off`), each
-  `ask`, `deny` or `off`. A push the guard cannot read takes the stricter of
+- **Options.** Three, and setting them is optional: `push_to_main` and
+  `force_push` take `ask` (the default, and the floor) or `deny`, and
+  `commit_style` takes `off` (the default), `ask` or `deny`. Set them in
+  `/config` or with `claude plugin configure rails@harness-core`. Until all
+  three are stored, Claude Code does not run the hook that reads them, and the
+  defaults apply. A push the guard cannot read takes the stricter of
   the first two. With `commit_style` on, the first `-m` message of a top-level
   `git commit` must start with a conventional prefix (`feat:`, `fix:`, `docs:`,
   `refactor:`, `chore:`, `test:`, `ci:`, `build:`, `perf:`, `style:` or
   `revert:`, with an optional scope in parentheses and an optional `!`);
   `--amend`, `--fixup`, `--squash`, `-F`, `-C` and `-c` are exempt, and a
   message it cannot read (a variable, a substitution) fails the check. The
-  options reach the guard only as its own hook arguments, which Claude Code
-  fills from your user or managed settings; no environment variable sets
-  them. A value other than `ask`, `deny` or `off` denies when its check fires,
-  and the reason names the option.
+  defaults are written into the plugin's hooks file: the git guard runs twice
+  on each Bash call, once with the defaults, on every install, and once with
+  your stored options, which speaks only where a stored option is stricter
+  than the default. So a stored option can only make a gate stricter, and no
+  environment variable, and so no project setting, changes either. A stored
+  value other than `ask`, `deny` or `off` denies when its check fires, and
+  the reason names the option.
 - **Never allows.** It asks, denies or stays silent, and Claude Code's own
   permission flow decides the rest.
 - **It fails closed.** As the destructive guard: a missing program, an
   engine crash, malformed engine output, engine stderr beside a silent
   verdict, an adapter fault, a signal or malformed hook input is a deny with
-  a named reason, and the hook runs with `"onFailure": "block"`.
+  a named reason, and the hook with the defaults runs with
+  `"onFailure": "block"`. The hook with your stored options does not, so it
+  cannot block a command while the options are unstored; if it cannot start
+  or times out, the defaults still apply (see KNOWN-LIMITS.md).
 - **What it needs.** `jq`, `wc` and `tr` from the same trusted roots,
   `/usr/bin/perl`, `/usr/bin/env` and `/bin/bash`; and, only when a bare or
   `HEAD` push needs the current branch, `git` from the same roots. It asks
