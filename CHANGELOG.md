@@ -3,6 +3,37 @@
 Each tag of this repository gets an entry: what changed in the vendored files,
 and any pin move of the vendored ledger.
 
+## v0.1.5
+
+README fixes from the second fresh-home walk, and a correction to the v0.1.4
+notes. No plugin changes: `harness` and `rails` stay at 0.1.1.
+
+- The install block says which tag to use: the README names the current
+  release tag (`v0.1.5`), says each release moves it, and gives one
+  `git ls-remote --tags` command, and the Tags page, for reading the newest.
+  A test ties the named tag to the top entry of this file.
+- Asking a session for a `ledger` command: the README now says to ask the
+  session to paste the command's output into its reply, because Claude Code
+  collapses a tool's output and a session can say the output is above when it
+  cannot be seen.
+- The prerequisites name a git `user.name` and `user.email`: the ticket
+  skill makes commits, and without them git signs each with an address it
+  makes up from the machine's name.
+- The README says what to answer to the optional settings changes: the
+  sandbox switch (no is safe, and what saying no gives up) and the six deny
+  rules (yes is recommended, and no is safe).
+- The README explains the version column of `claude plugin list`: it shows
+  each plugin's own version, so `harness` and `rails` show 0.1.1 at this
+  repository's tag and `sdlc` shows 0.15.0, the skills release `v1.5.0` at
+  the pinned commit. A test ties the numbers to the two plugin manifests, the
+  marketplace pin and this file.
+- Uninstall: the README gives the one command that confirms the two rules
+  files are gone, and marks `search.db` in the leftovers table as present
+  only if `ledger search` ever ran.
+- Correction to the v0.1.4 notes below: they said `KNOWN-LIMITS.md` "drops
+  one line". That line was added and removed after v0.1.3, so against v0.1.3
+  the file only gained the five lines from the rails fix.
+
 ## v0.1.4
 
 - The `rails` git guard runs on a plain install, headless and interactive. At

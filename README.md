@@ -147,7 +147,10 @@ plugin pinned here is `sdlc` at `v1.5.0` (commit
 that "First use" below names. Install, update and uninstall work as written
 below.
 
-You need Claude Code, `git`, network access to GitHub, and Python 3.11 or later
+You need Claude Code, `git` with your name and email set (`git config --global
+user.name` and `git config --global user.email`: the ticket skill makes
+commits, and without them git signs each one with an address it makes up from
+the machine's name), network access to GitHub, and Python 3.11 or later
 for the ledger's command. The repository must be public or shared with your
 account. Run the install commands in a shell, not in a session. Add the
 marketplace by its full URL with `#<tag>`: that form checks out exactly the
@@ -163,8 +166,20 @@ claude plugin install harness@harness-core
 claude plugin list
 ```
 
-`vX.Y.Z` is a release tag of this repository. The list shows `harness`, `sdlc`
-and `ledger-hooks` enabled. Start a new session, or run `/reload-plugins` in an
+`vX.Y.Z` is a release tag of this repository: use the current one, which is
+`v0.1.5`. Each release moves it, so if this text may be older than the
+repository, read the newest tag on the repository's Tags page on GitHub, or run
+one command and take the highest version it lists:
+
+```text
+git ls-remote --tags https://github.com/smithadifd/harness-core.git
+```
+
+The list shows `harness`, `sdlc` and `ledger-hooks` enabled. Its version
+column is each plugin's own version, not this repository's tag: `harness` and
+`rails` show 0.1.1, the version in their manifests at this repository's tag,
+and `sdlc` shows 0.15.0, which is the skills release `v1.5.0` at the pinned
+commit. Start a new session, or run `/reload-plugins` in an
 open one, to load them. On its first run in a folder, Claude Code asks whether
 you trust it, and the highlighted answer is "No, exit": move to "Yes" before
 you press Enter.
@@ -232,6 +247,18 @@ or reordered, and each addition is recorded so uninstall can take out exactly
 it. Setup never proposes anything that grants: no allow rule, no extra
 directory, no automatic permission for sandboxed commands.
 
+If you are unsure what to answer to the optional changes:
+
+- **The sandbox switch.** No is safe. Yes runs the agent's shell commands
+  inside Claude Code's sandbox, which limits what they can write and reach on
+  the network, so a command that needs more can fail or ask first. If you say
+  no, you give up that confinement, and the permission prompts still apply.
+  Say yes when you want it.
+- **The six deny rules.** Yes is recommended. They stop the agent reading
+  `.env` files and `.pem` and `.key` files, and the cost is a refused read when
+  you do want it to see one, in which case you paste what it needs. No is
+  safe: you give up that stop.
+
 Claude Code 2.1.326 makes auto mode the default permission mode for new
 accounts. In auto mode a command that you expect to prompt can simply run, so
 where this README says a command asks or prompts, it means the manual
@@ -273,9 +300,11 @@ The ledger is where your work's state lives, and the `ticket` skill (from the
   and the command that continues it.
 - **The `ledger` command.** It is on the PATH of a Claude Code session, not of
   your own shell: in a terminal, `ledger` is "command not found". Run it
-  through a session (ask for the command by name), and the session already
-  holds your stored database path and operator. The subcommands a person
-  needs:
+  through a session: ask for the command by name, and ask the session to paste
+  the command's output into its reply, because Claude Code collapses a tool's
+  output ("Ran 1 shell command") and a session can say the output is above
+  when you cannot see it. The session already holds your stored database path
+  and operator. The subcommands a person needs:
 
   | Command | What it shows |
   |---|---|
@@ -391,6 +420,16 @@ claude plugin list
 The list then shows none of the four (`harness`, `sdlc`, `ledger-hooks` and
 `rails`). Steps 2 and 3 were confirmed on Claude Code 2.1.325.
 
+The remove command's output does not list the placed files, so to confirm step
+1 took the two rules files out, run this in a terminal:
+
+```text
+ls $HOME/.claude/rules/harness.md $HOME/.claude/rules/harness-local.md
+```
+
+Each should be reported as "No such file or directory". The second stays if
+you edited it, and uninstall named it.
+
 #### What is left after uninstall
 
 Claude Code leaves its own plugin cache until its sweep, its plugin
@@ -401,7 +440,7 @@ this, and nothing else:
 |---|---|
 | `.claude/harness-setup.lock` | the empty lock file, which setup never deletes |
 | `.local/share/ledger/ledger.db` | the ledger database: your data, kept unless you ask for it to be deleted |
-| `.local/share/ledger/search.db` | the ledger's search index, made beside the database; it can be rebuilt, so it is yours to delete |
+| `.local/share/ledger/search.db` | the ledger's search index, made beside the database only if `ledger search` ever ran; it can be rebuilt, so it is yours to delete |
 | `.local/share/ledger/ledger.db.session-models` | a folder the ledger makes beside the database, of per-session records; it goes with the database if you delete that |
 | `.local` | made to hold the database, if it did not exist before |
 | `.local/share` | the same |
