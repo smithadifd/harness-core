@@ -3,6 +3,24 @@
 Each tag of this repository gets an entry: what changed in the vendored files,
 and any pin move of the vendored ledger.
 
+## Unreleased
+
+- The `rails` git guard runs on a plain install, headless and interactive. At
+  v0.1.3 its one hook read all three options, and Claude Code skips such a
+  hook until every option is stored, so with nothing stored the git guard did
+  not run in `claude -p` and, in an interactive session, failed and blocked
+  every Bash command. `plugins/rails/hooks/hooks.json` now runs the guard
+  twice: a floor hook with the defaults written in (`ask`, `ask`, `off`),
+  which references no option and keeps `"onFailure": "block"`, and a hook with
+  the stored options and the new `--tighten-only` argument, which speaks only
+  where a stored option is stricter than its default and has no
+  `onFailure`. No environment variable, and so no project setting, sets an
+  option. `push_to_main` and `force_push` now take `ask` or `deny` only: `off`
+  is gone, and an `off` stored from v0.1.3 now reads as `ask`. `commit_style`
+  keeps `off`, `ask` and `deny`. The `rails` plugin's version moves from 0.1.0
+  to 0.1.1. Someone who installed v0.1.3 moves to the new tag and installs
+  `rails` again (README, "If you installed v0.1.3").
+
 ## v0.1.3
 
 - The `rails` plugin, a second plugin in the `harness-core` marketplace

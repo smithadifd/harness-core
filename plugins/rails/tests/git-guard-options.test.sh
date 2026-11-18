@@ -5,6 +5,10 @@
 # ${user_config.KEY} text, is the default; any other value is invalid and
 # denies by name when its gate fires, and never otherwise. A presumed push
 # takes the stricter of the two push options.
+# T: hooks.json runs the guard twice (WALKFIX-HC design § 4.3): the floor
+# with the literal defaults on every install, and the stored-options hook,
+# --tighten-only, only once all three options are stored; the verdict is the
+# stricter of the two, never weaker than the floor (gg_pair).
 # Command strings are inert JSON data and are never executed.
 set -u
 LC_ALL=C
@@ -144,5 +148,79 @@ gg_row_at "$REPO_FEATURE" $'GT:1720 feature-branch push is never gated (sanity)'
 GG_COMMIT=off
 GG_MAIN=ask
 GG_FORCE=ask
+
+printf '%s\n' '== T: the floor and the stored-options hook, as hooks.json runs them =='
+PLAIN='git status'
+for env_set in none all-off; do
+  if [ "$env_set" = none ]; then
+    set --
+  else
+    set -- CLAUDE_PLUGIN_OPTION_PUSH_TO_MAIN=off CLAUDE_PLUGIN_OPTION_FORCE_PUSH=off CLAUDE_PLUGIN_OPTION_COMMIT_STYLE=off
+  fi
+  gg_pair - - - "$M1" "$@"
+  gg_expect "T1 none stored (option variables: $env_set), a push to main" ask:push_main_branch
+  gg_pair_hook 1 skipped "T1 none stored ($env_set): the stored-options hook does not run"
+  gg_pair - - - "$F1" "$@"
+  gg_expect "T2 none stored (option variables: $env_set), a force-push" ask:push_force
+  gg_pair - - - "$K2" "$@"
+  gg_expect "T3 none stored (option variables: $env_set), a non-conventional commit" silent
+done
+set --
+gg_pair deny - - "$M1"
+gg_expect "T4 only push_to_main stored (deny): a push to main asks" ask:push_main_branch
+gg_pair_hook 1 skipped "T4 the stored-options hook does not run while an option is unstored"
+gg_pair ask ask off "$M1"
+gg_expect "T5 all stored at the defaults, a push to main" ask:push_main_branch
+gg_pair_hook 0 ask:push_main_branch "T5 the floor asks before a push to main"
+gg_pair_hook 1 silent "T5 the stored-options hook is silent at the defaults (push to main)"
+gg_pair ask ask off "$F1"
+gg_expect "T5 all stored at the defaults, a force-push" ask:push_force
+gg_pair_hook 1 silent "T5 the stored-options hook is silent at the defaults (force-push)"
+gg_pair deny ask off "$M1"
+gg_expect "T6 push_to_main=deny stored, a push to main" deny:push_main_branch
+gg_pair_hook 1 deny:push_main_branch "T6 the deny is the stored-options hook's"
+gg_pair ask deny off "$F1"
+gg_expect "T7 force_push=deny stored, a force-push" deny:push_force
+gg_pair_hook 1 deny:push_force "T7 the deny is the stored-options hook's"
+gg_pair off ask off "$M1"
+gg_expect "T8 push_to_main=off stored (v0.1.3), a push to main asks" ask:push_main_branch
+gg_pair off off off "$F1"
+gg_expect "T8 force_push=off stored (v0.1.3), a force-push asks" ask:push_force
+gg_pair ask ask ask "$K2"
+gg_expect "T9 commit_style=ask stored, a non-conventional commit" ask:commit_nonconventional
+gg_pair ask ask deny "$K2"
+gg_expect "T9 commit_style=deny stored, a non-conventional commit" deny:commit_nonconventional
+gg_pair allow ask off "$M1"
+gg_expect "T10 push_to_main=allow stored, a push to main" deny:option_invalid_push_to_main
+gg_pair allow ask off "$PLAIN"
+gg_expect "T10 push_to_main=allow stored, git status" silent
+gg_pair ask yes off "$F1"
+gg_expect "T10b force_push=yes stored, a force-push" deny:option_invalid_force_push
+gg_pair ask yes off "$PLAIN"
+gg_expect "T10b force_push=yes stored, git status" silent
+gg_pair ask ask Ask "$K2"
+gg_expect "T10c commit_style=Ask stored, a non-conventional commit" deny:option_invalid_commit_style
+gg_pair ask ask Ask "$PLAIN"
+gg_expect "T10c commit_style=Ask stored, git status" silent
+gg_pair deny ask off "$P_U1"
+gg_expect "T11 push_to_main=deny, force_push=ask stored, a presumed push" deny:push_unreadable_word
+
+printf '%s\n' '== T24: --tighten-only once, in adapter mode only =='
+gg_hook_args "$REPO_FEATURE" "$M1" --tighten-only --push-to-main deny --force-push ask --commit-style off
+gg_expect "T24 control: --tighten-only once with push_to_main=deny" deny:push_main_branch
+gg_hook_args "$REPO_FEATURE" 'git status' --tighten-only --tighten-only --push-to-main ask --force-push ask --commit-style off
+gg_expect "T24 --tighten-only twice" deny:invalid_configuration
+gg_hook_args "$REPO_FEATURE" 'git status' --push-to-main ask --tighten-only --force-push ask --commit-style off --tighten-only
+gg_expect "T24 --tighten-only twice, apart" deny:invalid_configuration
+for near in --tighten-only=1 --TIGHTEN-ONLY --tighten_only '--tighten-only ' -tighten-only --tighten; do
+  gg_hook_args "$REPO_FEATURE" 'git status' "$near" --push-to-main ask --force-push ask --commit-style off
+  gg_expect "T24 a near miss '$near'" deny:invalid_configuration
+done
+gg_policy "$REPO_FEATURE" "$M1" --tighten-only --push-to-main ask --force-push ask --commit-style off
+if [ "$OUT" = '{"decision":"deny","reason":"invalid_configuration"}' ]; then pass "T24 --policy --tighten-only"; else fail "T24 --policy --tighten-only: $OUT"; fi
+T24_INPUT="$("$JQ" -cn --arg cwd "$REPO_FEATURE" --arg command "$M1" '{cwd:$cwd,command:$command}')"
+OUT="$(cd "$T" && printf '%s' "$T24_INPUT" | /usr/bin/env -i HOME="$GG_HOME" PATH="$GG_PATH" \
+  /bin/bash --noprofile --norc -p "$GUARD" --tighten-only --policy --push-to-main ask --force-push ask --commit-style off 2>/dev/null)"
+if [ "$OUT" = '{"decision":"deny","reason":"invalid_configuration"}' ]; then pass "T24 --tighten-only --policy"; else fail "T24 --tighten-only --policy: $OUT"; fi
 
 gg_finish OPTIONS

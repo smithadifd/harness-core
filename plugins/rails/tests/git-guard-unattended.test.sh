@@ -12,6 +12,10 @@
 #   U-LOG the guard log: armed only by an existing absolute SEAT_SCRATCH in an
 #      attended session, one JSON line per ask or deny, no command text.
 #   U-DORM unarmed, nothing is written anywhere under HOME.
+#   T12-T23 a project's settings env reaches both git guard hooks of
+#      hooks.json (the floor and the stored-options hook, run by gg_pair): an
+#      option variable changes nothing, and the loop variables only turn an ask
+#      into a deny or write a record (WALKFIX-HC design § 4.4, § 4.6).
 # Command strings are inert JSON data and are never executed.
 set -u
 LC_ALL=C
@@ -127,5 +131,77 @@ gg_expect "U-DORM an unarmed deny" deny:commit_nonconventional
 GG_COMMIT=off
 GG_HOME="$GG_HOME_SAVED"
 if [ -z "$(find "$DORM_HOME" -mindepth 1 -print)" ]; then pass "U-DORM no file anywhere under HOME"; else fail "U-DORM files under HOME: $(find "$DORM_HOME" -mindepth 1 -print | tr '\n' ' ')"; fi
+
+printf '%s\n' '== T12-T17 a project option variable changes no verdict =='
+M1='git push origin main'
+F1='git push -f origin feature'
+K2='git commit -m nope'
+gg_pair - - - "$M1" CLAUDE_PLUGIN_OPTION_PUSH_TO_MAIN=off
+gg_expect "T12 none stored, CLAUDE_PLUGIN_OPTION_PUSH_TO_MAIN=off, a push to main" ask:push_main_branch
+gg_pair - - - "$F1" CLAUDE_PLUGIN_OPTION_FORCE_PUSH=off
+gg_expect "T13 none stored, CLAUDE_PLUGIN_OPTION_FORCE_PUSH=off, a force-push" ask:push_force
+gg_pair ask ask deny "$K2" CLAUDE_PLUGIN_OPTION_COMMIT_STYLE=off
+gg_expect "T14 commit_style=deny stored, CLAUDE_PLUGIN_OPTION_COMMIT_STYLE=off, a commit" deny:commit_nonconventional
+gg_pair deny ask off "$M1" CLAUDE_PLUGIN_OPTION_PUSH_TO_MAIN=ask
+gg_expect "T15 push_to_main=deny stored, CLAUDE_PLUGIN_OPTION_PUSH_TO_MAIN=ask, a push to main" deny:push_main_branch
+for value in ask off; do
+  gg_pair ask deny off "$F1" "CLAUDE_PLUGIN_OPTION_FORCE_PUSH=$value"
+  gg_expect "T15b force_push=deny stored, CLAUDE_PLUGIN_OPTION_FORCE_PUSH=$value, a force-push" deny:push_force
+done
+gg_pair - - - "$M1" CLAUDE_PLUGIN_OPTION_PUSH_TO_MAIN=deny
+gg_expect "T16 none stored, CLAUDE_PLUGIN_OPTION_PUSH_TO_MAIN=deny is ignored" ask:push_main_branch
+gg_pair - - - "$F1" CLAUDE_PLUGIN_OPTION_FORCE_PUSH=deny
+gg_expect "T16b none stored, CLAUDE_PLUGIN_OPTION_FORCE_PUSH=deny is ignored" ask:push_force
+gg_pair - - - "$K2" CLAUDE_PLUGIN_OPTION_COMMIT_STYLE=deny
+gg_expect "T17 none stored, CLAUDE_PLUGIN_OPTION_COMMIT_STYLE=deny is ignored" silent
+
+printf '%s\n' '== T18-T23 the loop variables from a project only tighten =='
+gg_pair - - - "$M1" CLAUDE_SEAT_UNATTENDED=1
+gg_expect "T18 none stored, CLAUDE_SEAT_UNATTENDED=1, a push to main" deny:push_main_branch
+case "${PAIR_OUTS[0]:-}" in
+  *'the session is unattended, so a confirmation is a denial'*) pass "T18 the deny carries the unattended clause" ;;
+  *) fail "T18 the unattended clause: ${PAIR_OUTS[0]:-}" ;;
+esac
+for value in 0 true ''; do
+  gg_pair - - - "$M1" "CLAUDE_SEAT_UNATTENDED=$value"
+  gg_expect "T19 none stored, CLAUDE_SEAT_UNATTENDED='$value', a push to main" ask:push_main_branch
+done
+T20_W="$T/t20-writable"
+T20_RO="$T/t20-unwritable"
+mkdir -p "$T20_W" "$T20_RO"
+chmod 0500 "$T20_RO"
+gg_pair - - - "$M1" CLAUDE_SEAT_UNATTENDED=1 "SEAT_SCRATCH=$T20_W"
+gg_expect "T20 unattended, a writable SEAT_SCRATCH" deny:push_main_branch
+if [ -f "$T20_W/owed.log" ] && [ "$(wc -l <"$T20_W/owed.log" | tr -d ' ')" = 1 ]; then pass "T20 one owed record in the writable folder"; else fail "T20 the writable folder's owed.log: $(cat "$T20_W/owed.log" 2>&1)"; fi
+gg_pair - - - "$M1" CLAUDE_SEAT_UNATTENDED=1 "SEAT_SCRATCH=$T20_RO"
+gg_expect "T20 unattended, an unwritable SEAT_SCRATCH" deny:push_main_branch
+if printf '%s\n' "${PAIR_ERRS[0]:-}" | grep -qxF "rails git-guard: unattended denial not recorded: could not append to $T20_RO/owed.log"; then pass "T20 the could-not-append line on stderr"; else fail "T20 stderr: ${PAIR_ERRS[0]:-}"; fi
+if [ ! -e "$T20_RO/owed.log" ]; then pass "T20 no record in the unwritable folder"; else fail "T20 a record in the unwritable folder"; fi
+chmod 0700 "$T20_RO"
+T21="$T/t21-project"
+mkdir -p "$T21"
+gg_pair - - - "$M1" "SEAT_SCRATCH=$T21"
+gg_expect "T21 attended, SEAT_SCRATCH a project folder" ask:push_main_branch
+if [ -f "$T21/guard.log" ] && [ "$(wc -l <"$T21/guard.log" | tr -d ' ')" = 1 ]; then pass "T21 one guard.log line"; else fail "T21 guard.log: $(cat "$T21/guard.log" 2>&1)"; fi
+if grep -q 'git push' "$T21/guard.log" 2>/dev/null; then fail "T21 guard.log holds command text"; else pass "T21 guard.log holds no command text"; fi
+mkdir -p "$T/t22rel"
+gg_pair - - - "$M1" SEAT_SCRATCH=t22rel
+gg_expect "T22 SEAT_SCRATCH relative" ask:push_main_branch
+if [ -z "$(find "$T/t22rel" -mindepth 1 -print)" ]; then pass "T22 nothing written for a relative SEAT_SCRATCH"; else fail "T22 a relative SEAT_SCRATCH was written"; fi
+gg_pair - - - "$M1" "SEAT_SCRATCH=$T/t22-no-such"
+gg_expect "T22 SEAT_SCRATCH names no folder" ask:push_main_branch
+if [ ! -e "$T/t22-no-such" ]; then pass "T22 nothing made for a missing SEAT_SCRATCH"; else fail "T22 a missing SEAT_SCRATCH was made"; fi
+T22_SYM="$T/t22-sym"
+mkdir -p "$T22_SYM"
+ln -s "$T/t22-target" "$T22_SYM/guard.log"
+gg_pair - - - "$M1" "SEAT_SCRATCH=$T22_SYM"
+gg_expect "T22 guard.log a symlink" ask:push_main_branch
+if [ ! -e "$T/t22-target" ]; then pass "T22 the symlink's target was not written"; else fail "T22 the symlink was followed"; fi
+T23="$T/t23-seat"
+mkdir -p "$T23"
+gg_pair deny ask off "$M1" CLAUDE_SEAT_UNATTENDED=1 "SEAT_SCRATCH=$T23"
+gg_expect "T23 push_to_main=deny stored, unattended" deny:push_main_branch
+gg_pair_hook 1 deny:push_main_branch "T23 the stored-options hook denies"
+if [ -f "$T23/owed.log" ] && [ "$(wc -l <"$T23/owed.log" | tr -d ' ')" = 1 ]; then pass "T23 exactly one owed record (the floor's converted ask)"; else fail "T23 owed.log: $(cat "$T23/owed.log" 2>&1)"; fi
 
 gg_finish UNATTENDED
