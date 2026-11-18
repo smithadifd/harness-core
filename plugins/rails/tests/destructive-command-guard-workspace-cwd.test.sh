@@ -10,7 +10,8 @@
 #     stay as regressions of its removal;
 #   - a path inside a repository or a worktree (registered lane roots
 #     included), a path outside the scratchpad, a variable-derived path and a
-#     home-relative spelling keep their refusals;
+#     home-relative spelling keep their refusals; a home-relative spelling,
+#     quoted or not, is refused as unsafe_rm;
 #   - a relative target, and any worktree removal that needs the cwd's
 #     worktree, are refused with reason cwd_outside_worktree;
 #   - a relative, non-canonical or missing cwd, or one inside a repository
@@ -178,7 +179,9 @@ run_case "a .git path" deny "$WORKSPACE" "rm -rf $WORK_REPO/.git" unsafe_rm
 run_case "a dot-dot spelling" deny "$WORKSPACE" "rm -f $WORK/batch/../batch/file.md" unsafe_rm
 run_case "variable-derived path" deny "$WORKSPACE" 'rm -f "$X/file"' unsupported_syntax
 run_case "variable-derived path with no flag" deny "$WORKSPACE" 'rm "$X/file"' unsupported_syntax
-run_case "home-relative path" deny "$WORKSPACE" 'rm -f ~/notes/batch/file.md' unsupported_syntax
+# A home spelling the guard does not expand denies as unsafe_rm, as its quoted
+# spelling on the next line does.
+run_case "home-relative path" deny "$WORKSPACE" 'rm -f ~/notes/batch/file.md' unsafe_rm
 run_case "quoted home-relative path" deny "$WORKSPACE" "rm -f '~/notes/batch/file.md'" unsafe_rm
 run_case "quoted \$HOME path" deny "$WORKSPACE" "rm -f '\$HOME/notes/batch/file.md'" unsafe_rm
 run_case "the root folder" deny "$WORKSPACE" "rm -rf /" unsafe_rm

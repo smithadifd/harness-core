@@ -74,7 +74,9 @@ deny R1 unsupported_syntax '2>/dev/null rm -rf /'
 deny R2 unsupported_syntax '</dev/null rm -rf /'
 deny R3 unsupported_syntax 'FOO=1 2>/dev/null rm -rf /'
 deny R4 unsupported_syntax 'sudo 2>/dev/null rm -rf /'
-deny R5 unsupported_syntax 'echo hi && 2>/dev/null rm -rf ~'
+# R5 holds a home spelling (~), so its deny names unsafe_rm, as every
+# home-folder spelling does (the home-spelling suite's K8).
+deny R5 unsafe_rm 'echo hi && 2>/dev/null rm -rf ~'
 deny R6 unsupported_syntax '2> /dev/null rm -f /etc/hosts'
 deny R7 unsupported_syntax 'rm>/dev/null -rf /'
 deny R8 unsafe_worktree_remove '2>/dev/null git worktree remove --force /tmp/x'

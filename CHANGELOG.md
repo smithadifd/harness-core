@@ -20,6 +20,17 @@ and any pin move of the vendored ledger.
   keeps `off`, `ask` and `deny`. The `rails` plugin's version moves from 0.1.0
   to 0.1.1. Someone who installed v0.1.3 moves to the new tag and installs
   `rails` again (README, "If you installed v0.1.3").
+- The destructive-command guard now names `unsafe_rm`, with its hint, when it
+  denies an rm that holds a home-folder spelling it does not expand (`~`,
+  `~/x`, `~user/x`, `$HOME`, `$HOME/x`, `${HOME}`, `${HOME}/x`), as the
+  README says. It named `unsupported_syntax`, whose hint speaks of an
+  over-long or unbalanced command, which read as a misfire. The dollar
+  spellings deny as `unsafe_rm` quoted or not; a quoted tilde is a literal
+  name, judged like any other relative path. Only the reason changes: every
+  command that denied still denies, and no silent command changes. When a
+  segment that fails to parse holds any word that is a home spelling, the
+  deny names `unsafe_rm`; otherwise it keeps `unsupported_syntax`. The
+  `rails` plugin's version moves to 0.1.1.
 
 ## v0.1.3
 
