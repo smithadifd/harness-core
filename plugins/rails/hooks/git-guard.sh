@@ -89,10 +89,10 @@ adapter_fail_closed() { # CODE: adapter_failed | adapter_interrupted
   VERDICT_STARTED=1
   case "$1" in
     adapter_interrupted)
-      printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Git guard denied the command (reason=adapter_interrupted): the guard'"'"'s adapter was stopped by a signal; retry once."}}' || exit 3
+      printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Git guard denied the command (reason=adapter_interrupted): the guard'"'"'s adapter was stopped by a signal; retry once. This deny is final: never use or offer a ! command at the prompt, a sandbox override, or a settings, permission or allowlist change to get around it; tell the person the guard denied it, and that running the command themselves is their own call."}}' || exit 3
       ;;
     *)
-      printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Git guard denied the command (reason=adapter_failed): the guard'"'"'s adapter failed; retry once and report the code if it repeats."}}' || exit 3
+      printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Git guard denied the command (reason=adapter_failed): the guard'"'"'s adapter failed; retry once and report the code if it repeats. This deny is final: never use or offer a ! command at the prompt, a sandbox override, or a settings, permission or allowlist change to get around it; tell the person the guard denied it, and that running the command themselves is their own call."}}' || exit 3
       ;;
   esac
   VERDICT_DONE=1
@@ -276,12 +276,12 @@ ROOTS_HINT="/usr/bin, /bin, /usr/local/bin, /opt/homebrew/bin or /home""/linuxbr
 VERDICT_HINT=""
 verdict_hint() {
   case "$1" in
-    push_main_branch) VERDICT_HINT="this push updates main or master; confirm it, or set the rails plugin's push_to_main option" ;;
+    push_main_branch) VERDICT_HINT="this push updates main or master, which the rails plugin's push_to_main option guards" ;;
     push_main_unresolved) VERDICT_HINT='the guard could not tell which branch this push updates (the current branch, the folder or the repository is unknown), so it treats it as a push to main' ;;
     push_config_remap) VERDICT_HINT="git configuration (push.default, or a remote's push or mirror setting) decides what this push updates, so the guard treats it as a push to main" ;;
     push_all_branches) VERDICT_HINT='--all, --branches or --mirror pushes every branch, main included' ;;
     push_matching_refspec|push_pattern_refspec) VERDICT_HINT='a matching or wildcard refspec can update main' ;;
-    push_force) VERDICT_HINT="this is a force-push (--force, --force-with-lease, --force-if-includes, -f or a + refspec); confirm it, or set the rails plugin's force_push option" ;;
+    push_force) VERDICT_HINT="this is a force-push (--force, --force-with-lease, --force-if-includes, -f or a + refspec), which the rails plugin's force_push option guards" ;;
     push_delete) VERDICT_HINT='this deletes a remote branch (--delete, -d or a :branch refspec)' ;;
     push_mirror) VERDICT_HINT='--mirror force-updates and deletes every ref on the remote' ;;
     push_prune) VERDICT_HINT='--prune deletes remote branches' ;;
@@ -317,9 +317,9 @@ verdict_hint() {
     push_command_too_long) VERDICT_HINT='the command is over 6000 bytes; push in a shorter command of its own' ;;
     commit_nonconventional) VERDICT_HINT="the commit message's first line does not start with a conventional prefix: feat, fix, docs, refactor, chore, test, ci, build, perf, style or revert, an optional scope in parentheses, an optional !, then a colon and a space" ;;
     commit_message_unreadable) VERDICT_HINT='the guard cannot read the commit message (a variable, a substitution or an unquoted heredoc), so it cannot check its conventional prefix; write the message literally, or to a file and use git commit -F' ;;
-    option_invalid_push_to_main) VERDICT_HINT="the rails plugin's push_to_main option holds a value other than ask, deny or off; set it in /config" ;;
-    option_invalid_force_push) VERDICT_HINT="the rails plugin's force_push option holds a value other than ask, deny or off; set it in /config" ;;
-    option_invalid_commit_style) VERDICT_HINT="the rails plugin's commit_style option holds a value other than ask, deny or off; set it in /config" ;;
+    option_invalid_push_to_main) VERDICT_HINT="the rails plugin's push_to_main option holds a value other than ask, deny or off, a configuration fault for the person to fix in /config" ;;
+    option_invalid_force_push) VERDICT_HINT="the rails plugin's force_push option holds a value other than ask, deny or off, a configuration fault for the person to fix in /config" ;;
+    option_invalid_commit_style) VERDICT_HINT="the rails plugin's commit_style option holds a value other than ask, deny or off, a configuration fault for the person to fix in /config" ;;
     unsupported_syntax) VERDICT_HINT='the command is over 6000 bytes or has an unbalanced substitution or quote; split or shorten it' ;;
     invalid_configuration) VERDICT_HINT="the guard's working folder or options are invalid; this is a configuration fault, not the command" ;;
     dependency_missing_jq) VERDICT_HINT="jq was not found in $ROOTS_HINT; install jq in one of them" ;;
@@ -500,7 +500,7 @@ emit_claude_verdict() { # DECISION CODE
   if [ "$decision" = ask ]; then
     printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"ask","permissionDecisionReason":"Git guard asks before this command (reason=%s): %s."}}\n' "$code" "$hint" || exit 3
   else
-    printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Git guard denied the command (reason=%s): %s."}}\n' "$code" "$hint" || exit 3
+    printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Git guard denied the command (reason=%s): %s. This deny is final: never use or offer a ! command at the prompt, a sandbox override, or a settings, permission or allowlist change to get around it; tell the person the guard denied it, and that running the command themselves is their own call."}}\n' "$code" "$hint" || exit 3
   fi
   VERDICT_DONE=1
   audit_record "git-guard-$decision" "$code"

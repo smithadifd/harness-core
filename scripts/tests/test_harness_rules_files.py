@@ -95,8 +95,9 @@ GRANT_SHAPED = (
 # passes, falsifiable evidence, the human merge, CI read per job with every
 # gating job a success and the merge pinned to its head, a bug waiver only
 # from the human who merges and never from the change's own author, live
-# reach, sandboxed delegated work, no bypassed safety check, and the pointer to
-# the override file. A phrase alone does not hold a rule's meaning (a rule can
+# reach, sandboxed delegated work, no bypassed safety check, a guard's deny
+# that is final with no way around it offered, and the pointer to the override
+# file. A phrase alone does not hold a rule's meaning (a rule can
 # be negated and keep every phrase), so these only prove that CORE_RULES below,
 # which pins whole lines, still covers each one.
 REQUIRED_PHRASES = (
@@ -110,6 +111,8 @@ REQUIRED_PHRASES = (
     "live reach",
     "Subagents and background jobs run sandboxed by default",
     "Never bypass a safety check",
+    "A guard's deny is final.",
+    "Never use or offer a way around it",
     "Three review rounds at most",
     "open bug finding",
     "written or explicitly approved by the human who merges",
@@ -175,6 +178,7 @@ CORE_RULES: dict[str, tuple[str, ...]] = {
         "- Pin the merge to the reviewed head (`gh pr merge --match-head-commit <sha>`), so a commit pushed after the review cannot land with it.",
         "- Ask before anything with live reach, and wait for the answer: deploys, live hooks and wrappers, scheduled jobs, secrets, settings files, and any edit that changes who may approve or merge. This holds even where merging is otherwise granted.",
         "- Never bypass a safety check (`--no-verify`, skipped hooks). Ask before a destructive operation: a force-push, a history rewrite, a hard reset, a dropped table.",
+        "- A guard's deny is final. Never use or offer a way around it: a `!` command at the prompt, a sandbox override, or a settings, permission or allowlist change. Tell the person the guard denied it; running the command themselves is their own call.",
     ),
     "Delegated work": (
         "- Subagents and background jobs run sandboxed by default. A sandbox block is a signal to the session that delegated the work: it widens the sandbox for that one task, with a one-line reason it records, or takes the step itself. It is never a reason to drop the task.",
@@ -408,6 +412,10 @@ MUTATIONS = {
     "live-reach-no-ask": _replace("Ask before anything with live reach, and wait for the answer", "Do not ask before anything with live reach"),
     "live-reach-grant-wins": _replace(" This holds even where merging is otherwise granted.", ""),
     "safety-check-bypassed": _replace("Never bypass a safety check", "Always bypass a safety check"),
+    "guard-deny-not-final": _replace("A guard's deny is final.", "A guard's deny can be retried another way."),
+    "guard-bypass-offered": _replace("Never use or offer a way around it", "Offer a way around it"),
+    "guard-bang-command-dropped": _replace("a `!` command at the prompt, a sandbox override", "a sandbox override"),
+    "guard-deny-the-sessions-call": _replace("running the command themselves is their own call", "the session may run the command another way"),
     "sandbox-off": _replace("run sandboxed by default", "run unsandboxed by default"),
     "sandbox-block-drops-task": _replace("It is never a reason to drop the task.", "It is a reason to drop the task."),
     "second-family-always": _replace("applies only when the override names one", "applies always"),

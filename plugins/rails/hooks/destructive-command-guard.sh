@@ -90,10 +90,10 @@ adapter_fail_closed() { # CODE: adapter_failed | adapter_interrupted
   VERDICT_STARTED=1
   case "$1" in
     adapter_interrupted)
-      printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Destructive command guard denied the command (reason=adapter_interrupted): the guard'"'"'s adapter was stopped by a signal; retry once."}}' || exit 3
+      printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Destructive command guard denied the command (reason=adapter_interrupted): the guard'"'"'s adapter was stopped by a signal; retry once. This deny is final: never use or offer a ! command at the prompt, a sandbox override, or a settings, permission or allowlist change to get around it; tell the person the guard denied it, and that running the command themselves is their own call."}}' || exit 3
       ;;
     *)
-      printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Destructive command guard denied the command (reason=adapter_failed): the guard'"'"'s adapter failed; retry once and report the code if it repeats."}}' || exit 3
+      printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Destructive command guard denied the command (reason=adapter_failed): the guard'"'"'s adapter failed; retry once and report the code if it repeats. This deny is final: never use or offer a ! command at the prompt, a sandbox override, or a settings, permission or allowlist change to get around it; tell the person the guard denied it, and that running the command themselves is their own call."}}' || exit 3
       ;;
   esac
   VERDICT_DONE=1
@@ -421,7 +421,7 @@ ROOTS_HINT="/usr/bin, /bin, /usr/local/bin, /opt/homebrew/bin or /home""/linuxbr
 deny_hint() {
   case "$1" in
     unsafe_rm) DENY_HINT='an rm target is not a literal path strictly below the current worktree or the named session scratchpad; spell a worktree target relative to the current folder, because an absolute home path is refused by spelling' ;;
-    unsafe_worktree_remove) DENY_HINT='git worktree remove must name exactly one registered or authorized worktree and never --force; otherwise run the removal yourself, outside Claude Code' ;;
+    unsafe_worktree_remove) DENY_HINT="git worktree remove must name exactly one registered or authorized worktree and never --force; whether to run a denied removal by hand is the person's own call, not something the session offers" ;;
     unsupported_syntax) DENY_HINT='the command is over 6000 bytes or has an unbalanced substitution or quote; split or shorten it' ;;
     hidden_separator) DENY_HINT='this command mentions a removal and holds a quoted or escaped separator or a line continuation; run the removal as its own one-line command, and put any text that mentions it in a file' ;;
     unsupported_rm_prefix) DENY_HINT='rm reached through a wrapper or xargs; write the rm bare with literal targets' ;;
@@ -476,16 +476,16 @@ deny_hint() {
   esac
 }
 
-# Denies with a reason code: the fixed template and the code's hint, printed
-# by one builtin printf between the two verdict flags, then the audit record
-# and the guard log, which fork. The hints hold no characters that need JSON
-# escaping.
+# Denies with a reason code: the fixed template, the code's hint and the fixed
+# no-bypass sentence, printed by one builtin printf between the two verdict
+# flags, then the audit record and the guard log, which fork. The hints hold
+# no characters that need JSON escaping.
 emit_claude_deny() {
   local code="${1:-}"
   case "$code" in ''|*[!a-z_]*) code=engine_output_invalid ;; esac
   deny_hint "$code"
   VERDICT_STARTED=1
-  printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Destructive command guard denied the command (reason=%s): %s."}}\n' "$code" "$DENY_HINT" || exit 3
+  printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Destructive command guard denied the command (reason=%s): %s. This deny is final: never use or offer a ! command at the prompt, a sandbox override, or a settings, permission or allowlist change to get around it; tell the person the guard denied it, and that running the command themselves is their own call."}}\n' "$code" "$DENY_HINT" || exit 3
   VERDICT_DONE=1
   redacted_log "$code"
   guard_log_append deny "$code"

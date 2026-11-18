@@ -116,6 +116,41 @@ for code in $(printf '%s\n' $CARRIERS | sed 's/^/removal_beside_/') path_repoint
   fi
 done
 
+printf '%s\n' '== E the deny is final and invites no way around it =='
+# The one sentence every deny line ends with, identical for every reason code.
+NO_BYPASS='This deny is final: never use or offer a ! command at the prompt, a sandbox override, or a settings, permission or allowlist change to get around it; tell the person the guard denied it, and that running the command themselves is their own call.'
+DENY_LINES="$(printf '%s\n' "$CODE" | grep -F '"permissionDecision":"deny"')"
+DENY_COUNT="$(printf '%s\n' "$DENY_LINES" | grep -c .)"
+FINAL_COUNT="$(printf '%s\n' "$DENY_LINES" | grep -cF ". $NO_BYPASS\"}}")"
+if [ "$DENY_COUNT" -eq 3 ] && [ "$FINAL_COUNT" -eq 3 ]; then
+  pass "E1 all three deny lines (the template and the two crash-trap lines) end with the no-bypass sentence"
+else
+  fail "E1 deny lines: $DENY_COUNT, of which end with the no-bypass sentence: $FINAL_COUNT"
+fi
+if printf '%s\n' "$CODE" | grep -qF "(reason=%s): %s. $NO_BYPASS\"}}\\n' \"\$code\" \"\$DENY_HINT\" || exit 3"; then
+  pass "E1 the deny template is the code, its hint, then the no-bypass sentence"
+else
+  fail "E1 the deny template does not end with the hint and then the no-bypass sentence"
+fi
+# A hint never invites the session around the guard: no run-it-yourself, no
+# sandbox, settings, permission or allowlist change, no set-it instruction.
+HINT_LINES="$(awk '
+  /^deny_hint\(\) \{/ { on = 1; next }
+  on && /^}/ { on = 0 }
+  on && /DENY_HINT=/ { print }
+' "$ENGINE")"
+BYPASS_HINTS="$(printf '%s\n' "$HINT_LINES" | grep -iE 'yourself|outside claude code|sandbox|settings|allowlist|permission|dangerously|(^|[^a-z])set (it|the) ')"
+if [ -n "$HINT_LINES" ] && [ -z "$BYPASS_HINTS" ]; then
+  pass "E2 no hint invites a way around the guard ($(printf '%s\n' "$HINT_LINES" | grep -c .) hint lines)"
+else
+  fail "E2 a hint invites a way around the guard: ${BYPASS_HINTS:-no hint lines found}"
+fi
+if printf '%s\n' "$HINT_LINES" | grep -qF "unsafe_worktree_remove) DENY_HINT=\"git worktree remove must name exactly one registered or authorized worktree and never --force; whether to run a denied removal by hand is the person's own call, not something the session offers\" ;;"; then
+  pass "E2 unsafe_worktree_remove says a denied removal is the person's own call"
+else
+  fail "E2 unsafe_worktree_remove's hint is not the person's-own-call wording"
+fi
+
 printf '%s\n' '== D budgets =='
 SECONDS_LINES="$(grep -E '^TIMEOUT_SECONDS=' "$ENGINE")"
 TIMEOUT_VALUE="${SECONDS_LINES#TIMEOUT_SECONDS=}"

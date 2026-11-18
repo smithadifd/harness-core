@@ -28,6 +28,7 @@ WORKTREE="$TEST_ROOT/worktree"
 
 HINT_UNSAFE_RM='an rm target is not a literal path strictly below the current worktree or the named session scratchpad; spell a worktree target relative to the current folder, because an absolute home path is refused by spelling'
 HINT_UNSUPPORTED_SYNTAX='the command is over 6000 bytes or has an unbalanced substitution or quote; split or shorten it'
+NO_BYPASS='This deny is final: never use or offer a ! command at the prompt, a sandbox override, or a settings, permission or allowlist change to get around it; tell the person the guard denied it, and that running the command themselves is their own call.'
 
 FAILURES=0
 pass() { printf 'PASS: %s\n' "$1"; }
@@ -59,7 +60,7 @@ deny_at() { # ID STATE CWD REASON HINT COMMAND
   hook "$3" "$6"
   decision="$(printf '%s' "$OUT" | "$JQ" -er '.hookSpecificOutput.permissionDecision' 2>/dev/null || printf none)"
   reason="$(printf '%s' "$OUT" | "$JQ" -er '.hookSpecificOutput.permissionDecisionReason' 2>/dev/null || :)"
-  want="Destructive command guard denied the command (reason=$4): $5."
+  want="Destructive command guard denied the command (reason=$4): $5. $NO_BYPASS"
   if [ "$RC" -eq 0 ] && [ "$decision" = deny ] && [ "$reason" = "$want" ]; then
     pass "$1 $2 $6 -> deny/$4 with its hint"
   else

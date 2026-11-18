@@ -150,8 +150,8 @@ else
 fi
 
 printf '%s\n' '== D2 the crash trap =='
-FAIL_LINE='{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Git guard denied the command (reason=adapter_failed): the guard'"'"'s adapter failed; retry once and report the code if it repeats."}}'
-INT_LINE='{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Git guard denied the command (reason=adapter_interrupted): the guard'"'"'s adapter was stopped by a signal; retry once."}}'
+FAIL_LINE='{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Git guard denied the command (reason=adapter_failed): the guard'"'"'s adapter failed; retry once and report the code if it repeats. This deny is final: never use or offer a ! command at the prompt, a sandbox override, or a settings, permission or allowlist change to get around it; tell the person the guard denied it, and that running the command themselves is their own call."}}'
+INT_LINE='{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Git guard denied the command (reason=adapter_interrupted): the guard'"'"'s adapter was stopped by a signal; retry once. This deny is final: never use or offer a ! command at the prompt, a sandbox override, or a settings, permission or allowlist change to get around it; tell the person the guard denied it, and that running the command themselves is their own call."}}'
 replace_copy "$T/copies/d2-exit.sh" '  GUARD_LOG_INPUT="$normalized"' '  GUARD_LOG_INPUT="$normalized"
   exit 7'
 GG_GUARD="$T/copies/d2-exit.sh"
