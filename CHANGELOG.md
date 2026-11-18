@@ -18,8 +18,10 @@ move.
   and stop tasks", and says why.
 - Resume: the README no longer says the skill asks the person to confirm the
   old session is gone and to choose release and resume. It says what resume
-  does at the pinned skills release: it reopens the ticket by its id and
-  carries on, with no question. The skill is unchanged.
+  does at the pinned skills release: after a session ended with `/exit` it
+  reopens the ticket by its id and carries on, with no question; if the
+  earlier session crashed, the skill still asks the person to confirm that
+  session is gone before it releases the old claim. The skill is unchanged.
 - Close: the README says a diff side panel may open on its own as a ticket
   closes, and that `/diff` closes it.
 - Uninstall: the README says `/harness:setup uninstall` asks a yes or no

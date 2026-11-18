@@ -294,11 +294,12 @@ The ledger is where your work's state lives, and the `ticket` skill (from the
   twice for your go: once on the plan, and once before anything leaves your
   machine (a push or a pull request). It prints the item's id; keep it.
 - **Stop and resume.** You can leave a ticket in a session and pick it up in
-  another. In the new session say "Resume the ticket <id>". The skill
-  reopens the ticket by its id and carries on from where it stopped; it does
-  not ask you to confirm that the old session is gone, or to choose release
-  and resume. The ledger's `resume` subcommand (below) prints where work
-  stopped and the command that continues it.
+  another. In the new session say "Resume the ticket <id>". If the earlier
+  session was ended with `/exit`, the skill reopens the ticket by its id and
+  carries on from where it stopped, and asks nothing. If the earlier session
+  crashed instead, the skill asks you to confirm that session is gone before
+  it releases the old claim. The ledger's `resume` subcommand (below) prints
+  where work stopped and the command that continues it.
 - **Leaving while a build runs.** If you end a session with `/exit` while a
   build is running, Claude Code opens a "Background work is running" dialog
   with three choices: "Exit and stop tasks", "Move to background and exit"

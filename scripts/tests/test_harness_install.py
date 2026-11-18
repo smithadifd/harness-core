@@ -788,9 +788,11 @@ def test_the_readme_names_the_background_work_dialog_and_which_choice_to_make():
 def test_the_readme_says_what_resume_does_and_claims_no_question():
     first_use = readme_section("### First use")
     bullet = first_use[first_use.index("**Stop and resume.**"):].split("**Leaving while")[0]
-    assert "reopens the ticket by its id and carries on from where it stopped" in bullet
-    assert "does not ask you to confirm that the old session is gone" in bullet
-    assert "the skill asks you to confirm" not in one_line(README.read_text(encoding="utf-8"))
+    assert ("If the earlier session was ended with `/exit`, the skill reopens the ticket by its id "
+            "and carries on from where it stopped, and asks nothing") in bullet
+    assert ("If the earlier session crashed instead, the skill asks you to confirm that session "
+            "is gone before it releases the old claim") in bullet
+    assert "choose release and resume" not in one_line(README.read_text(encoding="utf-8"))
 
 
 def test_the_readme_says_a_diff_panel_may_open_and_slash_diff_closes_it():
@@ -828,6 +830,7 @@ def test_the_v0_1_6_entry_covers_the_walk_fixes_and_moves_no_plugin():
     entry = one_line(changelog_entry("v0.1.6"))
     for claim in ("collapsed under \"Ran 1 shell command\"", "ctrl+o",
                   "\"Background work is running\"", "release and resume",
+                  "if the earlier session crashed, the skill still asks",
                   "`/diff` closes it", "asks a yes or no question",
                   "`ledger-hooks` shows, 0.4.0"):
         assert claim in entry, claim
