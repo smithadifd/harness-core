@@ -665,6 +665,11 @@ def changelog_top_entry():
     return changelog_text().split("\n## ")[1]
 
 
+def changelog_entry(heading):
+    return next(part for part in changelog_text().split("\n## ")
+                if part.splitlines()[0] == heading)
+
+
 def plugin_version(name):
     manifest = ROOT / "plugins" / name / ".claude-plugin" / "plugin.json"
     return json.loads(manifest.read_text(encoding="utf-8"))["version"]
@@ -746,8 +751,91 @@ def test_the_readme_marks_search_db_as_present_only_if_ledger_search_ran():
 
 
 def test_the_release_entry_corrects_the_v0_1_4_known_limits_claim_and_moves_no_plugin():
-    entry = one_line(changelog_top_entry())
+    entry = one_line(changelog_entry("v0.1.5"))
     assert "KNOWN-LIMITS.md" in entry and "the file only gained the five lines" in entry
     stays = re.search(r"`harness` and `rails` stay at (\d+\.\d+\.\d+)", entry)
     assert stays, "the entry does not say the plugin versions stay"
     assert stays.group(1) == plugin_version("harness") == plugin_version("rails")
+
+
+# ---------------------------------------------------------------------------
+# The third walk's README friction (v0.1.6): each claim a newcomer meets is pinned.
+
+
+def readme_section(heading):
+    return one_line("\n".join(section(README.read_text(encoding="utf-8"), heading)))
+
+
+def test_the_readme_says_the_setup_plan_may_be_collapsed_and_ctrl_o_shows_it():
+    text = one_line(README.read_text(encoding="utf-8"))
+    setup_text = readme_section("### Set up")
+    assert "The plan may appear collapsed under \"Ran 1 shell command\"" in setup_text
+    assert "press ctrl+o to show it" in setup_text
+    assert "before you answer the question about the files" in setup_text
+    assert "without expanding anything" not in text
+
+
+def test_the_readme_names_the_background_work_dialog_and_which_choice_to_make():
+    first_use = readme_section("### First use")
+    bullet = first_use[first_use.index("**Leaving while a build runs.**"):]
+    bullet = bullet.split("**A diff panel may open.**")[0]
+    assert "`/exit`" in bullet and "\"Background work is running\"" in bullet
+    for choice in ("Exit and stop tasks", "Move to background and exit", "Stay"):
+        assert f"\"{choice}\"" in bullet, choice
+    assert "Choose \"Exit and stop tasks\"" in bullet and "stops the build" in bullet
+
+
+def test_the_readme_says_what_resume_does_and_claims_no_question():
+    first_use = readme_section("### First use")
+    bullet = first_use[first_use.index("**Stop and resume.**"):].split("**Leaving while")[0]
+    assert "reopens the ticket by its id and carries on from where it stopped" in bullet
+    assert "does not ask you to confirm that the old session is gone" in bullet
+    assert "the skill asks you to confirm" not in one_line(README.read_text(encoding="utf-8"))
+
+
+def test_the_readme_says_a_diff_panel_may_open_and_slash_diff_closes_it():
+    first_use = readme_section("### First use")
+    bullet = first_use[first_use.index("**A diff panel may open.**"):]
+    bullet = bullet.split("**The `ledger` command.**")[0]
+    assert "diff side panel on its own" in bullet
+    assert "Type `/diff` to close it" in bullet
+
+
+def test_the_readme_says_uninstall_asks_yes_or_no_before_it_removes_anything():
+    uninstall = readme_section("### Uninstall")
+    step = uninstall[uninstall.index("1. In a session"):uninstall.index("2. In a terminal")]
+    assert "asks you to answer yes or no before it removes anything" in step
+    assert step.index("shows what it will remove") < step.index("yes or no") < step.index(
+        "and then removes it")
+
+
+def test_the_readme_ledger_hooks_version_matches_the_marketplace_pin():
+    text = one_line(README.read_text(encoding="utf-8"))
+    found = re.search(r"`ledger-hooks` shows (\d+\.\d+\.\d+), which is the ledger release "
+                      r"`(v[^`]+)` at the pinned commit", text)
+    assert found, "the README does not say what ledger-hooks shows"
+    source = next(e for e in marketplace_manifest()["plugins"]
+                  if e["name"] == "ledger-hooks")["source"]
+    assert found.group(2) == source["ref"]
+    assert f"v{found.group(1)}" == source["ref"]
+    # The plugin list sentence names every plugin the list shows, ledger-hooks among them.
+    assert "The list shows `harness`, `sdlc` and `ledger-hooks` enabled." in text
+
+
+def test_the_v0_1_6_entry_covers_the_walk_fixes_and_moves_no_plugin():
+    headings = changelog_headings()
+    assert headings[:2] == ["v0.1.6", "v0.1.5"]
+    entry = one_line(changelog_entry("v0.1.6"))
+    for claim in ("collapsed under \"Ran 1 shell command\"", "ctrl+o",
+                  "\"Background work is running\"", "release and resume",
+                  "`/diff` closes it", "asks a yes or no question",
+                  "`ledger-hooks` shows, 0.4.0"):
+        assert claim in entry, claim
+    stays = re.search(r"`harness` and `rails` stay at (\d+\.\d+\.\d+)", entry)
+    assert stays, "the entry does not say the plugin versions stay"
+    assert stays.group(1) == plugin_version("harness") == plugin_version("rails")
+
+
+def test_the_readme_and_changelog_do_not_use_the_word_builder():
+    for path in (README, CHANGELOG):
+        assert "builder" not in path.read_text(encoding="utf-8").lower(), path.name

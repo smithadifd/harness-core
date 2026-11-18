@@ -3,6 +3,32 @@
 Each tag of this repository gets an entry: what changed in the vendored files,
 and any pin move of the vendored ledger.
 
+## v0.1.6
+
+README fixes from the third fresh-home walk. Docs only: no plugin changes
+(`harness` and `rails` stay at 0.1.1), no skill or script change and no pin
+move.
+
+- Setup's plan: the README no longer says the plan can be read without
+  expanding anything. In Claude Code 2.1.326 the reply can be one line with
+  the plan collapsed under "Ran 1 shell command"; the README now says so and
+  says ctrl+o shows it, before the question about the files.
+- Ending a session with `/exit` while a build is running: the README names
+  Claude Code's "Background work is running" dialog, says to choose "Exit
+  and stop tasks", and says why.
+- Resume: the README no longer says the skill asks the person to confirm the
+  old session is gone and to choose release and resume. It says what resume
+  does at the pinned skills release: it reopens the ticket by its id and
+  carries on, with no question. The skill is unchanged.
+- Close: the README says a diff side panel may open on its own as a ticket
+  closes, and that `/diff` closes it.
+- Uninstall: the README says `/harness:setup uninstall` asks a yes or no
+  question before it removes anything.
+- The version column of `claude plugin list`: the README now also says what
+  `ledger-hooks` shows, 0.4.0, the ledger release `v0.4.0` at the pinned
+  commit. A test ties the number to the marketplace pin.
+- The README's named current tag moves to `v0.1.6`.
+
 ## v0.1.5
 
 README fixes from the second fresh-home walk, and a correction to the v0.1.4

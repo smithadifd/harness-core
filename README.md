@@ -167,7 +167,7 @@ claude plugin list
 ```
 
 `vX.Y.Z` is a release tag of this repository: use the current one, which is
-`v0.1.5`. Each release moves it, so if this text may be older than the
+`v0.1.6`. Each release moves it, so if this text may be older than the
 repository, read the newest tag on the repository's Tags page on GitHub, or run
 one command and take the highest version it lists:
 
@@ -179,7 +179,8 @@ The list shows `harness`, `sdlc` and `ledger-hooks` enabled. Its version
 column is each plugin's own version, not this repository's tag: `harness` and
 `rails` show 0.1.1, the version in their manifests at this repository's tag,
 and `sdlc` shows 0.15.0, which is the skills release `v1.5.0` at the pinned
-commit. Start a new session, or run `/reload-plugins` in an
+commit; `ledger-hooks` shows 0.4.0, which is the ledger release `v0.4.0` at
+the pinned commit. Start a new session, or run `/reload-plugins` in an
 open one, to load them. On its first run in a folder, Claude Code asks whether
 you trust it, and the highlighted answer is "No, exit": move to "Yes" before
 you press Enter.
@@ -200,14 +201,15 @@ In a session, run:
 The skill asks you to type the operator name the ledger stamps on what you
 write, as a plain question in the chat: type the name as your next message
 (a picker's "Type something" choice can dismiss the question in Claude Code
-2.1.326). It then prints a plan in its own reply, where you can read it
-without expanding anything: every file it will create, the three ledger
+2.1.326). It then shows a plan: every file it will create, the three ledger
 options, the command that makes the first ledger write, and each optional
-settings change as the exact text to be added. Nothing is written until you
-answer. You give one yes for the files, the ledger options and the first ledger
-write together, then one yes or no for each optional settings change on its
-own. Saying no to every
-optional change leaves a complete setup. Setup then applies the plan, makes the
+settings change as the exact text to be added. The plan may appear collapsed
+under "Ran 1 shell command", with only a one-line reply in view: press ctrl+o
+to show it, and read it before you answer the question about the files.
+Nothing is written until you answer. You give one yes for the files, the
+ledger options and the first ledger write together, then one yes or no for
+each optional settings change on its own. Saying no to every optional change
+leaves a complete setup. Setup then applies the plan, makes the
 first ledger write, checks the result (it runs the doctor itself, so you need
 not run `doctor` again straight after) and ends by telling you to start a new
 session: the ledger's options reach a session's commands, and the rules default
@@ -292,12 +294,20 @@ The ledger is where your work's state lives, and the `ticket` skill (from the
   twice for your go: once on the plan, and once before anything leaves your
   machine (a push or a pull request). It prints the item's id; keep it.
 - **Stop and resume.** You can leave a ticket in a session and pick it up in
-  another. In the new session say "Resume the ticket <id>". If the first
-  session was ended with `/exit` while work was running, the ticket still
-  looks live: the skill asks you to confirm the old session is gone and to
-  choose release and resume. Answer that and it carries on from where it
-  stopped. The ledger's `resume` subcommand (below) prints where work stopped
-  and the command that continues it.
+  another. In the new session say "Resume the ticket <id>". The skill
+  reopens the ticket by its id and carries on from where it stopped; it does
+  not ask you to confirm that the old session is gone, or to choose release
+  and resume. The ledger's `resume` subcommand (below) prints where work
+  stopped and the command that continues it.
+- **Leaving while a build runs.** If you end a session with `/exit` while a
+  build is running, Claude Code opens a "Background work is running" dialog
+  with three choices: "Exit and stop tasks", "Move to background and exit"
+  and "Stay". Choose "Exit and stop tasks" (the first): it stops the build
+  with the session, which is the case "Resume the ticket" picks up. Moving it
+  to the background leaves the build running after you have gone, so a resume
+  would meet work that is still running.
+- **A diff panel may open.** While a ticket closes, Claude Code may open a
+  diff side panel on its own. Type `/diff` to close it.
 - **The `ledger` command.** It is on the PATH of a Claude Code session, not of
   your own shell: in a terminal, `ledger` is "command not found". Run it
   through a session: ask for the command by name, and ask the session to paste
@@ -389,7 +399,8 @@ plugin id, for example `ledger-hooks@harness-core`. Start a new session, or run
 Three steps, in this order:
 
 1. In a session, run `/harness:setup uninstall` first. It reads the record of
-   what setup wrote, shows what it will remove, and removes it: the two placed
+   what setup wrote, shows what it will remove, asks you to answer yes or no
+   before it removes anything, and then removes it: the two placed
    files if they are unchanged since setup, and each settings change it added
    that is still where it put it. A file you have edited, and a settings item
    you have moved or changed, is kept and named. The ledger database is kept,
