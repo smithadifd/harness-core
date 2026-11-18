@@ -544,9 +544,10 @@ to do. It never carries the command or a path from it. Known limits are in
   environment variable, and so no project setting, changes either. A stored
   value other than `ask`, `deny` or `off` denies when its check fires, and
   the reason names the option.
-- **Auto mode.** In Claude Code's default auto mode, a guard ask left
-  unanswered for about 13 to 14 seconds lets the command run, so an ask is not
-  a hard stop there, and a deny is.
+- **Auto mode.** In Claude Code's default auto mode, a push was seen to run
+  after a guard ask with no recorded answer. That is not yet confirmed on a
+  hands-off run, so do not count on an ask as a hard stop there. Use `deny`
+  for a hard stop.
 - **Never allows.** It asks, denies or stays silent, and Claude Code's own
   permission flow decides the rest.
 - **It fails closed.** As the destructive guard: a missing program, an

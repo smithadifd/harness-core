@@ -3,7 +3,7 @@
 Each tag of this repository gets an entry: what changed in the vendored files,
 and any pin move of the vendored ledger.
 
-## Unreleased
+## v0.1.4
 
 - The `rails` git guard runs on a plain install, headless and interactive. At
   v0.1.3 its one hook read all three options, and Claude Code skips such a
@@ -31,6 +31,40 @@ and any pin move of the vendored ledger.
   segment that fails to parse holds any word that is a home spelling, the
   deny names `unsafe_rm`; otherwise it keeps `unsupported_syntax`. The
   `rails` plugin's version moves to 0.1.1.
+- README and setup-skill fixes from the first fresh-home walk. The install
+  and update lines carry the real repository URL, not a placeholder owner.
+  The setup skill copies the plan into its own reply (a Bash result is
+  collapsed in the terminal and goes unread) and asks for the operator name
+  as a plain question the person types, never with a picker, whose
+  free-text choice dismisses the question in Claude Code 2.1.326. The
+  README gains a "First use" section (file an item and work it with the
+  `ticket` skill, stop and resume, and the `ledger` subcommands a person
+  needs) and says where the `ledger` command runs: on the PATH of a Claude
+  Code session, not of the person's own shell. It explains that auto mode is
+  the default permission mode in Claude Code 2.1.326, so a command that is
+  said to ask can simply run, and how to reach the manual mode. It says
+  that the first-run trust question highlights "No, exit". Uninstall now
+  says what the remove command's output names and what it does not, counts
+  `rails` among the plugins removed with the marketplace, and lists the two
+  extra ledger leftovers (`search.db` and the `ledger.db.session-models`
+  folder). The rails install in the README stores all three options at
+  their defaults and says why: with nothing stored the git guard still
+  guards, but an interactive session shows a non-blocking "Plugin option
+  push_to_main isn't set" hook error. The git guard section says that in
+  Claude Code's default auto mode a push was seen to run after a guard ask
+  with no recorded answer, that this is not yet confirmed on a hands-off
+  run, and that `deny` is the hard stop. Because the setup skill changed,
+  the `harness` plugin's version moves from 0.1.0 to 0.1.1, so that a
+  user's copy of the folder plugin changes with the tag.
+- The marketplace's `sdlc` pin moves from skills `v1.3.0` to `v1.5.0` (the
+  `sdlc` plugin at 0.15.0, commit `5abfc37a5cac57f454ab3fbae7bd407b3f7f7b33`),
+  and the README's status paragraph names it; the new "First use" section
+  describes the `ticket` skill from that plugin.
+- `KNOWN-LIMITS.md` drops one line: the one about a project's own
+  `PreToolUse` hook that returns allow for a git push, which said the git
+  guard's floor holds against it only if Claude Code takes the strictest of
+  several hooks' verdicts, and told the reader to assume otherwise until a
+  live check showed it.
 
 ## v0.1.3
 
