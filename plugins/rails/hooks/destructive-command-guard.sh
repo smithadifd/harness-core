@@ -1984,7 +1984,7 @@ rm_roots_row_ok() { # ROW HOME HOME_CANON
 # Reads the rm-roots file into RM_ROOTS, or denies by name. Run for every
 # judged rm, after initialize_context and before validate_rm.
 load_rm_roots() {
-  local home home_canon file dir row size rows=0 bytes=0
+  local home home_canon file dir row size rows=0 bytes=0 candidate stat_ok=0
   [ "$RM_ROOTS_READY" -eq 0 ] || return 0
   RM_ROOTS_READY=1
   RM_ROOTS=()
@@ -1994,6 +1994,15 @@ load_rm_roots() {
   file="$home/$RM_ROOTS_RELATIVE"
   dir="${file%/*}"
   [ -e "$file" ] || [ -L "$file" ] || return 0
+  # The checks below run stat_fields, whose flavour probe pipes into the grep
+  # wrapper, and /usr/bin/id: the armed tier's programs. Unarmed, GREP_BIN is
+  # empty, the probe fails and a GNU stat is asked the BSD form, so the tier
+  # is resolved here as initialize_context resolves it for a registry.
+  for candidate in "${STAT_CANDIDATES[@]}"; do
+    if [ -x "$candidate" ] && [ ! -d "$candidate" ]; then stat_ok=1; break; fi
+  done
+  [ "$stat_ok" -eq 1 ] || { MISSING_TOOL_CODE=stat; policy_deny_dependency; }
+  check_tools "${ARMED_TOOLS[@]}" || policy_deny_dependency
   [ -d "$dir" ] && [ ! -L "$dir" ] || policy_deny rm_roots_untrusted
   [ -f "$file" ] && [ ! -L "$file" ] || policy_deny rm_roots_untrusted
   owned_and_private "$dir" || policy_deny rm_roots_untrusted

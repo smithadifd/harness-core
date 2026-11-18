@@ -16,7 +16,9 @@
 #       rm_roots_malformed;
 #   Z   absent file: dormant, every verdict as without the layer;
 #   F   a fake HOME holding a planted file changes nothing (the shipped guard);
-#   P   the pin on the line that finds the account's home folder.
+#   P   the pin on the line that finds the account's home folder;
+#   G   a GNU-shaped stat (a --version banner, -c formats, -f refused) with no
+#       registry armed: a trusted file is still trusted.
 # The guard reads the account's real home folder, so the rows that need a
 # file run copies of the guard whose rm_roots_account_home function prints a
 # fixture folder instead. Every command string is inert JSON data and is
@@ -108,7 +110,7 @@ run_case() {
   if [ "$#" -gt 0 ]; then shift; fi
   local input output decision reason
   input="$("$JQ" -cn --arg cwd "$cwd" --arg command "$command_data" '{cwd:$cwd,command:$command}')"
-  output="$(cd "$TMP" && printf '%s' "$input" | env HOME="$TMP/githome" ${1+"$@"} \
+  output="$(cd "$TMP" && printf '%s' "$input" | env -u LANE_ROOTS_REGISTRY -u CLEANUP_ITEMS_REGISTRY HOME="$TMP/githome" ${1+"$@"} \
     "$GUARD_BASH" --noprofile --norc -p "$RUN_GUARD" --policy 2>/dev/null)"
   decision="$(printf '%s' "$output" | "$JQ" -er '.decision' 2>/dev/null || printf invalid)"
   reason="$(printf '%s' "$output" | "$JQ" -er '.reason' 2>/dev/null || printf invalid)"
@@ -271,6 +273,34 @@ chmod 777 "$NOFILE_HOME/.claude/rails"
 RUN_GUARD="$COPY_NOFILE"
 run_case "Z6 no file in a 0777 folder is still dormant" deny "$WORKSPACE" "rm -f $ROOT/file.md" unsafe_rm
 chmod 700 "$NOFILE_HOME/.claude/rails"
+
+printf '%s\n' '== G a GNU-shaped stat, no registry armed =='
+# A stat that answers as GNU stat does on Linux: a banner for --version, -c
+# FORMAT for the fields, and -f (file-system status on GNU) refused. On a host
+# whose stat is BSD it maps -c to -f; on a GNU host it runs -c as is.
+GNU_BIN="$TMP/gnu-stat-bin"
+mkdir -p "$GNU_BIN"
+{
+  printf '%s\n' '#!/bin/bash'
+  printf '%s\n' 'case "$1" in --version) printf "stat (GNU coreutils) stub\n"; exit 0 ;; -c) ;; *) exit 1 ;; esac'
+  printf '%s\n' 'fmt="$2"; shift 2; [ "$1" = "--" ] && shift'
+  printf '%s\n' 'for real in /usr/bin/stat /bin/stat; do [ -x "$real" ] && break; done'
+  printf '%s\n' 'if "$real" --version >/dev/null 2>&1; then exec "$real" -c "$fmt" -- "$@"; fi'
+  printf '%s\n' 'case "$fmt" in "%u %a") exec "$real" -f "%u %Lp" -- "$@" ;; "%s") exec "$real" -f "%z" -- "$@" ;; *) exit 1 ;; esac'
+} >"$GNU_BIN/stat"
+chmod 755 "$GNU_BIN/stat"
+COPY_GNU="$TMP/guard-gnu-stat.sh"
+sed "s|^STAT_CANDIDATES=.*|STAT_CANDIDATES=($GNU_BIN/stat)|" "$COPY" >"$COPY_GNU" || exit 1
+grep -qx "STAT_CANDIDATES=($GNU_BIN/stat)" "$COPY_GNU" || { fail "G fixture: the guard has no STAT_CANDIDATES line to rewrite"; exit 1; }
+RUN_GUARD="$COPY_GNU"
+roots_file "$ROOT"$'\n'
+run_case "G1 GNU stat, trusted file, root file" no_opinion "$WORKSPACE" "rm -f $ROOT/file.md" accepted
+run_case "G2 GNU stat, trusted file, worktree target" no_opinion "$REPO" "rm -rf ./build" accepted
+roots_file "$ROOT"$'\n' 666
+run_case "G3 GNU stat, a 0666 file is still untrusted" deny "$WORKSPACE" "rm -f $ROOT/file.md" rm_roots_untrusted
+roots_file "$ROOT"$'\n\n'
+run_case "G4 GNU stat, a blank row is malformed" deny "$WORKSPACE" "rm -f $ROOT/file.md" rm_roots_malformed
+RUN_GUARD="$COPY"
 
 printf '%s\n' '== F a fake HOME holding a planted file changes nothing (the shipped guard) =='
 printf '%s\n' "$ROOT" >"$FAKEHOME/.claude/rails/rm-roots"
