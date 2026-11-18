@@ -758,8 +758,14 @@ def test_settings_that_configure_made_invalid_refuse_by_name(tmp_path):
      "permissions.deny is an object, not an array"),
     ({"model": "kept", "sandbox": None}, "sandbox", "sandbox is null, not an object"),
     ({"sandbox": True}, "sandbox", "sandbox is a boolean, not an object"),
+    ({"model": "kept", "promptSuggestionEnabled": None}, "prompt-suggestions",
+     "promptSuggestionEnabled is null, not a boolean"),
+    ({"promptSuggestionEnabled": "false"}, "prompt-suggestions",
+     "promptSuggestionEnabled is a string, not a boolean"),
+    ({"promptSuggestionEnabled": 0}, "prompt-suggestions",
+     "promptSuggestionEnabled is a number, not a boolean"),
 ], ids=["permissions-null", "deny-null", "permissions-string", "deny-object", "sandbox-null",
-        "sandbox-boolean"])
+        "sandbox-boolean", "prompt-null", "prompt-string", "prompt-number"])
 def test_a_present_key_of_the_wrong_type_refuses_before_any_write(tmp_path, settings, approve,
                                                                  problem):
     bin_dir = install(tmp_path)
@@ -801,7 +807,7 @@ def test_a_wrong_type_no_approved_item_touches_is_left_alone(tmp_path):
 
 def test_apply_with_every_item_present_leaves_settings_byte_identical(tmp_path):
     bin_dir = install(tmp_path)
-    compact = json.dumps({"sandbox": {"enabled": True},
+    compact = json.dumps({"sandbox": {"enabled": True}, "promptSuggestionEnabled": False,
                           "permissions": {"deny": list(mod.DENY_RULES)}},
                          separators=(",", ":")).encode()
     home = make_home(tmp_path, compact)
@@ -896,7 +902,8 @@ def test_a_sigkill_at_every_apply_point_keeps_the_promise(tmp_path, pre):
 
 
 @pytest.mark.parametrize("shape", ["line1-only", "torn-line2", "third-line", "line2-not-complete",
-                                   "no-newline", "bad-header", "sandbox-value-one"])
+                                   "no-newline", "bad-header", "sandbox-value-one",
+                                   "prompt-value-zero", "prompt-value-true"])
 def test_an_unfinished_record_refuses_apply_and_remove(tmp_path, shape):
     bin_dir = install(tmp_path)
     home = make_home(tmp_path)
@@ -913,6 +920,9 @@ def test_an_unfinished_record_refuses_apply_and_remove(tmp_path, shape):
         # `1` is not the `true` setup writes: the compare is type-strict.
         "sandbox-value-one": line1 + line2.replace(b'"value": {"enabled": true}',
                                                    b'"value": {"enabled": 1}'),
+        # The prompt-suggestions item is recorded as `false`: `0` and `true` are not it.
+        "prompt-value-zero": line1 + line2.replace(b'"value": false', b'"value": 0'),
+        "prompt-value-true": line1 + line2.replace(b'"value": false', b'"value": true'),
     }[shape]
     assert shaped != raw
     at(home, mod.RECORD_REL).write_bytes(shaped)
@@ -1733,9 +1743,11 @@ def test_the_sandbox_key_is_recorded_at_its_place_in_the_final_settings(tmp_path
     _head, body = mod.parse_record(record_bytes(home))
     key = [item for item in body["settings"]["items"] if item["kind"] == "key"]
     assert key == [{"kind": "key", "name": "sandbox", "value": {"enabled": True}, "index": 1,
-                    "before": "model", "after": "permissions"}]
+                    "before": "model", "after": "promptSuggestionEnabled"},
+                   {"kind": "key", "name": "promptSuggestionEnabled", "value": False,
+                    "index": 2, "before": "sandbox", "after": "permissions"}]
     assert list(json.loads(at(home, mod.SETTINGS_REL).read_bytes())) == [
-        "model", "sandbox", "permissions"]
+        "model", "sandbox", "promptSuggestionEnabled", "permissions"]
 
 
 @pytest.mark.parametrize("how", ["moved", "shifted", "neighbour-before", "neighbour-after",
@@ -2036,3 +2048,118 @@ def test_an_error_taking_the_lock_refuses_by_name(tmp_path):
     done = apply_all(home, bin_dir, hooks={"raise_at": [1]})
     assert done.events[0]["op"] == "create" and done.events[0]["path"].endswith(mod.LOCK_REL)
     assert one_refusal(done) == "setup: cannot take the setup lock: [Errno 5] injected"
+
+
+# ---------------------------------------------------------------------------
+# The prompt-suggestions item: Claude Code's own `promptSuggestionEnabled`
+# user setting, proposed as `false`. Proposed in the plan, added only on its
+# approval and only when the key is absent, recorded, and taken out by remove.
+
+PROMPT_KEY = "promptSuggestionEnabled"
+PROMPT_ID = "prompt-suggestions"
+PROMPT_TEXT = '{\n  "promptSuggestionEnabled": false\n}'
+KEPT_SETTINGS = b'{\n  "model": "kept"\n}\n'
+
+
+def test_plan_proposes_prompt_suggestions_off_as_an_optional_item(tmp_path):
+    home = make_home(tmp_path, KEPT_SETTINGS)
+    before = snap(home)
+    done = run("plan", home)
+    assert done.rc == 0, done.err
+    assert f"OPTIONAL {PROMPT_ID}\n----\n{PROMPT_TEXT}\n----\n" in done.out
+    assert (PROMPT_ID, PROMPT_TEXT) in mod.optional_items()
+    assert [e for e in done.events if e["op"] in MUTATING and e.get("path")] == []
+    assert unchanged(before, snap(home))
+
+
+@pytest.mark.parametrize("settings", [KEPT_SETTINGS, None], ids=["settings-present", "no-settings"])
+def test_prompt_suggestions_off_is_added_on_its_approval_and_removed_by_remove(tmp_path, settings):
+    bin_dir = install(tmp_path)
+    home = make_home(tmp_path, settings)
+    before = snap(home)
+    done = run("apply", home, "--approve", PROMPT_ID, bin_dir=bin_dir)
+    assert done.rc == 0, done.err
+    data = json.loads(at(home, mod.SETTINGS_REL).read_bytes())
+    assert data[PROMPT_KEY] is False
+    assert data == ({"model": "kept", PROMPT_KEY: False} if settings else {PROMPT_KEY: False})
+    assert mod.granting_in_settings(data) == []
+    _head, body = mod.parse_record(record_bytes(home))
+    items = body["settings"]["items"]
+    assert [(item["kind"], item["name"], item["value"]) for item in items] == [
+        ("key", PROMPT_KEY, False)]
+    assert items[0]["value"] is False
+    removed = run("remove", home)
+    assert removed.rc == 0, removed.err
+    assert unchanged(before, snap(home))
+
+
+def test_prompt_suggestions_off_is_not_added_without_its_approval(tmp_path):
+    bin_dir = install(tmp_path)
+    home = make_home(tmp_path, KEPT_SETTINGS)
+    done = run("apply", home, "--approve", "sandbox", bin_dir=bin_dir)
+    assert done.rc == 0, done.err
+    assert json.loads(at(home, mod.SETTINGS_REL).read_bytes()) == {
+        "model": "kept", "sandbox": {"enabled": True}}
+    other = make_home(tmp_path, KEPT_SETTINGS, name="none-approved")
+    assert run("apply", other, bin_dir=bin_dir).rc == 0
+    assert at(other, mod.SETTINGS_REL).read_bytes() == KEPT_SETTINGS
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_a_prompt_suggestions_value_the_person_set_is_never_changed_or_removed(tmp_path, value):
+    bin_dir = install(tmp_path)
+    raw = (json.dumps({"model": "kept", PROMPT_KEY: value}, indent=2) + "\n").encode()
+    home = make_home(tmp_path, raw)
+    before = snap(home)
+    done = run("apply", home, "--approve", PROMPT_ID, bin_dir=bin_dir)
+    assert done.rc == 0, done.err
+    assert at(home, mod.SETTINGS_REL).read_bytes() == raw
+    _head, body = mod.parse_record(record_bytes(home))
+    assert body["settings"]["items"] == []
+    assert run("remove", home).rc == 0
+    assert at(home, mod.SETTINGS_REL).read_bytes() == raw
+    assert unchanged(before, snap(home))
+
+
+@pytest.mark.parametrize("how", ["moved", "changed-to-true", "changed-to-zero", "neighbour"])
+def test_remove_keeps_and_names_a_moved_or_changed_prompt_suggestions_key(tmp_path, how):
+    bin_dir = install(tmp_path)
+    home = make_home(tmp_path, KEPT_SETTINGS)
+    assert run("apply", home, "--approve", PROMPT_ID, bin_dir=bin_dir).rc == 0
+    settings = at(home, mod.SETTINGS_REL)
+    assert list(json.loads(settings.read_bytes())) == ["model", PROMPT_KEY]
+    data = {
+        "moved": {PROMPT_KEY: False, "model": "kept"},
+        "changed-to-true": {"model": "kept", PROMPT_KEY: True},
+        # `0` is not the `false` setup wrote: the compare is type-strict.
+        "changed-to-zero": {"model": "kept", PROMPT_KEY: 0},
+        "neighbour": {"model": "kept", PROMPT_KEY: False, "later": 1},
+    }[how]
+    settings.write_text(json.dumps(data, indent=2) + "\n")
+    done = run("remove", home)
+    assert done.rc == 0, done.err
+    assert f"kept for a manual check: {settings}: {PROMPT_KEY} (moved or changed)\n" in done.out
+    assert json.loads(settings.read_bytes()) == data
+    assert list(json.loads(settings.read_bytes())) == list(data)
+
+
+@pytest.mark.parametrize("how", ["value-true", "value-zero", "granting-key"])
+def test_any_prompt_suggestions_proposal_but_the_one_safe_value_refuses(monkeypatch, how):
+    if how == "value-true":
+        monkeypatch.setattr(mod, "PROMPT_SUGGESTION_VALUE", True)
+    elif how == "value-zero":
+        monkeypatch.setattr(mod, "PROMPT_SUGGESTION_VALUE", 0)
+    else:
+        monkeypatch.setattr(mod, "GRANTING_KEYS", mod.GRANTING_KEYS | {PROMPT_KEY})
+    with pytest.raises(mod.SetupError, match=r"^proposals grant: prompt-suggestions$"):
+        mod.check_proposals()
+
+
+def test_a_wrong_typed_prompt_suggestions_key_is_left_alone_when_it_is_not_approved(tmp_path):
+    bin_dir = install(tmp_path)
+    raw = b'{\n  "promptSuggestionEnabled": "no"\n}\n'
+    home = make_home(tmp_path, raw)
+    done = run("apply", home, "--approve", "sandbox", bin_dir=bin_dir)
+    assert done.rc == 0, done.err
+    assert json.loads(at(home, mod.SETTINGS_REL).read_bytes()) == {
+        "promptSuggestionEnabled": "no", "sandbox": {"enabled": True}}

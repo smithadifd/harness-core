@@ -67,7 +67,9 @@ def test_doctor_reports_the_placed_files_the_stored_options_and_the_database(tmp
     assert sorted(lines_of(lines, "ok", "files")) == sorted([
         f"ok files: placed by setup and unchanged: {at(home, RULES)}",
         f"ok files: placed by setup and unchanged: {at(home, OVERRIDE)}"])
-    assert len(lines_of(lines, "ok", "settings")) == 1 + len(setup.DENY_RULES)
+    assert len(lines_of(lines, "ok", "settings")) == 2 + len(setup.DENY_RULES)
+    assert ("ok settings: settings key promptSuggestionEnabled is in place as setup added it"
+            in lines_of(lines, "ok", "settings"))
     assert lines_of(lines, "ok", "options") == [
         f"ok options: ledger_db is set: {at(home, DB)}",
         f"ok options: ledger_operator is set: {OPERATOR}",
@@ -262,7 +264,7 @@ def test_doctor_notes_settings_items_when_the_settings_file_is_gone(tmp_path):
     rc, lines = doctor(home, bin_dir)
     assert rc == 0, lines
     gone = lines_of(lines, "note", "settings")
-    assert len(gone) == 1 + len(setup.DENY_RULES)
+    assert len(gone) == 2 + len(setup.DENY_RULES)
     assert all("is already gone" in line and "is absent" in line for line in gone)
 
 

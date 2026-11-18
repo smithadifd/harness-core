@@ -80,7 +80,13 @@ Rules that hold in every mode:
    Then ask about each `OPTIONAL` item on its own, in the order printed, as a
    separate question showing that item's exact text. A yes to one item is never
    a yes to another, and the answer to the files is never a yes to an item.
-   Saying no to every item leaves a complete setup.
+   Saying no to every item leaves a complete setup. When you ask about the
+   `prompt-suggestions` item, say what it is for: Claude Code can show a grey
+   suggested reply already typed into the prompt box, such as a "yes" at a
+   decision point, and pressing Enter sends it; the item turns those
+   suggestions off (`promptSuggestionEnabled` set to `false`), so an empty
+   prompt stays empty. No leaves Claude Code's suggestions as they are. Setup
+   adds the key only when it is absent, and uninstall takes it out again.
 
 4. **Apply.** Pass one `--approve <id>` for each item the person said yes to,
    using the id printed after `OPTIONAL`, and nothing for the others:
