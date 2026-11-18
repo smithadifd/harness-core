@@ -520,7 +520,9 @@ v0.1.3 now reads as `ask`.
 - **Deny only.** It never allows and never asks. For a command it judged and
   accepted, or one it has no opinion on, it exits 0 with no output, and
   Claude Code's own permission flow decides as it would without the plugin.
-  A worktree removal it denies is yours to run by hand, outside Claude Code.
+  A deny is final: the session tells you the guard denied the command and
+  never offers a way around it. Whether to run a denied command yourself is
+  your call.
 - **It fails closed.** A missing program, an engine crash, malformed engine
   output, any engine stderr, an adapter fault or a signal is a deny with a
   named reason, never silence. The hook runs with `"onFailure": "block"`, so
@@ -547,7 +549,11 @@ v0.1.3 now reads as `ask`.
   seen.
 
 A deny reads `Destructive command guard denied the command (reason=CODE):
-HINT.` The code names the rule or the fault (`unsafe_rm`,
+HINT.`, then one fixed sentence, the same for every code: `This deny is
+final: never use or offer a ! command at the prompt, a sandbox override, or a
+settings, permission or allowlist change to get around it; tell the person
+the guard denied it, and that running the command themselves is their own
+call.` The code names the rule or the fault (`unsafe_rm`,
 `unsafe_worktree_remove`, `inherited_git_environment`,
 `dependency_missing_jq`, `engine_timeout`, and so on), and the hint says what
 to do. It never carries the command or a path from it. Known limits are in
@@ -629,7 +635,10 @@ to do. It never carries the command or a path from it. Known limits are in
   carried.
 
 A reason reads `Git guard asks before this command (reason=CODE): HINT.` or
-`Git guard denied the command (reason=CODE): HINT.` The code names the gate
+`Git guard denied the command (reason=CODE): HINT.`, and a deny then ends
+with the same fixed sentence as the destructive guard's, that the deny is
+final and that running the command is your own call; an ask does not carry
+it. The code names the gate
 or the fault (`push_main_branch`, `push_force`, `push_beside_substitution`,
 `commit_nonconventional`, `option_invalid_force_push`,
 `dependency_missing_git`, and so on); the hint never carries the command.
