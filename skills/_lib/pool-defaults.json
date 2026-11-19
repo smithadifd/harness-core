@@ -52,7 +52,12 @@
       "pool": "claude",
       "note": "Judgment tier. Draws on the pool's Fable-scoped window as well as the shared ones."
     },
-    {"id": "openai-codex/gpt-5.6-sol", "pool": "openai-codex"},
+    {"id": "openai-codex/gpt-6.1-sol", "pool": "openai-codex"},
+    {
+      "id": "openai-codex/gpt-5.6-sol",
+      "pool": "openai-codex",
+      "note": "The sol lane's previous pin; declared as available inventory, preferred for no work kind by default."
+    },
     {
       "id": "openai-codex/gpt-6-astra",
       "pool": "openai-codex",
@@ -64,42 +69,42 @@
   "work_kinds": [
     {
       "id": "orchestration",
-      "models": ["claude-opus-5-5", "openai-codex/gpt-5.6-sol"],
+      "models": ["claude-opus-5-5", "openai-codex/gpt-6.1-sol"],
       "note": "Driving a run. Both lanes are primary-pool, so a quota problem on one moves the work to the other."
     },
     {
       "id": "hard_build",
-      "models": ["claude-opus-5-5", "openai-codex/gpt-5.6-sol"],
+      "models": ["claude-opus-5-5", "openai-codex/gpt-6.1-sol"],
       "note": "Code changes that need judgment."
     },
     {
       "id": "mechanical_build",
-      "models": ["xai-oauth/grok-4.6", "openai-codex/gpt-5.6-sol", "claude-sonnet-5-5"],
+      "models": ["xai-oauth/grok-4.6", "openai-codex/gpt-6.1-sol", "claude-sonnet-5-5"],
       "note": "The measured default build lane first, then both primary pools behind it."
     },
     {
       "id": "docs",
-      "models": ["google-antigravity/gemini-3.8-flash", "openai-codex/gpt-5.6-sol", "claude-sonnet-5-5"],
+      "models": ["google-antigravity/gemini-3.8-flash", "openai-codex/gpt-6.1-sol", "claude-sonnet-5-5"],
       "note": "Prose and records work."
     },
     {
       "id": "review",
-      "models": ["claude-sonnet-5-5", "openai-codex/gpt-5.6-sol"],
+      "models": ["claude-sonnet-5-5", "openai-codex/gpt-6.1-sol"],
       "note": "The fresh-context reviewing lane."
     },
     {
       "id": "second_review",
-      "models": ["openai-codex/gpt-5.6-sol", "xai-oauth/grok-4.6", "claude-sonnet-5-5"],
+      "models": ["openai-codex/gpt-6.1-sol", "xai-oauth/grok-4.6", "claude-sonnet-5-5"],
       "note": "The independent second reviewing lane, which is required to come from a different provider than the builder of the same work."
     },
     {
       "id": "lint",
-      "models": ["claude-sonnet-5-5", "openai-codex/gpt-5.6-sol"],
+      "models": ["claude-sonnet-5-5", "openai-codex/gpt-6.1-sol"],
       "note": "Mechanical checks."
     },
     {
       "id": "research",
-      "models": ["openai-codex/gpt-5.6-sol", "claude-sonnet-5-5"],
+      "models": ["openai-codex/gpt-6.1-sol", "claude-sonnet-5-5"],
       "note": "Reading-heavy investigation."
     }
   ]
