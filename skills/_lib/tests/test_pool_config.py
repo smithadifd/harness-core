@@ -264,26 +264,26 @@ def test_shipped_defaults_resolve_one_known_order_per_work_kind():
         for kind in config.work_kinds
     }
     assert resolved == {
-        "orchestration": ("claude-opus-5-5", "openai-codex/gpt-5.6-sol"),
-        "hard_build": ("claude-opus-5-5", "openai-codex/gpt-5.6-sol"),
+        "orchestration": ("claude-opus-5-5", "openai-codex/gpt-6.1-sol"),
+        "hard_build": ("claude-opus-5-5", "openai-codex/gpt-6.1-sol"),
         "mechanical_build": (
             "xai-oauth/grok-4.6",
-            "openai-codex/gpt-5.6-sol",
+            "openai-codex/gpt-6.1-sol",
             "claude-sonnet-5-5",
         ),
         "docs": (
             "google-antigravity/gemini-3.8-flash",
-            "openai-codex/gpt-5.6-sol",
+            "openai-codex/gpt-6.1-sol",
             "claude-sonnet-5-5",
         ),
-        "review": ("claude-sonnet-5-5", "openai-codex/gpt-5.6-sol"),
+        "review": ("claude-sonnet-5-5", "openai-codex/gpt-6.1-sol"),
         "second_review": (
-            "openai-codex/gpt-5.6-sol",
+            "openai-codex/gpt-6.1-sol",
             "xai-oauth/grok-4.6",
             "claude-sonnet-5-5",
         ),
-        "lint": ("claude-sonnet-5-5", "openai-codex/gpt-5.6-sol"),
-        "research": ("openai-codex/gpt-5.6-sol", "claude-sonnet-5-5"),
+        "lint": ("claude-sonnet-5-5", "openai-codex/gpt-6.1-sol"),
+        "research": ("openai-codex/gpt-6.1-sol", "claude-sonnet-5-5"),
     }, "the shipped defaults resolve a different order than the recorded one"
 
 
@@ -406,7 +406,7 @@ def test_override_fixture_drops_every_model_of_a_disabled_pool():
             f"pool 'xai-grok': {order}"
         )
     assert pool_config.resolve_eligible_models(config, "mechanical_build") == (
-        "openai-codex/gpt-5.6-sol",
+        "openai-codex/gpt-6.1-sol",
         "claude-sonnet-5-5",
     ), "disabling a secondary pool must fall back to the primary pools, in declared order"
 
@@ -1164,7 +1164,7 @@ def test_cli_prints_the_eligible_order_one_per_line(capsys):
     assert exit_code == 0
     assert captured.out.splitlines() == [
         "xai-oauth/grok-4.6",
-        "openai-codex/gpt-5.6-sol",
+        "openai-codex/gpt-6.1-sol",
         "claude-sonnet-5-5",
     ], f"the command line must print the eligible order, most preferred first: {captured.out!r}"
 
@@ -1176,7 +1176,7 @@ def test_cli_applies_a_user_configuration(capsys):
     captured = capsys.readouterr()
     assert exit_code == 0
     assert captured.out.splitlines() == [
-        "openai-codex/gpt-5.6-sol",
+        "openai-codex/gpt-6.1-sol",
         "claude-sonnet-5-5",
     ], f"--config must be merged over the shipped defaults: {captured.out!r}"
 

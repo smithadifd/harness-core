@@ -73,7 +73,7 @@ def test_well_known_pool_override_is_read_at_run_time(tmp_path):
 
     assert before.returncode == after.returncode == 0, before.stderr + after.stderr
     assert before.stdout.splitlines()[0] == "xai-oauth/grok-4.6"
-    assert after.stdout.splitlines()[0] == "openai-codex/gpt-5.6-sol", (
+    assert after.stdout.splitlines()[0] == "openai-codex/gpt-6.1-sol", (
         "the override created between runs was not read from the current HOME"
     )
 
@@ -118,7 +118,7 @@ def test_relative_xdg_config_home_is_ignored_from_any_directory(tmp_path):
 
     assert first.returncode == second.returncode == 0, first.stderr + second.stderr
     assert first.stdout.splitlines()[0] == second.stdout.splitlines()[0] == (
-        "openai-codex/gpt-5.6-sol"
+        "openai-codex/gpt-6.1-sol"
     ), "a relative XDG_CONFIG_HOME was not ignored in favour of the HOME fallback"
 
 
