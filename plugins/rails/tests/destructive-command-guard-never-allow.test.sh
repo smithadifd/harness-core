@@ -7,6 +7,10 @@
 #   N2 dynamic: every command the source suite accepted through the adapter
 #      is silent here, and the engine still says it judged and accepted it.
 #   N3: an engine that prints an allow verdict is denied as invalid output.
+#   N4: with a trusted rm-roots file set (a copy of the guard whose account
+#      home folder is a fixture), every N2 command is still silent and still
+#      judged, an rm of a file below a listed root is silent too, and an
+#      engine allow verdict still denies.
 # Command strings are inert JSON data and are never executed.
 set -u
 LC_ALL=C
@@ -57,35 +61,49 @@ else
 fi
 
 printf '%s\n' '== N2 dynamic: what the source accepted is silent here =='
+# The guard and working folder the N2 rows run against.
+N2_GUARD="$GUARD"
+N2_CWD="$WORKTREE"
 payload() {
-  "$JQ" -cn --arg cwd "$WORKTREE" --arg command "$1" \
+  "$JQ" -cn --arg cwd "$N2_CWD" --arg command "$1" \
     '{hook_event_name:"PreToolUse",tool_name:"Bash",tool_input:{command:$command},cwd:$cwd}'
 }
 n2() { # LABEL COMMAND
   local out rc policy
-  out="$(payload "$2" | /bin/bash --noprofile --norc -p "$GUARD" --scratchpad "$SCRATCHPAD" --authorized-worktree "$DISPOSABLE" 2>/dev/null)"
+  out="$(payload "$2" | /bin/bash --noprofile --norc -p "$N2_GUARD" --scratchpad "$SCRATCHPAD" --authorized-worktree "$DISPOSABLE" 2>/dev/null)"
   rc=$?
   if [ "$rc" -eq 0 ] && [ -z "$out" ]; then
     pass "N2 $1: silent (exit 0, no output)"
   else
     fail "N2 $1: expected silence, got exit $rc and output ${out:0:160}"
   fi
-  policy="$("$JQ" -cn --arg cwd "$WORKTREE" --arg command "$2" '{cwd:$cwd,command:$command}' \
-    | /bin/bash --noprofile --norc -p "$GUARD" --policy --scratchpad "$SCRATCHPAD" --authorized-worktree "$DISPOSABLE" 2>/dev/null)"
+  policy="$("$JQ" -cn --arg cwd "$N2_CWD" --arg command "$2" '{cwd:$cwd,command:$command}' \
+    | /bin/bash --noprofile --norc -p "$N2_GUARD" --policy --scratchpad "$SCRATCHPAD" --authorized-worktree "$DISPOSABLE" 2>/dev/null)"
   if [ "$policy" = '{"decision":"no_opinion","reason":"accepted"}' ]; then
     pass "N2 $1: the engine judged and accepted it"
   else
     fail "N2 $1: the engine said $policy"
   fi
 }
-n2 "literal build descendant" 'rm -rf ./build'
-n2 "two literal relative descendants" 'rm -rf ./build ./build/cache'
-n2 "explicitly authorized disposable worktree" "git worktree remove $DISPOSABLE"
-n2 "literal nested build descendant" 'rm -f ./build/cache/file'
-n2 "named scratchpad descendant" "rm -rf $SCRATCHPAD/cache"
-for rm_spelling in /bin/rm /usr/bin/rm ./rm ../bin/rm 'command rm' 'exec rm' 'env rm' 'sudo rm' 'nohup rm' 'nice rm'; do
-  n2 "$rm_spelling literal descendant" "$rm_spelling -rf ./build"
-done
+n2_rows() {
+  local rm_spelling
+  n2 "literal build descendant" 'rm -rf ./build'
+  n2 "two literal relative descendants" 'rm -rf ./build ./build/cache'
+  n2 "explicitly authorized disposable worktree" "git worktree remove $DISPOSABLE"
+  n2 "literal nested build descendant" 'rm -f ./build/cache/file'
+  n2 "named scratchpad descendant" "rm -rf $SCRATCHPAD/cache"
+  for rm_spelling in /bin/rm /usr/bin/rm ./rm ../bin/rm 'command rm' 'exec rm' 'env rm' 'sudo rm' 'nohup rm' 'nice rm'; do
+    n2 "$rm_spelling literal descendant" "$rm_spelling -rf ./build"
+  done
+  n2 "tab-separated literal rm" $'rm\t-rf\t./build'
+  n2 "leading negation operator with literal descendant" '! rm -rf ./build'
+  n2 "assignment prefix with literal descendant" 'FOO=1 rm -rf ./build'
+  n2 "sudo option with literal descendant" 'sudo -n rm -rf ./build'
+  n2 "env option with literal descendant" 'env -i rm -rf ./build'
+  n2 "nested supported prefixes with literal descendant" 'sudo -n env NAME=value command -p rm -rf ./build'
+  n2 "relative recursive rm" 'rm -r build'
+}
+n2_rows
 # The source accepted a line continuation inside a literal rm; rule G now
 # denies it, since a continuation beside a removal word can hide a separator.
 out="$(payload $'rm -rf \\\n./build' | /bin/bash --noprofile --norc -p "$GUARD" --scratchpad "$SCRATCHPAD" --authorized-worktree "$DISPOSABLE" 2>/dev/null)"
@@ -93,13 +111,6 @@ case "$out" in
   *'"permissionDecision":"deny"'*'(reason=hidden_separator)'*) pass "N2 continued literal rm: deny/hidden_separator (rule G)" ;;
   *) fail "N2 continued literal rm: expected deny/hidden_separator, got ${out:0:160}" ;;
 esac
-n2 "tab-separated literal rm" $'rm\t-rf\t./build'
-n2 "leading negation operator with literal descendant" '! rm -rf ./build'
-n2 "assignment prefix with literal descendant" 'FOO=1 rm -rf ./build'
-n2 "sudo option with literal descendant" 'sudo -n rm -rf ./build'
-n2 "env option with literal descendant" 'env -i rm -rf ./build'
-n2 "nested supported prefixes with literal descendant" 'sudo -n env NAME=value command -p rm -rf ./build'
-n2 "relative recursive rm" 'rm -r build'
 
 printf '%s\n' '== N3: an allow from the engine is never passed through =='
 STANDIN="$TEST_ROOT/allow-policy.sh"
@@ -111,6 +122,37 @@ reason="$(printf '%s' "$out" | "$JQ" -er '.hookSpecificOutput.permissionDecision
 case "$rc:$decision:$reason" in
   "0:deny:Destructive command guard denied the command (reason=engine_output_invalid)"*) pass "N3 an engine allow verdict denies as engine_output_invalid" ;;
   *) fail "N3 an engine allow verdict gave exit $rc, decision $decision, reason ${reason:0:120}" ;;
+esac
+
+printf '%s\n' '== N4: with an rm-roots file set, nothing allows either =='
+ROOTS_HOME="$TEST_ROOT/acct-home"
+ROOTS_DIR="$TEST_ROOT/rm-root"
+ROOTS_WORKSPACE="$TEST_ROOT/workspace"
+ROOTS_GUARD="$TEST_ROOT/guard-rm-roots.sh"
+mkdir -p "$ROOTS_HOME/.claude/rails" "$ROOTS_DIR" "$ROOTS_WORKSPACE"
+chmod 700 "$ROOTS_HOME/.claude/rails"
+printf '%s\n' "$ROOTS_DIR" >"$ROOTS_HOME/.claude/rails/rm-roots"
+chmod 600 "$ROOTS_HOME/.claude/rails/rm-roots"
+printf 'x\n' >"$ROOTS_DIR/file.md"
+# A copy of the guard whose rm_roots_account_home prints the fixture home.
+awk -v home="$ROOTS_HOME" '
+  /^rm_roots_account_home\(\) \{$/ { print; printf "  printf %c%%s%c %c%s%c\n", 39, 39, 39, home, 39; on = 1; done++; next }
+  on && /^}$/ { on = 0; print; next }
+  on { next }
+  { print }
+  END { if (done != 1) exit 1 }
+' "$GUARD" >"$ROOTS_GUARD" || { fail "N4 fixture: the guard has no rm_roots_account_home function to rewrite"; exit 1; }
+N2_GUARD="$ROOTS_GUARD"
+n2_rows
+N2_CWD="$ROOTS_WORKSPACE"
+n2 "rm-roots file below a listed root, from a folder in no repository" "rm -f $ROOTS_DIR/file.md"
+out="$(payload 'printf safe' | /bin/bash --noprofile --norc -p "$ROOTS_GUARD" --adapter-policy "$STANDIN" 2>/dev/null)"
+rc=$?
+decision="$(printf '%s' "$out" | "$JQ" -er '.hookSpecificOutput.permissionDecision' 2>/dev/null || printf none)"
+reason="$(printf '%s' "$out" | "$JQ" -er '.hookSpecificOutput.permissionDecisionReason' 2>/dev/null || :)"
+case "$rc:$decision:$reason" in
+  "0:deny:Destructive command guard denied the command (reason=engine_output_invalid)"*) pass "N4 with rm-roots set, an engine allow verdict denies as engine_output_invalid" ;;
+  *) fail "N4 with rm-roots set, an engine allow verdict gave exit $rc, decision $decision, reason ${reason:0:120}" ;;
 esac
 
 if [ "$FAILURES" -eq 0 ]; then

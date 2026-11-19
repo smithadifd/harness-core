@@ -631,6 +631,19 @@ v0.1.3 now reads as `ask`.
   (`LANE_ROOTS_REGISTRY`, `CLEANUP_ITEMS_REGISTRY`, `SEAT_SCRATCH`) are set;
   set to a registry that is absent, untrusted or malformed, they deny every
   removal by name.
+- **Extra rm roots (optional).** From a working folder in no git repository,
+  an `rm -f` of a regular file strictly below a folder listed in the file
+  `.claude/rails/rm-roots` in your home folder is accepted (silent), when the
+  file is outside every git repository and the rm is not recursive. The guard
+  reads that file in the home folder your account's password entry names,
+  never the one `HOME` names.
+  It holds one absolute, existing, canonically spelled folder per line; the
+  root folder, `/Users`, the home folder and any folder above it are refused.
+  The file and its folder must be owned by you and not group- or
+  world-writable. With no file nothing changes; an untrusted or malformed file
+  denies every rm, as `rm_roots_untrusted` or `rm_roots_malformed`, and the
+  reason names the file. A working folder inside a worktree never reads the
+  listed folders.
 - **What it does not claim.** It is detection, not prevention. It does not
   see a removal whose name is built indirectly (`$CMD -rf /`), a wrapper it
   does not list (`chronic`, `ssh`), an interpreter (`python3 -c`), a script
