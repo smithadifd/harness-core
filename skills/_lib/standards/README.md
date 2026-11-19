@@ -35,5 +35,7 @@ Standards in this folder:
   purpose, posture, principles, the core and where the rules live.
 - [`licensing.md`](licensing.md) — license and funding policy, and the selling
   and open-core guidance. Funding handles belong to the instance.
+- [`release.md`](release.md) — release classes (versioned, continuous, none),
+  the one-line declaration, and the tag, changelog and GitHub Release rules.
 - [`prompting.md`](prompting.md) — how to write sub-agent briefs and scope
   reviewers.

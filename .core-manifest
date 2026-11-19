@@ -139,6 +139,7 @@ skills/_lib/standards/harness-definition.md
 skills/_lib/standards/licensing.md
 skills/_lib/standards/portable-core.md
 skills/_lib/standards/prompting.md
+skills/_lib/standards/release.md
 skills/_lib/standards/security.md
 skills/_lib/standards/trust-ladder.md
 skills/_lib/tests/fixtures/model_promotion/overlay.json
