@@ -40,6 +40,7 @@ SUITES = [
     "destructive-command-guard-pins.test.sh",
     "destructive-command-guard-reasons.test.sh",
     "destructive-command-guard-redirect.test.sh",
+    "destructive-command-guard-rm-roots.test.sh",
     "destructive-command-guard-scope.test.sh",
     "destructive-command-guard-unavailable-temp.test.sh",
     "destructive-command-guard-workspace-cwd.test.sh",

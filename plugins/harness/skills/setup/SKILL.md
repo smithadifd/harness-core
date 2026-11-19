@@ -40,10 +40,11 @@ Rules that hold in every mode:
   settings file, the ledger or an instance folder yourself.
 - Never ask for, print or store a credential.
 - Single-quote every value you put into a command: the operator, the harness,
-  each `--approve` id and the instance folder's path, exactly as the templates
-  below show. The deny ids contain parentheses (`deny:Read(.env)`), which the
-  shell reads as syntax, so an unquoted id stops the command before the script
-  runs. If a value itself holds a single quote, write that quote as `'\''`.
+  each `--approve` id, the ledger database's path and the instance folder's
+  path, exactly as the templates below show. The deny ids contain parentheses
+  (`deny:Read(.env)`), which the shell reads as syntax, so an unquoted id stops
+  the command before the script runs. If a value itself holds a single quote,
+  write that quote as `'\''`.
 
 ## Set up
 
@@ -54,7 +55,13 @@ Rules that hold in every mode:
    message to be the name. Never ask for it with a picker, option list or
    question dialog: its free-text choice dismisses the question. The harness
    name is `claude-code` unless they give another; use it wherever
-   `<harness>` appears.
+   `<harness>` appears. If the person tells you they already keep a ledger
+   database at another path, add `--db '<path>'`, with that absolute path (a
+   leading `~` replaced with their home folder), to the `plan`, `apply` and
+   `ledger-init` commands below, the same path in all three. Never choose or
+   suggest a path for them. Setup then lists that path in the plan, stores it
+   as the ledger's database option and uses a database already there as it
+   is: it never makes a second one.
 
 2. **Print the plan.** Nothing is written by this step:
 

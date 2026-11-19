@@ -108,6 +108,7 @@ the text itself.
 | `plugins/rails/tests/destructive-command-guard-pins.test.sh` | pins of the temp roots, the strict-descendant rules and delegated shells |
 | `plugins/rails/tests/destructive-command-guard-reasons.test.sh` | static checks of the guard's reason codes, hints and time budgets |
 | `plugins/rails/tests/destructive-command-guard-redirect.test.sh` | tests of the symlinked-redirect denial |
+| `plugins/rails/tests/destructive-command-guard-rm-roots.test.sh` | tests of the account's rm-roots file: the files it lets an rm from a folder in no repository remove, what it never does, and the untrusted, malformed and absent file |
 | `plugins/rails/tests/destructive-command-guard-scope.test.sh` | the interface-level scope check: an accepted rm is silent, an ordinary command has no opinion |
 | `plugins/rails/tests/destructive-command-guard-unavailable-temp.test.sh` | the unavailable-temp regression |
 | `plugins/rails/tests/destructive-command-guard-workspace-cwd.test.sh` | tests of a working folder in no git repository |
