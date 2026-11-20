@@ -3,6 +3,62 @@
 Each tag of this repository gets an entry: what changed in the vendored files,
 and any pin move of the vendored ledger.
 
+## v0.2.0
+
+Everything merged since v0.1.6. Both plugins move, so a machine that installed
+an earlier tag picks up the new builds when it moves to this tag: `harness`
+from 0.1.1 to 0.2.0 and `rails` from 0.1.1 to 0.2.0. No pin move: the
+marketplace's `sdlc` pin stays at skills `v1.5.0` and its `ledger-hooks` pin
+at ledger `v0.4.0`, and `ledger-vendor.pin` is unchanged.
+
+`harness` 0.2.0:
+
+- Setup proposes turning off Claude Code's prompt suggestions (#21). A new
+  optional item, `prompt-suggestions`, sets the user setting
+  `promptSuggestionEnabled` to `false`, so an empty prompt stays empty instead
+  of holding a grey suggested reply that Enter would send. It is applied only
+  on a yes, only when the person has not set that key, and uninstall takes it
+  out again. The setup skill says what it is for when it asks, and the README
+  lists it with the other optional settings changes.
+- `plan`, `apply` and `ledger-init` take `--db <absolute path>` for a person
+  who already keeps a ledger database at another path (#24). The plan lists
+  that path, apply stores it as the ledger's database option, and a database
+  already there is used as it is: setup never makes a second one. A relative
+  path is refused. The setup skill passes the same path to all three commands
+  and never chooses a path for the person.
+- The rules default placed by setup gains one line: a guard's deny is final,
+  and nobody uses or offers a way around it (#22).
+
+`rails` 0.2.0:
+
+- The destructive-command guard accepts an `rm -f` of a regular file under a
+  folder listed in the account's `.claude/rails/rm-roots` file (#26). The file
+  is optional and guard-owned: the guard finds it in the home folder the
+  account's password entry names, never from `HOME`, another variable or the
+  command text. The rule applies only from a working folder in no git
+  repository, to a file strictly below a listed folder that is outside every
+  git repository, with no recursive flag. With no file, every verdict is
+  unchanged. A file that is not trusted (not a regular file, a symlink,
+  not owned by the user, or writable by the group or others) denies every
+  judged `rm` as `rm_roots_untrusted`; a malformed one denies as
+  `rm_roots_malformed`. `hooks.json` and `plugin.json` options are unchanged.
+- Both guards' deny messages end with a fixed sentence that the deny is final
+  and that nobody uses or offers a way around it, and the hints no longer
+  invite one (for example the git guard's option hints now say the option is
+  the person's to set) (#22). Which commands deny, ask or pass is unchanged.
+
+No plugin change:
+
+- The README opens with why the harness exists, what a person gets and how it
+  fits together (#23); the named current tag moves to `v0.2.0` and the version
+  column text to 0.2.0, which tests tie to this file and the manifests.
+- `skills/_lib/standards/release.md`, the release standard, is mirrored in
+  (#25), with its `.core-manifest` line.
+- The sol lane's pool pin in `skills/_lib/pool-defaults.json` moves to GPT-6.1
+  Sol, with the previous pin kept as available inventory (#27).
+- `KNOWN-LIMITS.md` follows #22, #24 and #26: guard line references, the
+  `--db` wording and the rm-roots limit.
+
 ## v0.1.6
 
 README fixes from the third fresh-home walk. Docs only: no plugin changes
