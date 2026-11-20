@@ -75,7 +75,7 @@ def test_plugin_manifest():
     manifest = load(".claude-plugin", "plugin.json")
     assert manifest == {
         "name": "rails",
-        "version": "0.1.1",
+        "version": "0.2.0",
         "description": "Guard hooks for shell commands: deny destructive commands, ask before a push to main "
                        "or a force-push. No hook in this plugin ever allows.",
         "author": {"name": "harness-core maintainers"},

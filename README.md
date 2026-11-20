@@ -252,7 +252,7 @@ claude plugin list
 ```
 
 `vX.Y.Z` is a release tag of this repository: use the current one, which is
-`v0.1.6`. Each release moves it, so if this text may be older than the
+`v0.2.0`. Each release moves it, so if this text may be older than the
 repository, read the newest tag on the repository's Tags page on GitHub, or run
 one command and take the highest version it lists:
 
@@ -262,7 +262,7 @@ git ls-remote --tags https://github.com/smithadifd/harness-core.git
 
 The list shows `harness`, `sdlc` and `ledger-hooks` enabled. Its version
 column is each plugin's own version, not this repository's tag: `harness` and
-`rails` show 0.1.1, the version in their manifests at this repository's tag,
+`rails` show 0.2.0, the version in their manifests at this repository's tag,
 and `sdlc` shows 0.15.0, which is the skills release `v1.5.0` at the pinned
 commit; `ledger-hooks` shows 0.4.0, which is the ledger release `v0.4.0` at
 the pinned commit. Start a new session, or run `/reload-plugins` in an

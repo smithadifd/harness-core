@@ -894,7 +894,8 @@ def test_the_release_entry_corrects_the_v0_1_4_known_limits_claim_and_moves_no_p
     assert "KNOWN-LIMITS.md" in entry and "the file only gained the five lines" in entry
     stays = re.search(r"`harness` and `rails` stay at (\d+\.\d+\.\d+)", entry)
     assert stays, "the entry does not say the plugin versions stay"
-    assert stays.group(1) == plugin_version("harness") == plugin_version("rails")
+    # A past entry records the version its tag carried, not the current manifest's.
+    assert stays.group(1) == "0.1.1"
 
 
 # ---------------------------------------------------------------------------
@@ -965,7 +966,8 @@ def test_the_readme_ledger_hooks_version_matches_the_marketplace_pin():
 
 def test_the_v0_1_6_entry_covers_the_walk_fixes_and_moves_no_plugin():
     headings = changelog_headings()
-    assert headings[:2] == ["v0.1.6", "v0.1.5"]
+    first = headings.index("v0.1.6")
+    assert headings[first:first + 2] == ["v0.1.6", "v0.1.5"]
     entry = one_line(changelog_entry("v0.1.6"))
     for claim in ("collapsed under \"Ran 1 shell command\"", "ctrl+o",
                   "\"Background work is running\"", "release and resume",
@@ -975,7 +977,30 @@ def test_the_v0_1_6_entry_covers_the_walk_fixes_and_moves_no_plugin():
         assert claim in entry, claim
     stays = re.search(r"`harness` and `rails` stay at (\d+\.\d+\.\d+)", entry)
     assert stays, "the entry does not say the plugin versions stay"
-    assert stays.group(1) == plugin_version("harness") == plugin_version("rails")
+    # A past entry records the version its tag carried, not the current manifest's.
+    assert stays.group(1) == "0.1.1"
+
+
+# ---------------------------------------------------------------------------
+# The v0.2.0 release: the entry names each plugin's move, and the manifests agree with it.
+
+
+def test_the_v0_2_0_entry_names_each_plugin_move_and_the_manifests_carry_it():
+    headings = changelog_headings()
+    assert headings[headings.index("v0.2.0"):][:2] == ["v0.2.0", "v0.1.6"]
+    entry = one_line(changelog_entry("v0.2.0"))
+    assert "`harness` from 0.1.1 to 0.2.0" in entry and "`rails` from 0.1.1 to 0.2.0" in entry
+    if headings[0] == "v0.2.0":
+        # While this is the newest entry, the manifests carry the versions it names.
+        assert plugin_version("harness") == plugin_version("rails") == "0.2.0"
+    for section_name in ("`harness` 0.2.0:", "`rails` 0.2.0:"):
+        assert section_name in entry, section_name
+    for number in ("#21", "#22", "#23", "#24", "#25", "#26", "#27"):
+        assert number in entry, number
+    assert "No pin move" in entry
+    sources = {e["name"]: e["source"] for e in marketplace_manifest()["plugins"]
+               if isinstance(e["source"], dict)}
+    assert sources["sdlc"]["ref"] == "v1.5.0" and sources["ledger-hooks"]["ref"] == "v0.4.0"
 
 
 def test_the_readme_and_changelog_do_not_use_the_word_builder():
