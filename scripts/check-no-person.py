@@ -19,7 +19,13 @@ Two kinds of rule run over every line of every tracked file:
   token shapes and private-key headers. Under ``skills/_lib/ledger/``, the
   public ledger tree vendored unchanged, two shapes do not run in its files:
   "private home folder" and "decision number" (VENDORING.md's carve record
-  names the same allowance).
+  names the same allowance). The private-network hostname shape has one
+  narrower carve: in exactly ``skills/_lib/ledger/verbs/doc.py``, its first
+  hit is allowed only when the whole file tokenizes without an error token
+  and the hit's tokens are NAME ``os``, OP ``.``, NAME ``open``, OP ``(``,
+  NAME ``root``, OP ``.``, NAME ``home``.
+  A decode or tokenize error gives that file no carve; a second occurrence,
+  another shape on the line, or any other path still fails.
 - The deny list: person, owner and private-system words come only from the
   environment variable NO_PERSON_DENY, a case-insensitive regular expression
   of terms joined by ``|`` (CI fills it from the repository secret of that
@@ -77,10 +83,12 @@ failure. Nothing is ever skipped silently.
 from __future__ import annotations
 
 import hashlib
+import io
 import os
 import re
 import subprocess
 import sys
+import tokenize
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -91,6 +99,12 @@ LEDGER_TREE = "skills/_lib/ledger/"
 # Two shapes do not run in a file under the public ledger tree: its own
 # home-folder paths and decision numbers. Every other shape still does.
 LEDGER_SHAPES = frozenset({"private home folder", "decision number"})
+LEDGER_DOC_PATH = "skills/_lib/ledger/verbs/doc.py"
+LEDGER_DOC_HOME_TOKENS = (
+    (tokenize.NAME, "os"), (tokenize.OP, "."), (tokenize.NAME, "open"),
+    (tokenize.OP, "("), (tokenize.NAME, "root"), (tokenize.OP, "."),
+    (tokenize.NAME, "home"),
+)
 # The license carve (see the docstring): exactly this path, exactly this line
 # shape, and the holder text pinned by its sha256.
 LICENSE_PATH = "LICENSE"
@@ -278,6 +292,36 @@ def license_copyright_line(path: str, line: str) -> bool:
     return hashlib.sha256(holder).hexdigest() == LICENSE_HOLDER_SHA256
 
 
+def ledger_doc_home_spans(path: str, data: bytes) -> frozenset[tuple[int, int, int]]:
+    """Token spans eligible for the document-root home-attribute carve."""
+    if path != LEDGER_DOC_PATH:
+        return frozenset()
+    try:
+        encoding, _consumed = tokenize.detect_encoding(io.BytesIO(data).readline)
+        data.decode(encoding)
+        tokens = list(tokenize.tokenize(io.BytesIO(data).readline))
+    except (UnicodeDecodeError, tokenize.TokenError, SyntaxError, IndentationError):
+        return frozenset()
+    if any(token.type == tokenize.ERRORTOKEN or
+           (token.type == tokenize.OP and token.string not in tokenize.EXACT_TOKEN_TYPES)
+           for token in tokens):
+        # Python 3.14 reports some characters as an unknown OP that earlier
+        # tokenizers report as ERRORTOKEN. Both forms fail closed.
+        return frozenset()
+
+    width = len(LEDGER_DOC_HOME_TOKENS)
+    spans: set[tuple[int, int, int]] = set()
+    for start in range(len(tokens) - width + 1):
+        window = tokens[start:start + width]
+        if tuple((token.type, token.string) for token in window) != LEDGER_DOC_HOME_TOKENS:
+            continue
+        row = window[0].start[0]
+        if any(token.start[0] != row or token.end[0] != row for token in window):
+            continue
+        spans.add((row, window[4].start[1], window[6].end[1]))
+    return frozenset(spans)
+
+
 def scan_text(path: str, data: bytes, deny: re.Pattern[str] | None,
               allowed: dict[tuple[str, str], int], used: set[tuple[str, str]]) -> list[str]:
     """One ``<path>:<line>: <rule>`` per rule a line of ``data`` breaks.
@@ -287,6 +331,8 @@ def scan_text(path: str, data: bytes, deny: re.Pattern[str] | None,
     UTF-8 punctuation still ends at a word boundary."""
     text = data.decode("utf-8", errors="surrogateescape")
     in_ledger = path.startswith(LEDGER_TREE)
+    doc_home_spans = ledger_doc_home_spans(path, data)
+    doc_home_used = False
     hits: list[str] = []
     carved = False
     for number, line in enumerate(text.split("\n"), 1):
@@ -297,7 +343,17 @@ def scan_text(path: str, data: bytes, deny: re.Pattern[str] | None,
         for name, pattern in SHAPES:
             if in_ledger and name in LEDGER_SHAPES:
                 continue
-            if pattern.search(line):
+            if name == "private-network hostname":
+                uncarved = False
+                for match in pattern.finditer(line):
+                    span = (number, match.start(), match.end())
+                    if not doc_home_used and span in doc_home_spans:
+                        doc_home_used = True
+                    else:
+                        uncarved = True
+                if uncarved:
+                    rules.append(f"no-person shape: {name}")
+            elif pattern.search(line):
                 rules.append(f"no-person shape: {name}")
         for name, pattern in SECRET_SHAPES:
             if pattern.search(line):

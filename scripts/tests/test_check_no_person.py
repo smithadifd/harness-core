@@ -169,6 +169,97 @@ def test_j3_the_two_ledger_shapes_still_fail_outside_the_ledger_tree(tmp_path):
     assert "skills/_lib/ledger.py:1: no-person shape: decision number" in lines(result)
 
 
+LEDGER_DOC = "skills/_lib/ledger/verbs/doc.py"
+DOC_HOME_OPEN = "home_fd = os.open(root" + ".home, os.O_RDONLY | directory)\n"
+
+
+def test_j3_the_ledger_doc_home_open_line_is_allowed_once(tmp_path):
+    repo = build(tmp_path, {LEDGER_DOC: DOC_HOME_OPEN})
+    result = run(repo, NO_PERSON_DENY=DENY)
+    assert result.returncode == 0, result.stdout
+
+
+def test_j3_a_second_ledger_doc_home_open_line_fails(tmp_path):
+    repo = build(tmp_path, {LEDGER_DOC: DOC_HOME_OPEN * 2})
+    result = run(repo, NO_PERSON_DENY=DENY)
+    assert result.returncode == 1
+    assert f"{LEDGER_DOC}:2: no-person shape: private-network hostname" in lines(result)
+    assert f"{LEDGER_DOC}:1: no-person shape: private-network hostname" not in lines(result)
+
+
+def test_j3_another_shape_on_the_allowed_line_still_fails(tmp_path):
+    source = DOC_HOME_OPEN.rstrip("\n") + "  # " + SHAPE_PLANTS["absolute home"] + "\n"
+    repo = build(tmp_path, {LEDGER_DOC: source})
+    result = run(repo, NO_PERSON_DENY=DENY)
+    assert result.returncode == 1
+    assert f"{LEDGER_DOC}:1: no-person shape: absolute home" in lines(result)
+    assert f"{LEDGER_DOC}:1: no-person shape: private-network hostname" not in lines(result)
+
+
+def test_j3_the_home_open_line_fails_in_another_ledger_file(tmp_path):
+    path = "skills/_lib/ledger/verbs/other.py"
+    repo = build(tmp_path, {path: DOC_HOME_OPEN})
+    result = run(repo, NO_PERSON_DENY=DENY)
+    assert result.returncode == 1
+    assert f"{path}:1: no-person shape: private-network hostname" in lines(result)
+
+
+def test_j3_the_home_open_line_fails_outside_the_ledger_tree(tmp_path):
+    path = "lib/doc.py"
+    repo = build(tmp_path, {path: DOC_HOME_OPEN})
+    result = run(repo, NO_PERSON_DENY=DENY)
+    assert result.returncode == 1
+    assert f"{path}:1: no-person shape: private-network hostname" in lines(result)
+
+
+@pytest.mark.parametrize("source", [
+    "home_fd = os.open(other" + ".home, flags)\n",
+    "home_fd = open(root" + ".home, flags)\n",
+    "text = 'os.open(root" + ".home, flags)'\n",
+    "# os.open(root" + ".home, flags)\n",
+])
+def test_j3_ledger_doc_home_open_near_misses_fail(tmp_path, source):
+    repo = build(tmp_path, {LEDGER_DOC: source})
+    result = run(repo, NO_PERSON_DENY=DENY)
+    assert result.returncode == 1
+    assert f"{LEDGER_DOC}:1: no-person shape: private-network hostname" in lines(result)
+
+
+@pytest.mark.parametrize("tail", [
+    "`\n",
+    "\"\"\"unterminated\n",
+    "if True:\n    pass\n  pass\n",
+])
+def test_j3_a_tokenize_error_gives_the_ledger_doc_no_allowance(tmp_path, tail):
+    repo = build(tmp_path, {LEDGER_DOC: DOC_HOME_OPEN + tail})
+    result = run(repo, NO_PERSON_DENY=DENY)
+    assert result.returncode == 1
+    assert f"{LEDGER_DOC}:1: no-person shape: private-network hostname" in lines(result)
+
+
+def test_j3_an_unknown_source_encoding_gives_the_ledger_doc_no_allowance(tmp_path):
+    source = b"# coding: no-such-codec\n" + DOC_HOME_OPEN.encode("utf-8")
+    repo = build(tmp_path, {LEDGER_DOC: source})
+    result = run(repo, NO_PERSON_DENY=DENY)
+    assert result.returncode == 1
+    assert f"{LEDGER_DOC}:2: no-person shape: private-network hostname" in lines(result)
+
+
+def test_j3_an_undecodable_byte_gives_the_ledger_doc_no_allowance(tmp_path):
+    source = DOC_HOME_OPEN.encode("utf-8") + b"# \xff\n"
+    repo = build(tmp_path, {LEDGER_DOC: source})
+    result = run(repo, NO_PERSON_DENY=DENY)
+    assert result.returncode == 1
+    assert f"{LEDGER_DOC}:1: no-person shape: private-network hostname" in lines(result)
+
+
+def test_j3_the_real_vendored_ledger_doc_passes_the_whole_check(tmp_path):
+    source = (SCRIPT.parents[1] / LEDGER_DOC).read_bytes()
+    repo = build(tmp_path, {LEDGER_DOC: source})
+    result = run(repo, NO_PERSON_DENY=DENY)
+    assert result.returncode == 0, result.stdout
+
+
 def test_j3_the_index_is_scanned_not_the_disk(tmp_path):
     repo = build(tmp_path, {"notes.md": SHAPE_PLANTS["absolute home"] + "\n"})
     (repo / "notes.md").write_text("cleaned on disk only\n")
