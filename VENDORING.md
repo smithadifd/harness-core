@@ -156,7 +156,7 @@ This repository was carved, without history, from a private toolkit at commit
 - Allowed by the scan: the public ledger repository's owner/name slug, in `ledger-vendor.pin`, `scripts/ledger-vendor-bump.py` and `scripts/tests/test_check_ledger_vendor.py` only.
 - Allowed by the scan: the person and system words under `skills/_lib/ledger/`, the public ledger tree vendored unchanged.
 - Allowed by the scan: two no-person shapes in files under `skills/_lib/ledger/`, "private home folder" (a home-folder path to a dot folder or a user folder) and "decision number"; every other path, token and private-key pattern still applies there.
-- Allowed by the scan: the one tokenized os.open of the document-root home attribute in skills/_lib/ledger/verbs/doc.py, exactly once; a decode error, tokenize error or ERRORTOKEN gives no allowance.
+- Allowed by the scan: the one tokenized os.open of the document-root home attribute in skills/_lib/ledger/verbs/doc.py, exactly once, only when the detected source encoding is UTF-8 or UTF-8-SIG and the hostname match is exactly the root dot home token pair; another encoding, a decode or tokenize error, or ERRORTOKEN gives no allowance.
 - Rewritten from its source: `.github/workflows/commit-identity.yml` carries the generic `self-hosted` runner label in place of the source's machine-named label, reads the `CORE_CI_RUNNER` repository variable in place of the source's two runner variables, and sets `persist-credentials: false` on its checkout.
 
 Each line below is one `cmp` of the file here against

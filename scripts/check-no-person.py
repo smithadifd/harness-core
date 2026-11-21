@@ -21,11 +21,14 @@ Two kinds of rule run over every line of every tracked file:
   "private home folder" and "decision number" (VENDORING.md's carve record
   names the same allowance). The private-network hostname shape has one
   narrower carve: in exactly ``skills/_lib/ledger/verbs/doc.py``, its first
-  hit is allowed only when the whole file tokenizes without an error token
-  and the hit's tokens are NAME ``os``, OP ``.``, NAME ``open``, OP ``(``,
-  NAME ``root``, OP ``.``, NAME ``home``.
-  A decode or tokenize error gives that file no carve; a second occurrence,
-  another shape on the line, or any other path still fails.
+  hit is allowed only when the detected source encoding is exactly UTF-8 or
+  UTF-8-SIG, the whole file tokenizes without an error token, the hit text is
+  exactly the ``root`` dot ``home`` token pair, and the hit's tokens are NAME
+  ``os``, OP ``.``, NAME
+  ``open``, OP ``(``, NAME ``root``, OP ``.``, NAME ``home``. The token stream
+  and hostname matches use the same decoded text. Any other encoding, a decode
+  or tokenize error, a second occurrence, another shape on the line, or any
+  other path gives no carve.
 - The deny list: person, owner and private-system words come only from the
   environment variable NO_PERSON_DENY, a case-insensitive regular expression
   of terms joined by ``|`` (CI fills it from the repository secret of that
@@ -105,6 +108,7 @@ LEDGER_DOC_HOME_TOKENS = (
     (tokenize.OP, "("), (tokenize.NAME, "root"), (tokenize.OP, "."),
     (tokenize.NAME, "home"),
 )
+LEDGER_DOC_HOME_MATCH = "root" + ".home"
 # The license carve (see the docstring): exactly this path, exactly this line
 # shape, and the holder text pinned by its sha256.
 LICENSE_PATH = "LICENSE"
@@ -292,22 +296,26 @@ def license_copyright_line(path: str, line: str) -> bool:
     return hashlib.sha256(holder).hexdigest() == LICENSE_HOLDER_SHA256
 
 
-def ledger_doc_home_spans(path: str, data: bytes) -> frozenset[tuple[int, int, int]]:
-    """Token spans eligible for the document-root home-attribute carve."""
+def ledger_doc_home_spans(
+        path: str, data: bytes) -> tuple[str, frozenset[tuple[int, int, int]]]:
+    """Decoded scan text and token spans eligible for the document-root carve."""
+    empty: frozenset[tuple[int, int, int]] = frozenset()
     if path != LEDGER_DOC_PATH:
-        return frozenset()
+        return data.decode("utf-8", errors="surrogateescape"), empty
     try:
         encoding, _consumed = tokenize.detect_encoding(io.BytesIO(data).readline)
-        data.decode(encoding)
-        tokens = list(tokenize.tokenize(io.BytesIO(data).readline))
+        if encoding.lower() not in {"utf-8", "utf-8-sig"}:
+            return data.decode("utf-8", errors="surrogateescape"), empty
+        text = data.decode(encoding)
+        tokens = list(tokenize.generate_tokens(io.StringIO(text).readline))
     except (UnicodeDecodeError, tokenize.TokenError, SyntaxError, IndentationError):
-        return frozenset()
+        return data.decode("utf-8", errors="surrogateescape"), empty
     if any(token.type == tokenize.ERRORTOKEN or
            (token.type == tokenize.OP and token.string not in tokenize.EXACT_TOKEN_TYPES)
            for token in tokens):
         # Python 3.14 reports some characters as an unknown OP that earlier
         # tokenizers report as ERRORTOKEN. Both forms fail closed.
-        return frozenset()
+        return text, empty
 
     width = len(LEDGER_DOC_HOME_TOKENS)
     spans: set[tuple[int, int, int]] = set()
@@ -319,19 +327,18 @@ def ledger_doc_home_spans(path: str, data: bytes) -> frozenset[tuple[int, int, i
         if any(token.start[0] != row or token.end[0] != row for token in window):
             continue
         spans.add((row, window[4].start[1], window[6].end[1]))
-    return frozenset(spans)
+    return text, frozenset(spans)
 
 
 def scan_text(path: str, data: bytes, deny: re.Pattern[str] | None,
               allowed: dict[tuple[str, str], int], used: set[tuple[str, str]]) -> list[str]:
     """One ``<path>:<line>: <rule>`` per rule a line of ``data`` breaks.
 
-    ``data`` is decoded as UTF-8, a byte that is not UTF-8 kept as a
-    surrogate escape, so a binary file still scans and a word followed by
-    UTF-8 punctuation still ends at a word boundary."""
-    text = data.decode("utf-8", errors="surrogateescape")
+    ``data`` normally decodes as UTF-8 with invalid bytes kept as surrogate
+    escapes. The document-root carve instead uses its accepted UTF-8 or
+    UTF-8-SIG decode for both token and shape positions."""
+    text, doc_home_spans = ledger_doc_home_spans(path, data)
     in_ledger = path.startswith(LEDGER_TREE)
-    doc_home_spans = ledger_doc_home_spans(path, data)
     doc_home_used = False
     hits: list[str] = []
     carved = False
@@ -347,7 +354,8 @@ def scan_text(path: str, data: bytes, deny: re.Pattern[str] | None,
                 uncarved = False
                 for match in pattern.finditer(line):
                     span = (number, match.start(), match.end())
-                    if not doc_home_used and span in doc_home_spans:
+                    if (not doc_home_used and match.group(0) == LEDGER_DOC_HOME_MATCH and
+                            span in doc_home_spans):
                         doc_home_used = True
                     else:
                         uncarved = True

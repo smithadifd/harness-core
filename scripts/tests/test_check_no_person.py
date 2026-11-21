@@ -10,6 +10,7 @@ private host, and the real deny list never appears in it.
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import os
 import re
 import shutil
@@ -89,6 +90,14 @@ def run(repo: Path, **env_vars: str) -> subprocess.CompletedProcess[str]:
 
 def lines(result: subprocess.CompletedProcess[str]) -> list[str]:
     return result.stdout.splitlines()
+
+
+def load_checker():
+    spec = importlib.util.spec_from_file_location("check_no_person", SCRIPT)
+    assert spec is not None and spec.loader is not None
+    checker = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(checker)
+    return checker
 
 
 def test_a_clean_tree_passes_with_the_deny_list_set(tmp_path):
@@ -251,6 +260,47 @@ def test_j3_an_undecodable_byte_gives_the_ledger_doc_no_allowance(tmp_path):
     result = run(repo, NO_PERSON_DENY=DENY)
     assert result.returncode == 1
     assert f"{LEDGER_DOC}:1: no-person shape: private-network hostname" in lines(result)
+
+
+def test_j3_a_latin_1_column_shift_cannot_move_the_ledger_doc_allowance(tmp_path):
+    multibyte = "é".encode("utf-8") * 15
+    source = (b"# coding: latin-1\n\"" + multibyte +
+              b"\"; os.open(root." + b"home(0)); host." + b"home\n")
+    checker = load_checker()
+    _text, spans = checker.ledger_doc_home_spans(LEDGER_DOC, source)
+    assert spans == frozenset()
+    repo = build(tmp_path, {LEDGER_DOC: source})
+    result = run(repo, NO_PERSON_DENY=DENY)
+    assert result.returncode == 1
+    assert f"{LEDGER_DOC}:2: no-person shape: private-network hostname" in lines(result)
+
+
+def test_j3_utf_8_sig_ledger_doc_home_open_is_allowed_once(tmp_path):
+    source = b"\xef\xbb\xbf" + DOC_HOME_OPEN.encode("utf-8")
+    repo = build(tmp_path, {LEDGER_DOC: source})
+    result = run(repo, NO_PERSON_DENY=DENY)
+    assert result.returncode == 0, result.stdout
+
+
+def test_j3_a_non_utf_8_source_gives_the_ledger_doc_no_allowance(tmp_path):
+    source = b"# coding: latin-1\n" + DOC_HOME_OPEN.encode("ascii")
+    repo = build(tmp_path, {LEDGER_DOC: source})
+    result = run(repo, NO_PERSON_DENY=DENY)
+    assert result.returncode == 1
+    assert f"{LEDGER_DOC}:2: no-person shape: private-network hostname" in lines(result)
+
+
+def test_j3_an_eligible_span_cannot_move_to_another_hostname(monkeypatch):
+    checker = load_checker()
+    monkeypatch.setattr(checker, "LEDGER_DOC_HOME_TOKENS", (
+        (checker.tokenize.NAME, "os"), (checker.tokenize.OP, "."),
+        (checker.tokenize.NAME, "open"), (checker.tokenize.OP, "("),
+        (checker.tokenize.NAME, "host"), (checker.tokenize.OP, "."),
+        (checker.tokenize.NAME, "home"),
+    ))
+    hits = checker.scan_text(
+        LEDGER_DOC, b"os.open(host." + b"home, flags)\n", None, {}, set())
+    assert hits == [f"{LEDGER_DOC}:1: no-person shape: private-network hostname"]
 
 
 def test_j3_the_real_vendored_ledger_doc_passes_the_whole_check(tmp_path):
