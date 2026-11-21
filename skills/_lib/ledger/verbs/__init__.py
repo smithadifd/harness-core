@@ -15,13 +15,20 @@ refused.
 from __future__ import annotations
 
 import re
+import shlex
+import unicodedata
 import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Callable, Iterable, Mapping
 
+from ledger import __version__, lease
+from ledger.card import _one_line
 from ledger.store import Event, Ledger, open_ledger
+
+# The one line `ledger --version` prints and `ledger resume --brief` prints first.
+VERSION_LINE = f"ledger {__version__}"
 
 DEFAULT_LIMIT = 50
 
@@ -73,6 +80,13 @@ class Result:
     data: Any
     text: str = ""
     exit_code: int = EXIT_OK
+    # Bytes the CLI writes as they are to standard output when --json is
+    # off: no trailing newline, no envelope (``doc show --content``).
+    raw: bytes | None = None
+    # A failure that keeps its data: --json prints ``ok: false`` with this
+    # code, ``data`` and ``text`` as the message; text mode prints ``text``.
+    # Either way the exit status is ``exit_code``.
+    error_code: str | None = None
 
 
 @dataclass(frozen=True)
@@ -91,9 +105,56 @@ class Context:
     # person (LEDGER_OPERATOR) and the seat (LEDGER_AGENT).
     operator: str | None = None
     agent: str | None = None
+    # Command prefix shown in runnable output, and whether this invocation
+    # supplied --db rather than LEDGER_DB.
+    program: str = "ledger"
+    db_explicit: bool = False
 
 
 ACTOR_SEPARATOR = "/"
+
+
+_NAMED_SHELL_ESCAPES = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
+
+
+def _is_control(char: str) -> bool:
+    return unicodedata.category(char) in ("Cc", "Zl", "Zp")
+
+
+def _shell_escape(value: str) -> str:
+    out = []
+    for char in value:
+        if char == "\\":
+            out.append("\\\\")
+        elif char == "'":
+            out.append("\\'")
+        elif char in _NAMED_SHELL_ESCAPES:
+            out.append(_NAMED_SHELL_ESCAPES[char])
+        elif _is_control(char):
+            codepoint = ord(char)
+            if codepoint < 0x100:
+                out.append(f"\\x{codepoint:02x}")
+            elif codepoint < 0x10000:
+                out.append(f"\\u{codepoint:04x}")
+            else:
+                out.append(f"\\U{codepoint:08x}")
+        else:
+            out.append(char)
+    return "".join(out)
+
+
+def quote_command_arg(value: str) -> str:
+    """Quote one shell argument, escaping controls to keep output on one line."""
+    if not any(_is_control(char) for char in value):
+        return shlex.quote(value)
+    return "$'" + _shell_escape(value) + "'"
+
+
+def invocation_prefix(program: str, db: str, db_explicit: bool) -> str:
+    """Build the command prefix repeated in runnable CLI output."""
+    if not db_explicit:
+        return program
+    return f"{program} --db {quote_command_arg(db)}"
 
 
 def compose_actor(operator: str | None, agent: str | None) -> str | None:
@@ -220,8 +281,13 @@ def item_dict(row: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def format_items(items: list[Mapping[str, Any]]) -> str:
+    """One line per item: id, type, status and title, TAB-separated. Each
+    column is escaped, so a TAB, a line break or a control sequence in a
+    title can neither add a column nor reach the terminal."""
     return "\n".join(
-        f"{it['item_id']}\t{it['type']}\t{it['status']}\t{it['title']}" for it in items
+        f"{_one_line(it['item_id'])}\t{_one_line(it['type'])}\t"
+        f"{_one_line(it['status'])}\t{_one_line(it['title'])}"
+        for it in items
     )
 
 
@@ -286,3 +352,34 @@ def require_item(lg: Ledger, item_id: str) -> dict[str, Any]:
         if row["item_id"] == item_id:
             return item_dict(row)
     raise CliError(f"item not found: {item_id}", code="not_found", exit_code=EXIT_NOT_FOUND)
+
+
+def lease_rows(lg: Ledger) -> dict[str, dict[str, Any]]:
+    """Every current claim's ``v_leases`` row, by item id."""
+    return {
+        row["item_id"]: dict(row) for row in lg._conn.execute("SELECT * FROM v_leases")
+    }
+
+
+def read_item(
+    item: Mapping[str, Any],
+    lease_row: Mapping[str, Any] | None,
+    *,
+    at: Any = None,
+) -> dict[str, Any]:
+    """``item`` as ``query`` and ``ready`` show it (``card`` carries the same fields).
+
+    ``status`` is ``lease.read_status``: ``open`` for a claim whose lease
+    expired. ``recorded_status`` is the status the events record, and for an
+    expired claim ``expired_holder`` and ``expires_at`` name the old holder
+    and the lease stamp (both ``None`` otherwise). Read side only: guards and
+    write verbs read the recorded status, and nothing is written.
+    """
+    out = dict(item)
+    shown = lease.read_status(item, lease_row, at=at)
+    expired = shown != item["status"]
+    out["status"] = shown
+    out["recorded_status"] = item["status"]
+    out["expired_holder"] = lease_row["holder"] if expired else None
+    out["expires_at"] = lease_row["expires_at"] if expired else None
+    return out

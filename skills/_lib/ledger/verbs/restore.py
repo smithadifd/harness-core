@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 from ledger.restore import restore_export
-from ledger.verbs import Context, Result, UsageError, Verb
+from ledger.verbs import Context, Result, UsageError, Verb, actor_kwargs
 
 
 def add_arguments(parser) -> None:
@@ -22,7 +22,8 @@ def add_arguments(parser) -> None:
     parser.add_argument(
         "--accept-loop-events",
         action="store_true",
-        help="explicitly allow loop-owned events after an export integrity check",
+        help="explicitly allow loop-owned events and review receipts (review.receipt, "
+        "review.grant-cite, review.merge-intent, review.merge-done) after an export integrity check",
     )
 
 
@@ -48,6 +49,7 @@ def run(args, ctx: Context) -> Result:
         system=args.system,
         accept_loop_events=args.accept_loop_events,
         on_accept_loop_events=_announce_loop_events,
+        **actor_kwargs(ctx),
     )
     return Result(
         data={"events": result.events, "path": str(result.path)},

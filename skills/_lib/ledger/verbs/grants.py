@@ -14,13 +14,17 @@ that is not verified is UNVERIFIED, never standing. The asymmetry is
 deliberate: a withdrawal only removes authority, so it takes effect without
 verification and fails closed; a grant adds authority, so it must verify.
 
-Verified. The election's ``quote_ref`` resolves to an ``utterance.captured``
-event whose provenance class says a person wrote it (``REPLY_PROVENANCE``:
-a submitted prompt or a question-picker answer), and every entry in
-``quotes`` is a byte-exact substring of that utterance's text. The quote rule
-is ``ledger elect``'s own (``validate_quote_provenance``), called here
-unchanged: a raw ``ledger append`` of a ``decision.elected`` skips that
-check at write time, so the reader checks again.
+Verified. The election answers an ask: its ``asked_event_id`` names a
+``decision.asked`` whose ``question_id`` is the same grant id (else the
+reason is ``grant_unasked``), and ``ledger.answers.bound_answer`` on that
+ask returns this election: the owner's picker answer, captured by the
+harness, bound to the ask, with every field derived from it (else the
+reason is ``bound_answer``'s, or ``not_first_answer`` when the ask's first
+election is another one). A grant is raised as an ask with the grant id as
+its ``question_id`` and recorded with ``ledger pick --ask``.
+``unverified_reason`` stays as the quote-only audit check: it reports
+whether the quotes are verbatim spans of a reply-class utterance, and no
+standing reads it.
 
 Grantor and date. ``grantor`` is the operator stamped on the quoted
 utterance (the text before the first ``/`` of its actor, as ``v_events``
@@ -36,8 +40,19 @@ revision print the same bytes. ``ledger grants --check GRANT_ID`` exits 0 when
 the grant is STANDING and otherwise refuses with exit 3 and one of the codes
 ``grant_withdrawn``, ``grant_unverified`` or ``grant_unknown``.
 
-A read verb: it never appends, so it needs no ``LEDGER_HARNESS``. It reports;
-no gate reads it.
+A read verb: it never appends, so it needs no ``LEDGER_HARNESS``.
+
+Gates. A gate decides a grant through one library call,
+``ledger.verbs.grants.standing(lg, grant_id)``, and a shell caller through
+``ledger grants --check GRANT_ID``; both run ``read_grants`` and
+``check_grant``, so they agree on every grant. ``standing`` returns the
+``Grant`` only when that exact id is STANDING and otherwise raises the
+``CliError`` ``--check`` refuses with; it has no other return. It reads inside
+the caller's transaction when there is one (so a gate may call it inside
+``Ledger.transaction()`` before its own append), else in a read transaction of
+its own, and it never writes. The readers it is for are the merge command, the
+review-run round check, apply-reviewed-patch and design dispatch; each moves
+to it in its own change.
 """
 from __future__ import annotations
 
@@ -45,6 +60,7 @@ import json
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+from ledger.answers import bound_answer
 from ledger.decisions import REPLY_PROVENANCE
 from ledger.store import Ledger
 from ledger.verbs import EXIT_REFUSED, CliError, Context, Result, Verb, open_db
@@ -56,6 +72,11 @@ WITHDRAWN_LABEL = "withdrawn"
 STANDING = "STANDING"
 WITHDRAWN = "WITHDRAWN"
 UNVERIFIED = "UNVERIFIED"
+# Why a granted election stands on no ask carrying its grant id.
+GRANT_UNASKED = "grant_unasked"
+# Why a granted election is not the ask's first election.
+NOT_FIRST_ANSWER = "not_first_answer"
+_MAX_EVENT_ID = 2**63 - 1  # SQLite integer ceiling
 # The standing grant for review rounds past the cap. A review-round grant
 # line that names a standing grant points at this record.
 REVIEW_ROUND_GRANT_ID = "grant:review-round-past-cap"
@@ -119,7 +140,8 @@ def _utterance(conn, quote_ref: Any) -> Mapping[str, Any] | None:
 
 
 def unverified_reason(lg: Ledger, payload: Mapping[str, Any]) -> str | None:
-    """None when the election verifies; otherwise why it does not."""
+    """The quote-only audit check: None when the quotes are verbatim spans of a
+    reply-class utterance; otherwise why not. No standing reads it."""
     quote_ref = payload.get("quote_ref")
     quotes = payload.get("quotes")
     try:
@@ -134,6 +156,29 @@ def unverified_reason(lg: Ledger, payload: Mapping[str, Any]) -> str | None:
     return None
 
 
+def standing_reason(
+    lg: Ledger, grant_id: str, event_id: int, payload: Mapping[str, Any]
+) -> str | None:
+    """None when a ``granted`` election is the bound answer to an ask that
+    carries its grant id; otherwise why it is not."""
+    asked = payload.get("asked_event_id")
+    if type(asked) is not int or not 1 <= asked <= _MAX_EVENT_ID:
+        return GRANT_UNASKED
+    row = lg._conn.execute(
+        "SELECT kind, payload FROM events WHERE id = ?", (asked,)
+    ).fetchone()
+    if row is None or row["kind"] != "decision.asked":
+        return GRANT_UNASKED
+    if json.loads(row["payload"]).get("question_id") != grant_id:
+        return GRANT_UNASKED
+    answer = bound_answer(lg, asked)
+    if answer.reason is not None:
+        return answer.reason
+    if answer.election.id != event_id:
+        return NOT_FIRST_ANSWER
+    return None
+
+
 def _grant(lg: Ledger, grant_id: str, event_id: int, payload: Mapping[str, Any]) -> Grant:
     quote_ref = payload.get("quote_ref")
     utterance = _utterance(lg._conn, quote_ref)
@@ -141,7 +186,7 @@ def _grant(lg: Ledger, grant_id: str, event_id: int, payload: Mapping[str, Any])
     if payload.get("chosen") != GRANTED:
         status = WITHDRAWN
     else:
-        reason = unverified_reason(lg, payload)
+        reason = standing_reason(lg, grant_id, event_id, payload)
         status = STANDING if reason is None else UNVERIFIED
     grantor = NONE_CELL
     date = NONE_CELL
@@ -163,9 +208,16 @@ def _grant(lg: Ledger, grant_id: str, event_id: int, payload: Mapping[str, Any])
 
 
 def read_grants(lg: Ledger) -> tuple[int, list[Grant]]:
-    """``(ledger_revision, grants)`` from one read snapshot, sorted by grant id."""
+    """``(ledger_revision, grants)`` from one read snapshot, sorted by grant id.
+
+    Reads inside the caller's transaction when there is one, and leaves it
+    open with its pending writes; else in a read transaction of its own,
+    which it rolls back.
+    """
     conn = lg._conn
-    conn.execute("BEGIN")
+    own = not conn.in_transaction
+    if own:
+        conn.execute("BEGIN")
     try:
         revision = int(conn.execute("SELECT COALESCE(MAX(id), 0) FROM events").fetchone()[0])
         newest: dict[str, tuple[int, dict[str, Any]]] = {}
@@ -183,7 +235,7 @@ def read_grants(lg: Ledger) -> tuple[int, list[Grant]]:
             for grant_id, (event_id, payload) in sorted(newest.items())
         ]
     finally:
-        if conn.in_transaction:
+        if own and conn.in_transaction:
             conn.execute("ROLLBACK")
     return revision, grants
 
@@ -220,6 +272,24 @@ def check_grant(grants: list[Grant], grant_id: str) -> Grant:
     )
 
 
+def standing(lg: Ledger, grant_id: Any) -> Grant:
+    """The ``Grant`` for exactly ``grant_id`` when it is STANDING.
+
+    Otherwise raises ``CliError`` (exit code ``EXIT_REFUSED``) with code
+    ``grant_unknown``, ``grant_withdrawn`` or ``grant_unverified`` and
+    ``check_grant``'s message. There is no return for a grant that is not
+    standing. The id is compared as an exact string: an id that is not a
+    ``str``, is empty, or carries none of the grant prefixes is
+    ``grant_unknown``. The same functions decide ``ledger grants --check``.
+    Safe inside the caller's write transaction (see ``read_grants``).
+    """
+    if type(grant_id) is not str or grant_kind(grant_id) is None:
+        # No stored grant can match; check_grant([]) raises grant_unknown.
+        check_grant([], grant_id)
+    _revision, grants = read_grants(lg)
+    return check_grant(grants, grant_id)
+
+
 def _cell(value: Any) -> str:
     return " ".join(str(value).split()).replace("|", "\\|")
 
@@ -251,11 +321,13 @@ def add_arguments(parser) -> None:
 def run(args, ctx: Context) -> Result:
     lg = open_db(ctx, write=False)
     try:
-        revision, grants = read_grants(lg)
+        if args.check is not None:
+            grant = standing(lg, args.check)
+        else:
+            revision, grants = read_grants(lg)
     finally:
         lg.close()
     if args.check is not None:
-        grant = check_grant(grants, args.check)
         return Result(
             data=grant.row(),
             text=(

@@ -21,6 +21,8 @@ from ledger.cli import main
 from ledger.store import open_ledger
 from ledger.verbs import EXIT_NOT_FOUND, EXIT_OK, EXIT_REFUSED, EXIT_USAGE
 
+from test_search import _doctor_cannot_refresh
+
 ITEM = "it-1a2b3c4d5e6f"
 
 
@@ -81,10 +83,10 @@ def test_link_positional_target_takes_an_explicit_rel(tmp_path, monkeypatch):
     db = _db(tmp_path)
     _seed(monkeypatch, db)
 
-    code, _out, err = invoke(monkeypatch, ["--db", db, "link", ITEM, "--rel", "pr", "123"])
+    code, _out, err = invoke(monkeypatch, ["--db", db, "link", ITEM, "--rel", "pr", "org/repo#123"])
 
     assert code == 0, err
-    assert _events(db)[-1] == ("item.linked", {"rel": "pr", "target": "123"})
+    assert _events(db)[-1] == ("item.linked", {"rel": "pr", "target": "org/repo#123"})
 
 
 @pytest.mark.parametrize(
@@ -260,7 +262,8 @@ def test_stale_index_search_returns_the_document_and_doctor_reads_current(
     code, _out, err = invoke(monkeypatch, ["--db", db, "index"])
     assert code == 0, err
     invoke(monkeypatch, ["--db", db, "note", ITEM, "--text", "quokka findings"])
-    assert _doctor_search(monkeypatch, db) == "behind"
+    with _doctor_cannot_refresh(monkeypatch):
+        assert _doctor_search(monkeypatch, db) == "behind"
 
     code, out, err = invoke(monkeypatch, ["--json", "--db", db, "search", "quokka"])
 
@@ -277,7 +280,8 @@ def test_search_that_cannot_rewrite_a_stale_index_refuses_by_name(tmp_path, monk
     code, _out, err = invoke(monkeypatch, ["--db", db, "index"])
     assert code == 0, err
     invoke(monkeypatch, ["--db", db, "note", ITEM, "--text", "quokka findings"])
-    assert _doctor_search(monkeypatch, db) == "behind"
+    with _doctor_cannot_refresh(monkeypatch):
+        assert _doctor_search(monkeypatch, db) == "behind"
 
     def refuse_write(*_args, **_kwargs):
         raise PermissionError(13, "Permission denied")
@@ -290,6 +294,7 @@ def test_search_that_cannot_rewrite_a_stale_index_refuses_by_name(tmp_path, monk
     assert "cannot rebuild the search index" in err
     assert "search.db" in err
     assert "Traceback" not in err
+    # Doctor's own refresh hits the same refusal: it reports what it reads.
     assert _doctor_search(monkeypatch, db) == "behind"
 
 

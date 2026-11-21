@@ -15,6 +15,8 @@ import pytest
 from ledger.backup import backup_db, integrity_check
 from ledger.cli import main
 from ledger.export import (
+    STREAM_DIGEST_NAME,
+    WATERMARK_NAME,
     ChainBroken,
     LagExceeded,
     canonical_stream,
@@ -25,6 +27,7 @@ from ledger.export import (
     load_export,
     read_watermark,
     verify_export,
+    verify_stream_digest,
 )
 from ledger.restore import replay_events, restore_export
 from ledger.store import (
@@ -36,6 +39,8 @@ from ledger.store import (
     open_ledger,
 )
 from ledger.verbs import EXIT_INTEGRITY, EXIT_REFUSED, EXIT_USAGE, discover_verbs
+
+from test_export import isolate_git_config
 
 _LIB = Path(__file__).resolve().parents[2]
 
@@ -78,6 +83,11 @@ def invoke(monkeypatch, argv, *, env=None):
     with redirect_stdout(out), redirect_stderr(err):
         code = main(list(argv))
     return code, out.getvalue(), err.getvalue()
+
+
+@pytest.fixture(autouse=True)
+def isolated_git(tmp_path: Path, monkeypatch) -> Path:
+    return isolate_git_config(tmp_path, monkeypatch)
 
 
 def _db(tmp_path: Path) -> Path:
@@ -750,6 +760,73 @@ def test_restore_round_trips_empty_ledger_export(tmp_path: Path) -> None:
         lg.close()
 
 
+def _claim_stamps(db: Path) -> dict:
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT actor, harness, model, session, operator "
+            "FROM v_events WHERE kind = 'ledger.system'"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert len(rows) == 1
+    return dict(rows[0])
+
+
+def test_cli_restore_of_unclaimed_export_records_the_callers_attribution(
+    tmp_path: Path, monkeypatch
+) -> None:
+    db = _db(tmp_path)
+    export_dir = tmp_path / "export"
+    _seed(db, 1)
+    lg = open_ledger(db)
+    export_events(lg, export_dir)
+    lg.close()
+    dest = tmp_path / "restored.db"
+    env = {
+        "LEDGER_HARNESS": "claude-code",
+        "LEDGER_OPERATOR": "alice",
+        "LEDGER_AGENT": "builder",
+        "LEDGER_MODEL": "model-x",
+        "LEDGER_SESSION": "sess-42",
+    }
+    code, _out, err = invoke(
+        monkeypatch,
+        ["--json", "--db", str(dest), "restore", "--dir", str(export_dir),
+         "--system", "home"],
+        env=env,
+    )
+    assert code == 0, err
+    assert _claim_stamps(dest) == {
+        "actor": "alice/builder",
+        "harness": "claude-code",
+        "model": "model-x",
+        "session": "sess-42",
+        "operator": "alice",
+    }
+
+
+def test_restore_export_with_no_attribution_writes_no_stamps(
+    tmp_path: Path,
+) -> None:
+    db = _db(tmp_path)
+    export_dir = tmp_path / "export"
+    _seed(db, 1)
+    lg = open_ledger(db)
+    export_events(lg, export_dir)
+    lg.close()
+    dest = tmp_path / "fresh.db"
+    restore_export(export_dir, dest, system="home")
+    assert _claim_stamps(dest) == {
+        "actor": None,
+        "harness": None,
+        "model": None,
+        "session": None,
+        "operator": "",
+    }
+
+
 @pytest.mark.parametrize(
     "watermark",
     ["true", "2.5", '"3"', "-1", None],
@@ -812,7 +889,7 @@ def test_backup_refuses_live_database_target(tmp_path: Path, monkeypatch) -> Non
     assert code == EXIT_REFUSED
     assert len(err.strip().splitlines()) == 1
     assert db.read_bytes() == before
-    assert not Path(str(db) + ".partial").exists()
+    assert not list(db.parent.glob(f".ledger-backup.{db.name}.*.partial"))
 
 
 def test_backup_refuses_failed_integrity_check(tmp_path: Path, monkeypatch) -> None:
@@ -823,7 +900,7 @@ def test_backup_refuses_failed_integrity_check(tmp_path: Path, monkeypatch) -> N
     with pytest.raises(LedgerError, match="integrity_check: bad page 1"):
         backup_db(db, dest)
     assert not dest.exists()
-    assert not Path(str(dest) + ".partial").exists()
+    assert not list(dest.parent.glob(f".ledger-backup.{dest.name}.*.partial"))
 
 
 def test_backup_snapshots_wal_events_not_yet_checkpointed(tmp_path: Path) -> None:
@@ -1078,3 +1155,85 @@ def test_restore_refuses_non_string_actor(tmp_path: Path) -> None:
         return record
 
     _restore_refusal(tmp_path, mutate, "actor")
+
+
+def _deep_json(depth: int = 2000) -> str:
+    """A JSON value nested ``depth`` objects deep. Python 3.11's parser
+    raises RecursionError; 3.12 and later parse it."""
+    return '{"a":' * depth + "0" + "}" * depth
+
+
+def _ensure_json_loads_raises_recursion(monkeypatch) -> None:
+    """If this interpreter's json.loads copes with ``_deep_json``, still
+    raise RecursionError from the export module's json.loads so the named
+    refusal is what the test observes."""
+    try:
+        json.loads(_deep_json())
+    except RecursionError:
+        return
+
+    def _raise(s, *args, **kwargs):
+        raise RecursionError
+
+    monkeypatch.setattr("ledger.export.json.loads", _raise)
+
+
+def test_read_watermark_refuses_deeply_nested_file(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / WATERMARK_NAME).write_text(_deep_json() + "\n", encoding="utf-8")
+    _ensure_json_loads_raises_recursion(monkeypatch)
+    with pytest.raises(LedgerError, match="unreadable watermark"):
+        read_watermark(tmp_path)
+
+
+def test_verify_stream_digest_refuses_deeply_nested_file(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / STREAM_DIGEST_NAME).write_text(_deep_json() + "\n", encoding="utf-8")
+    _ensure_json_loads_raises_recursion(monkeypatch)
+    with pytest.raises(LedgerError, match="unreadable export stream digest"):
+        verify_stream_digest(tmp_path, [])
+
+
+def test_load_export_refuses_deeply_nested_file(tmp_path: Path, monkeypatch) -> None:
+    name = event_filename(1)
+    (tmp_path / name).write_text(_deep_json() + "\n", encoding="utf-8")
+    _ensure_json_loads_raises_recursion(monkeypatch)
+    with pytest.raises(ChainBroken, match="exported file"):
+        load_export(tmp_path)
+
+
+def test_export_commit_ignores_hostile_global_gitconfig(
+    tmp_path: Path, monkeypatch
+) -> None:
+    hostile_home = tmp_path / "hostile-home"
+    hostile_home.mkdir()
+    fail_gpg = tmp_path / "fail-gpg"
+    fail_gpg.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    fail_gpg.chmod(0o755)
+    (hostile_home / ".gitconfig").write_text(
+        "[commit]\n\tgpgSign = true\n[gpg]\n\tprogram = %s\n" % fail_gpg,
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(hostile_home))
+    export_dir = tmp_path / "export"
+    export_dir.mkdir()
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(export_dir)],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(export_dir), "config", "user.name", "ledger-test"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(export_dir), "config", "user.email", "ledger-test@example.invalid"],
+        check=True,
+        capture_output=True,
+    )
+    db = _db(tmp_path)
+    _seed(db, 1)
+    lg = open_ledger(db)
+    export_events(lg, export_dir)
+    lg.close()
+    committed = commit_export(export_dir)
+    assert committed.sha is not None

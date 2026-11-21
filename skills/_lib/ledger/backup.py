@@ -1,18 +1,33 @@
 """Online backup of a ledger SQLite database.
 
 Uses sqlite3's backup API (or, as a documented alternative, VACUUM INTO).
-Never copies the live database file. The copy is written as ``*.partial``,
-checked with ``PRAGMA integrity_check``, and renamed only when the check
-returns ``ok``.
+Never copies the live database file. The copy is written at a unique
+``.ledger-backup.<name>.*.partial`` name beside the destination, checked with ``PRAGMA
+integrity_check``, and renamed only when the check returns ``ok`` and the
+source path still names the file the copy was read from.
+
+A destination that already exists is refused unless the caller passes
+``overwrite=True`` (the CLI's ``--overwrite``), the same rule ``restore``
+applies to its target. Without ``overwrite`` the copy is published only
+with a hard link, which fails atomically when the name is taken, so a file
+that appears while the copy runs is never replaced. A filesystem that cannot
+make the hard link refuses the backup instead: nothing is published, the
+destination is left exactly as it was, and the caller passes
+``overwrite=True`` to publish there by rename.
 """
 from __future__ import annotations
 
+import errno
+import os
 import sqlite3
+import stat
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from .dbfile import checked_connect, precheck_files, verify_bound
 from .paths import resolve_db_path
-from .store import BUSY_TIMEOUT_MS, LedgerError
+from .store import BUSY_TIMEOUT_MS, LedgerError, _connect_readonly
 from .store import (
     _recorded_versions,
     _refuse_newer_schema_before_connect,
@@ -21,6 +36,15 @@ from .store import (
 )
 
 BACKUP_PAGES_PER_STEP = 64
+
+# Every backup temp starts with this fixed prefix and ends with this suffix.
+# The search-index cleanup removes files named ``.search.db.<id>.partial``,
+# so a temp named from the destination alone (``.<name>.<id>.partial``)
+# would match it for a destination named ``search.db`` or
+# ``search.db.<anything>``. A name that starts with this prefix never
+# starts with ``.search.db.``, whatever the destination is called.
+BACKUP_TEMP_PREFIX = ".ledger-backup."
+BACKUP_TEMP_SUFFIX = ".partial"
 
 
 @dataclass(frozen=True)
@@ -31,8 +55,8 @@ class BackupResult:
 
 def integrity_check(path: Path) -> str:
     """Run ``PRAGMA integrity_check`` on ``path``; return the joined verdict."""
-    uri = Path(path).resolve().as_uri() + "?mode=ro"
-    conn = sqlite3.connect(uri, uri=True)
+    resolved = resolve_db_path(path)
+    conn = _connect_readonly(resolved)
     try:
         rows = conn.execute("PRAGMA integrity_check").fetchall()
     finally:
@@ -47,8 +71,8 @@ def _refuse_newer_schema_in_copy(path: Path) -> None:
     the copy starts, so a newer migration committed in between reaches the
     copy. Reading the copy checks exactly what would be published.
     """
-    uri = Path(path).resolve().as_uri() + "?mode=ro"
-    conn = sqlite3.connect(uri, uri=True)
+    resolved = resolve_db_path(path)
+    conn = _connect_readonly(resolved)
     try:
         versions = _recorded_versions(conn)
     finally:
@@ -56,38 +80,265 @@ def _refuse_newer_schema_in_copy(path: Path) -> None:
     _refuse_unknown_versions(versions, load_migrations())
 
 
-def backup_db(db_path: Path | str, dest: Path | str) -> BackupResult:
-    """Snapshot ``db_path`` into ``dest`` via the online backup API."""
-    source_path = resolve_db_path(db_path)
-    if not source_path.is_file():
-        raise LedgerError(f"database does not exist: {source_path}")
-    dest_path = resolve_db_path(dest)
-    live_files = (
-        source_path,
-        source_path.with_name(source_path.name + "-wal"),
-        source_path.with_name(source_path.name + "-shm"),
+_SIDE_FILE_SUFFIXES = ("-wal", "-shm", "-journal")
+
+
+def file_identity(path: Path) -> tuple[int, int] | None:
+    """The ``(device, inode)`` of the file at ``path``, or ``None`` when no file has that name.
+
+    Read with ``lstat``, so a symbolic link is a file of its own and never
+    redirects the check. Any error other than a missing name propagates: a
+    caller refuses a destination it cannot prove distinct.
+    """
+    try:
+        found = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    return found.st_dev, found.st_ino
+
+
+def _swap_ascii_case(name: str) -> str:
+    return "".join(
+        char.swapcase() if char.isascii() and char.isalpha() else char
+        for char in name
+    )
+
+
+def _tells_case_apart(dest_path: Path) -> bool:
+    """True only when the folder that would hold ``dest_path`` is shown to tell case apart.
+
+    The folder is the nearest existing ancestor of ``dest_path`` (a backup
+    creates the missing ones inside it). One of its entries is looked up
+    again with the case of its ASCII letters swapped: when no file has the
+    swapped name, or another file has it, the folder tells case apart. A
+    folder with no entry to try, or any error, shows nothing, and the answer
+    is False.
+    """
+    folder = dest_path.parent
+    try:
+        while True:
+            try:
+                found = os.lstat(folder)
+                break
+            except FileNotFoundError:
+                if folder.parent == folder:
+                    return False
+                folder = folder.parent
+        if not stat.S_ISDIR(found.st_mode):
+            return False
+        with os.scandir(folder) as entries:
+            for entry in entries:
+                swapped = _swap_ascii_case(entry.name)
+                if swapped == entry.name:
+                    continue
+                original = file_identity(folder / entry.name)
+                if original is None or file_identity(folder / swapped) == original:
+                    return False
+                # The swapped name is missing or another file. Read the entry
+                # again: had it been removed meanwhile, the swapped name would
+                # be missing on a folder that folds case too.
+                return file_identity(folder / entry.name) == original
+    except OSError:
+        return False
+    return False
+
+
+def refuse_side_file_name(dest_path: Path, verb: str) -> None:
+    """Refuse a destination named like a database side file, as its volume reads the name.
+
+    SQLite removes a file on a side-file name when the last connection to
+    that database closes, so the name is refused whether or not a file has
+    it yet. The suffix compare ignores case unless the destination's folder
+    is shown to tell case apart: where the volume folds case, ``-WAL`` names
+    the ``-wal`` file, and where it does not, ``copy.db-WAL`` is an ordinary
+    name. A folder that cannot be shown either way is treated as folding.
+    """
+    name = dest_path.name
+    if name.endswith(_SIDE_FILE_SUFFIXES) or (
+        name.casefold().endswith(_SIDE_FILE_SUFFIXES)
+        and not _tells_case_apart(dest_path)
+    ):
+        raise LedgerError(
+            f"{verb} target is named like a database side file "
+            f"(-wal, -shm or -journal): {dest_path}"
+        )
+
+
+def _refuse_live_destination(source_path: Path, dest_path: Path) -> None:
+    """Refuse a backup destination that is the live database or one of its side files.
+
+    Decided by file identity, never by comparing spellings: a volume can
+    read two spellings as one name (case, Unicode normalization), and a hard
+    link is another name for the same file. A destination no file has yet
+    cannot be the live file; the exact spelling of a live name still refuses
+    here, and any other side-file name is left to ``refuse_side_file_name``.
+    """
+    live_files = (source_path,) + tuple(
+        source_path.with_name(source_path.name + suffix)
+        for suffix in _SIDE_FILE_SUFFIXES
     )
     if dest_path in live_files:
         raise LedgerError(f"backup target is the live database: {dest_path}")
+    try:
+        dest_identity = file_identity(dest_path)
+        if dest_identity is None:
+            return
+        for live in live_files:
+            if file_identity(live) == dest_identity:
+                raise LedgerError(f"backup target is the live database: {dest_path}")
+    except OSError as exc:
+        raise LedgerError(
+            f"backup target cannot be told apart from the live database: "
+            f"{dest_path} ({exc})"
+        ) from exc
+
+
+def _refuse_existing_target(dest_path: Path) -> None:
+    """Refuse a backup destination that any file already has.
+
+    Decided by file identity, as ``restore`` decides its own target: a
+    spelling the volume reads as an existing file's name refuses, and a name
+    that cannot be read refuses too.
+    """
+    try:
+        occupied = file_identity(dest_path) is not None
+    except OSError as exc:
+        raise LedgerError(
+            f"backup target cannot be checked: {dest_path} ({exc})"
+        ) from exc
+    if occupied:
+        raise LedgerError(
+            f"backup target already exists: {dest_path} "
+            f"(pass --overwrite to replace it)"
+        )
+
+
+# Why a filesystem cannot make the hard link that publishes a backup without
+# replacing: no permission to link (EPERM, as on some network and FAT-family
+# volumes), links not supported there (ENOTSUP, which is EOPNOTSUPP on some
+# platforms), a destination on another device (EXDEV) or a file at its link
+# limit (EMLINK). Any other error is a real failure and propagates.
+_LINK_UNSUPPORTED = frozenset(
+    {errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EXDEV, errno.EMLINK}
+)
+
+
+def _taken_error(dest_path: Path) -> LedgerError:
+    return LedgerError(
+        f"backup target already exists: {dest_path} "
+        f"(pass --overwrite to replace it)"
+    )
+
+
+def _cannot_publish_error(dest_path: Path) -> LedgerError:
+    return LedgerError(
+        f"backup target filesystem cannot publish without replacing: {dest_path} "
+        f"(hard links are not supported there; pass --overwrite to publish by rename)"
+    )
+
+
+def _overlong_temp_error(dest_path: Path) -> LedgerError:
+    return LedgerError(
+        f"backup destination file name exceeds the file name limit: {dest_path}"
+    )
+
+
+def _publish_without_replacing(partial: Path, dest_path: Path) -> None:
+    """Move ``partial`` to ``dest_path`` unless a file has that name by then.
+
+    The only way to publish here is a hard link, which raises
+    ``FileExistsError`` atomically when the name is taken, so a file that
+    appears at any moment before the link, however late, is refused and left
+    as it was; the partial is unlinked once the link holds. A filesystem that
+    cannot make the link (see ``_LINK_UNSUPPORTED``) refuses the backup with
+    ``backup target filesystem cannot publish without replacing``. There is
+    no other way to publish without replacing, so nothing is written at
+    ``dest_path``: an absent name stays absent and a file there is left byte
+    for byte as it was. On either refusal the caller removes the partial.
+    """
+    try:
+        os.link(partial, dest_path)
+    except FileExistsError as exc:
+        raise _taken_error(dest_path) from exc
+    except OSError as exc:
+        if exc.errno not in _LINK_UNSUPPORTED:
+            raise
+        raise _cannot_publish_error(dest_path) from exc
+    partial.unlink(missing_ok=True)
+
+
+def backup_db(
+    db_path: Path | str, dest: Path | str, *, overwrite: bool = False
+) -> BackupResult:
+    """Snapshot ``db_path`` into ``dest`` via the online backup API.
+
+    A ``dest`` that already exists is refused (``backup target already
+    exists``) and left untouched, unless ``overwrite`` is true. The check
+    runs before the copy starts and again, atomically, when the copy is
+    published by hard link (see ``_publish_without_replacing``). On a
+    filesystem that cannot make the hard link the backup is refused
+    (``backup target filesystem cannot publish without replacing``) and
+    ``dest`` is left as it was; there, ``overwrite`` publishes by rename. The
+    live database and its side files are refused either way.
+    """
+    source_path = resolve_db_path(db_path)
+    dest_path = resolve_db_path(dest)
+    # Before the source precheck, which refuses a hard-linked live file for
+    # its own reasons: the destination guard stands on its own.
+    _refuse_live_destination(source_path, dest_path)
+    if not precheck_files(source_path):
+        raise LedgerError(f"database does not exist: {source_path}")
+    # A file published on a name SQLite treats as a side file is removed by
+    # a later last closer.
+    refuse_side_file_name(dest_path, "backup")
+    if not overwrite:
+        _refuse_existing_target(dest_path)
     # A backup of a newer schema would later be read by this same older code.
     _refuse_newer_schema_before_connect(source_path)
     dest_path.parent.mkdir(parents=True, exist_ok=True)
-    partial = dest_path.with_name(dest_path.name + ".partial")
-    partial.unlink(missing_ok=True)
+    # A unique partial name, so two backups to one destination never unlink
+    # or write each other's copy, and a fixed prefix, so the name can never
+    # match the search-index cleanup's pattern whatever the destination is.
+    # The destination file system answers whether that name is too long:
+    # only ENAMETOOLONG becomes a LedgerError. The destination name is not
+    # truncated, and no length is computed here.
     try:
-        source = sqlite3.connect(
-            str(source_path),
-            timeout=BUSY_TIMEOUT_MS / 1000,
+        handle, partial_name = tempfile.mkstemp(
+            prefix=f"{BACKUP_TEMP_PREFIX}{dest_path.name}.",
+            suffix=BACKUP_TEMP_SUFFIX,
+            dir=dest_path.parent,
+        )
+    except OSError as exc:
+        if exc.errno != errno.ENAMETOOLONG:
+            raise
+        raise _overlong_temp_error(dest_path) from exc
+    partial = Path(partial_name)
+    try:
+        os.close(handle)
+        source, _source_mode, source_proof = checked_connect(
+            source_path,
+            lambda: sqlite3.connect(
+                str(source_path),
+                timeout=BUSY_TIMEOUT_MS / 1000,
+            ),
         )
         try:
             source.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
-            target = sqlite3.connect(str(partial), timeout=BUSY_TIMEOUT_MS / 1000)
+            target, _target_mode, _target_proof = checked_connect(
+                partial,
+                lambda: sqlite3.connect(
+                    str(partial), timeout=BUSY_TIMEOUT_MS / 1000
+                ),
+            )
             try:
                 target.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
                 source.backup(target, pages=BACKUP_PAGES_PER_STEP)
                 target.execute("PRAGMA journal_mode = DELETE")
             finally:
                 target.close()
+            # The copy was read from the proved source file: publish it only
+            # while the source path still names that file.
+            verify_bound(source_proof)
         finally:
             source.close()
         verdict = integrity_check(partial)
@@ -96,8 +347,15 @@ def backup_db(db_path: Path | str, dest: Path | str) -> BackupResult:
             more = f" (+{len(lines) - 1} more)" if len(lines) > 1 else ""
             raise LedgerError(f"backup failed integrity_check: {lines[0]}{more}")
         _refuse_newer_schema_in_copy(partial)
-        partial.replace(dest_path)
+        if overwrite:
+            partial.replace(dest_path)
+        else:
+            # The copy can take long: publish so that a file that took the
+            # name meanwhile is not replaced either.
+            _publish_without_replacing(partial, dest_path)
     except BaseException:
+        # Every refusal and error removes this backup's own partial and
+        # nothing else: the destination is never touched here.
         partial.unlink(missing_ok=True)
         raise
     return BackupResult(path=dest_path, integrity="ok")

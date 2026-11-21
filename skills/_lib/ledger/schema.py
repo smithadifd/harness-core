@@ -8,7 +8,9 @@ closed. The events themselves are never removed from the store.
 """
 from __future__ import annotations
 
+import math
 import re
+import unicodedata
 from typing import Any, Mapping
 
 GUIDANCE_ITEM_TYPE = "guidance"
@@ -40,11 +42,68 @@ SPEC_MERGE_CLASSES = ("MC-0", "MC-1", "MC-2", "MC-3", "MC-4")
 # its content_hash (verbs/spec.py). version, source, source_rev and the hash
 # itself are not content.
 SPEC_CONTENT_FIELDS = ("title", "body_md", "acceptance", "size", "merge_class")
+# A document attached to an item (verbs/doc.py): content-addressed, its
+# bytes stored inline (at most DOC_INLINE_LIMIT of them) or by path under the
+# database's document root (at most DOC_PATH_LIMIT).
+DOC_KIND = "doc.attached"
+DOC_ROLES = ("review-receipt", "brief", "packet", "retro", "other")
+DOC_INLINE_LIMIT = 65536
+DOC_PATH_LIMIT = 16777216
+# A by-path document's stored path: relative to the document root, at most
+# this many UTF-8 bytes in all, and per component (doc_path_problem).
+DOC_PATH_MAX_BYTES = 1024
+DOC_PATH_COMPONENT_MAX_BYTES = 255
+# The reason a stored path that breaks its grammar is refused with.
+DOC_PATH_REFUSAL = "bad-doc-path"
+DOC_DEFAULT_MIME = "application/octet-stream"
+# Set, only as true, on a document whose bytes or stored path hold a
+# credential shape (ledger/credscan.py) and that
+# ``doc add --allow-credential-shapes`` attached.
+DOC_CREDENTIAL_OVERRIDE = "credential_override"
+# Channels only `ledger capture` (verbs/capture.py) writes: the harness's
+# record of a submitted prompt and of a question-picker answer. The store
+# refuses every other writer on any channel that starts with the prefix.
+CAPTURE_CHANNEL_PREFIX = "hook:"
+PROMPT_CHANNEL = "hook:prompt"
+PICKER_CHANNEL = "hook:picker"
+CAPTURE_CHANNELS = (PROMPT_CHANNEL, PICKER_CHANNEL)
 _SOURCE = {"type": "string", "min_len": 1}
 # A reference to a file, PR or event: one line, short. Content is never
 # copied into the ledger, only pointed at.
 _REF = {"type": "string", "min_len": 1, "max_len": 300, "single_line": True}
 _TEXT = {"type": "string", "min_len": 1}
+_SHA256_HEX = {"type": "string", "pattern": r"[0-9a-f]{64}"}
+# A document's displayed text: one line, no control character
+# (control_character, the Cc class), checked wherever the payload is
+# validated, so a restored document holds none either.
+_DOC_TITLE = {"type": "string", "min_len": 1, "max_len": 300, "single_line": True,
+              "no_control": True}
+_DOC_MIME = {
+    "type": "string",
+    "max_len": 127,
+    "pattern": r"[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*",
+}
+# What the harness displayed in one AskUserQuestion call and what came
+# back (verbs/capture.py builds it; ledger.answers reads it). display,
+# answers and annotation are the harness's own data, kept verbatim.
+_PICKER = {
+    "type": "object",
+    "required": {
+        "display": {"type": "array", "min_len": 1, "items": {"type": "json_object"}},
+        "display_sha256": _SHA256_HEX,
+        "question_count": {"type": "integer", "min": 1},
+        "answers": {"type": "json_object"},
+        "typed": {"type": "boolean"},
+        "ambiguous": {"type": "boolean"},
+        "tool_use_id": {"type": "string", "min_len": 1},
+    },
+    "optional": {
+        "chosen_label": {"type": "string"},
+        "chosen_position": {"type": "integer", "min": 1},
+        "annotation": {"type": "json_object"},
+        "asked_event_id": {"type": "integer", "min": 1},
+    },
+}
 # One fixed form (UTC, milliseconds) so lease stamps order as text.
 _LEASE_STAMP = {
     "type": "string",
@@ -75,7 +134,35 @@ _REF_TARGET_PATTERN = "|".join((
     r"[0-9a-f]{7,40}",
     r"event:[1-9][0-9]*",
 ))
-_REF_TARGET = {**_REF, "pattern": f"(?:{_REF_TARGET_PATTERN})"}
+# The forms the pattern above accepts, one example each, in the words the
+# refusal below, the agent contract page and `resume --brief` use. A test runs
+# every example through the pattern, and another reads the page and the short
+# form for each one, so the list cannot drift from the pattern.
+REF_FORMS = (
+    ("a file path", "src/app.py:12"),
+    ("a pull request or issue", "#12"),
+    ("a pull request or issue with its repository", "owner/repo#12"),
+    ("a branch", "branch:feat/x"),
+    ("a commit sha of 7 to 40 lowercase hex digits", "3f2a9c1"),
+    ("an event", "event:42"),
+)
+# A URL is refused as a ref, never accepted: it goes on the item as a link.
+REF_URL_ROUTE = (
+    "a URL is not a ref: put it on the item with ledger link ITEM --rel url --target URL"
+)
+REF_ALLOWED_TEXT = (
+    ", ".join(f"{form} ({example})" for form, example in REF_FORMS) + "; " + REF_URL_ROUTE
+)
+_REF_TARGET = {
+    **_REF,
+    "pattern": f"(?:{_REF_TARGET_PATTERN})",
+    "allowed_text": REF_ALLOWED_TEXT,
+}
+# A directory path, absolute or with at least one "/", no :line suffix: the
+# only ref whose one trailing slash the writing verbs strip.
+_DIRECTORY_REF = re.compile(
+    rf"/(?:{_PATH_SEGMENT}/)*{_PATH_SEGMENT}|(?:{_PATH_SEGMENT}/)+{_PATH_SEGMENT}"
+)
 _SKILL = {
     "type": "string",
     "min_len": 1,
@@ -119,6 +206,109 @@ ENTITY_STATE_FIELDS = tuple(_ENTITY_STATE)
 DURABLE = "durable"
 EPHEMERAL = "ephemeral"
 SYSTEM_CLAIM_KIND = "ledger.system"
+
+# The review records. Only the receipt writer (ledger/receipts.py) writes
+# them: the store reserves these kinds, and restore takes them only with
+# --accept-loop-events. A review.receipt records one review round of one pull
+# request, on the one item whose pr link names it; a review.grant-cite records
+# that the past-cap review-round grant stood when a round past the cap ran.
+RECEIPT_KIND = "review.receipt"
+GRANT_CITE_KIND = "review.grant-cite"
+MERGE_INTENT_KIND = "review.merge-intent"
+MERGE_DONE_KIND = "review.merge-done"
+RECEIPT_KINDS = (RECEIPT_KIND, GRANT_CITE_KIND, MERGE_INTENT_KIND, MERGE_DONE_KIND)
+RECEIPT_VERDICTS = ("approved", "changes_requested", "unparseable", "crashed")
+# The verdicts that carry served_model, family, open_bugs and findings; the
+# other two carry neither count, so a reader testing open_bugs == 0 cannot
+# read a crash as clean.
+RECEIPT_COUNTED_VERDICTS = ("approved", "changes_requested")
+RECEIPT_CELLS = ("block", "harden", "nit")
+# The document role a receipt's document is attached under.
+RECEIPT_DOC_ROLE = "review-receipt"
+# At most this many findings in one receipt.
+RECEIPT_MAX_FINDINGS = 200
+# The one grant a review.grant-cite cites. The same string as
+# ledger.verbs.grants.REVIEW_ROUND_GRANT_ID (a test holds them equal); the
+# schema cannot import the verb module.
+CITED_GRANT_ID = "grant:review-round-past-cap"
+_INT_MAX = 2**63 - 1  # SQLite integer ceiling
+_EVENT_ID = {"type": "integer", "min": 1, "max": _INT_MAX}
+# owner/repo, lowercase only: ledger link's character set casefolded. An
+# uppercase letter is refused, never folded.
+_RECEIPT_REPO = {"type": "string", "max_len": 200, "pattern": r"[a-z0-9_.-]+/[a-z0-9_.-]+"}
+_RECEIPT_COMMIT = {"type": "string", "pattern": r"[0-9a-f]{40}"}
+# One token: a lane, a family or a tier. The ledger holds no list of either.
+_RECEIPT_TOKEN = {"type": "string", "min_len": 1, "max_len": 64,
+                  "pattern": r"[a-z0-9][a-z0-9._-]*"}
+# One line of text a terminal shows as stored (display_text_problem).
+_RECEIPT_MODEL = {"type": "string", "min_len": 1, "max_len": 200, "single_line": True,
+                  "display_text": True}
+# <path>:<line>#<root>, one line.
+_FINDING_ID = {"type": "string", "min_len": 1, "max_len": 300, "single_line": True,
+               "no_control": True, "pattern": r"[^\s#]+:[1-9][0-9]*#[^\s#]+"}
+# Where an imported receipt came from: closed, both keys required.
+_IMPORTED_FROM = {
+    "type": "object",
+    "required": {
+        "store": {"type": "string", "min_len": 1, "max_len": 1024, "single_line": True,
+                  "no_nul": True},
+        "sha256": _SHA256_HEX,
+    },
+    "optional": {},
+}
+
+# Merge records carry a full PR URL; stored links may also use the short
+# form, resolved by receipts.pr_item. Keys use casefolded repository names.
+_MERGE_FIELDS = {
+    "key": {"type": "string",
+            "pattern": r"merge:[a-z0-9_.-]+/[a-z0-9_.-]+#[1-9][0-9]*:[0-9a-f]{40}"},
+    "pr": {"type": "string",
+           "pattern": r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[1-9][0-9]*"},
+    "head": _RECEIPT_COMMIT,
+}
+
+
+def _check_merge(payload: Mapping[str, Any]) -> None:
+    repo, pr = payload["pr"].removeprefix("https://github.com/").rsplit("/pull/", 1)
+    if payload["key"] != f"merge:{repo.casefold()}#{pr}:{payload['head']}":
+        _fail("merge-key-mismatch")
+
+
+def _check_receipt(payload: Mapping[str, Any]) -> None:
+    """The rules across a ``review.receipt`` payload's fields; its fields
+    have passed their own checks.
+
+    ``prior_receipt`` is present exactly when ``round`` is 2 or more. An
+    ``approved`` or ``changes_requested`` receipt carries ``served_model``,
+    ``family``, ``open_bugs`` and ``findings``, and ``open_bugs`` is the
+    number of findings whose cell is ``block``. An ``unparseable`` or
+    ``crashed`` receipt carries neither ``open_bugs`` nor ``findings``, and
+    ``family`` exactly when ``served_model``. Finding ids are unique.
+    """
+    if payload["round"] >= 2 and "prior_receipt" not in payload:
+        _fail("receipt-prior-required")
+    if payload["round"] == 1 and "prior_receipt" in payload:
+        _fail("receipt-prior-forbidden")
+    if payload["verdict"] in RECEIPT_COUNTED_VERDICTS:
+        for key in ("served_model", "family", "open_bugs", "findings"):
+            if key not in payload:
+                _fail(f"receipt-counts-required:{key}")
+        blocks = sum(1 for finding in payload["findings"] if finding["cell"] == "block")
+        if payload["open_bugs"] != blocks:
+            _fail("receipt-open-bugs-mismatch")
+    else:
+        for key in ("open_bugs", "findings"):
+            if key in payload:
+                _fail(f"receipt-counts-forbidden:{key}")
+        if "family" in payload and "served_model" not in payload:
+            _fail("receipt-family-needs-served-model")
+        if "served_model" in payload and "family" not in payload:
+            _fail("receipt-served-model-needs-family")
+    seen: set[str] = set()
+    for index, finding in enumerate(payload.get("findings", ())):
+        if finding["id"] in seen:
+            _fail(f"receipt-finding-duplicate:findings[{index}].id")
+        seen.add(finding["id"])
 
 
 # item_id: "required" | "optional" | "absent" (refused when given)
@@ -208,6 +398,34 @@ SCHEMAS: dict[tuple[str, int], dict[str, Any]] = {
                            "single_line": True},
         },
     },
+    # A document attached to an item. sha256 and size are computed by the
+    # ledger from the bytes it read: ``ledger doc add`` is the only live
+    # writer (the store reserves the kind). Exactly one of content_b64 (the
+    # bytes, base64, at most DOC_INLINE_LIMIT) and path (a stored path under
+    # the database's document root, in doc_path_problem's grammar) is
+    # present; both or neither is refused (exactly-one-of). size is at most
+    # DOC_PATH_LIMIT for every document. Restore and replay recompute an
+    # inline document's digest before inserting it; a by-path document holds
+    # no bytes, so they check its schema and scan its stored path
+    # (restore.py). credential_override is present only as true: doc add sets
+    # it when --allow-credential-shapes attached bytes or a stored path
+    # holding a credential shape, and any other value is refused.
+    (DOC_KIND, 1): {
+        "item_id": "required",
+        "required": {
+            "role": {"enum": DOC_ROLES},
+            "sha256": _SHA256_HEX,
+            "size": {"type": "integer", "min": 0, "max": DOC_PATH_LIMIT},
+            "mime": _DOC_MIME,
+        },
+        "optional": {
+            "content_b64": {"type": "string"},
+            "path": {"type": "string", "doc_path": True},
+            "title": _DOC_TITLE,
+            DOC_CREDENTIAL_OVERRIDE: {"type": "boolean", "only_true": True},
+        },
+        "exactly_one_of": (("content_b64", "path"),),
+    },
     ("decision.asked", 1): {
         "item_id": "required",
         "required": {
@@ -236,6 +454,9 @@ SCHEMAS: dict[tuple[str, int], dict[str, Any]] = {
             "title_raw": {"type": "string", "min_len": 1},
             # The source entry's raw markdown: every line under its heading.
             "body": {"type": "string", "min_len": 1},
+            # What the answer covers. The picker shows it in the question
+            # (ledger ask-display), and an election takes it from the ask.
+            "scope": {"type": "string", "min_len": 1},
         },
     },
     ("decision.elected", 1): {
@@ -256,6 +477,11 @@ SCHEMAS: dict[tuple[str, int], dict[str, Any]] = {
             "source": _SOURCE,
             "question_id": {"type": "string", "min_len": 1},
             "asked_event_id": {"type": "integer", "min": 1},
+            # The picker answer an election records (ledger pick): the
+            # fingerprint of the display the owner saw and the 1-based
+            # position of the option chosen.
+            "display_sha256": _SHA256_HEX,
+            "chosen_position": {"type": "integer", "min": 1},
         },
     },
     # Withdraws (held) or restores (released) one ask without an election and
@@ -288,6 +514,8 @@ SCHEMAS: dict[tuple[str, int], dict[str, Any]] = {
             "omitted_bytes": {"type": "integer", "min": 1},
             "omitted_sha256": {"type": "string", "pattern": r"[0-9a-f]{64}"},
             "source": _SOURCE,
+            # Only on channel hook:picker, which only ledger capture writes.
+            "picker": _PICKER,
         },
         "together": (("omitted_bytes", "omitted_sha256"),),
     },
@@ -458,7 +686,7 @@ SCHEMAS: dict[tuple[str, int], dict[str, Any]] = {
         "item_id": "required",
         "required": {
             "point": {"type": "string", "min_len": 1, "max_len": 600},
-            "phase": {"enum": PHASES},
+            "phase": {"enum": PHASES, "show_allowed": True},
         },
         "optional": {
             "skills": {"type": "array", "max_len": 12, "items": _SKILL},
@@ -520,6 +748,74 @@ SCHEMAS: dict[tuple[str, int], dict[str, Any]] = {
         },
         "optional": {},
     },
+    # One review round of one pull request (ledger/receipts.py). doc_sha256
+    # is the sha256 the ledger computed for the review-receipt document the
+    # writer attached in the same transaction; prior_receipt, carried_from
+    # and supersedes name receipts on the same item. "check" holds the rules
+    # across fields (_check_receipt).
+    (RECEIPT_KIND, 1): {
+        "item_id": "required",
+        "required": {
+            "repo": _RECEIPT_REPO,
+            "pr": _EVENT_ID,
+            "head": _RECEIPT_COMMIT,
+            "base": _RECEIPT_COMMIT,
+            "round": _EVENT_ID,
+            "counts_toward_cap": {"type": "boolean"},
+            "lane": _RECEIPT_TOKEN,
+            "tier": _RECEIPT_TOKEN,
+            "requested_model": _RECEIPT_MODEL,
+            "verdict": {"enum": RECEIPT_VERDICTS},
+            "changed_files_sha256": _SHA256_HEX,
+            "doc_sha256": _SHA256_HEX,
+        },
+        "optional": {
+            "prior_receipt": _EVENT_ID,
+            "family": _RECEIPT_TOKEN,
+            "served_model": _RECEIPT_MODEL,
+            "open_bugs": {"type": "integer", "min": 0, "max": RECEIPT_MAX_FINDINGS},
+            "findings": {
+                "type": "array",
+                "max_len": RECEIPT_MAX_FINDINGS,
+                "items": {
+                    "type": "object",
+                    "required": {"id": _FINDING_ID, "cell": {"enum": RECEIPT_CELLS}},
+                    "optional": {"carried_from": _EVENT_ID},
+                },
+            },
+            "supersedes": _EVENT_ID,
+            "imported_from": _IMPORTED_FROM,
+        },
+        "check": _check_receipt,
+    },
+    # That the past-cap review-round grant stood, on its deciding election,
+    # when the writer wrote this (ledger/receipts.py sets grant_id and
+    # grant_event_id itself). It grants nothing by itself.
+    (GRANT_CITE_KIND, 1): {
+        "item_id": "required",
+        "required": {
+            "grant_id": {"enum": (CITED_GRANT_ID,)},
+            "grant_event_id": _EVENT_ID,
+            "repo": _RECEIPT_REPO,
+            "pr": _EVENT_ID,
+            "round": _EVENT_ID,
+            "scope": {"type": "string", "min_len": 1, "max_len": 300, "single_line": True,
+                      "display_text": True},
+        },
+        "optional": {},
+    },
+    (MERGE_INTENT_KIND, 1): {
+        "item_id": "required",
+        "required": _MERGE_FIELDS,
+        "optional": {},
+        "check": _check_merge,
+    },
+    (MERGE_DONE_KIND, 1): {
+        "item_id": "required",
+        "required": _MERGE_FIELDS,
+        "optional": {},
+        "check": _check_merge,
+    },
 }
 
 # One place declares how long each kind lives in item exports and cards.
@@ -531,6 +827,7 @@ DURABILITY: dict[str, str] = {
     "item.linked": DURABLE,
     "item.note": DURABLE,
     SPEC_KIND: DURABLE,
+    DOC_KIND: DURABLE,
     ENTITY_REGISTERED_KIND: DURABLE,
     ENTITY_STATE_KIND: DURABLE,
     "item.tried": DURABLE,
@@ -553,6 +850,10 @@ DURABILITY: dict[str, str] = {
     "loop.done": DURABLE,
     "loop.closed": DURABLE,
     SYSTEM_CLAIM_KIND: DURABLE,
+    RECEIPT_KIND: DURABLE,
+    GRANT_CITE_KIND: DURABLE,
+    MERGE_INTENT_KIND: DURABLE,
+    MERGE_DONE_KIND: DURABLE,
 }
 
 
@@ -566,15 +867,399 @@ def is_ephemeral(kind: str) -> bool:
 
 
 class ValidationError(ValueError):
-    """Unknown kind, unknown key, or a payload that fails its schema."""
+    """Unknown kind, unknown key, or a payload that fails its schema.
 
-    def __init__(self, reason: str):
+    ``reason`` is always exactly the refusal name. A ``hint`` (advice for the
+    person, such as how to fix the input) only adds to the message:
+    ``str(exc)`` reads ``<reason>: <hint>``.
+    """
+
+    def __init__(self, reason: str, *, hint: str | None = None):
         self.reason = reason
-        super().__init__(reason)
+        self.hint = hint
+        super().__init__(reason if hint is None else f"{reason}: {hint}")
 
 
 def _fail(reason: str) -> None:
     raise ValidationError(reason)
+
+
+# The refusal a write gets when text a picker displays breaks the displayed
+# text rule (display_text_problem). ``ask_control_character:<field>`` is its
+# reason for every class the rule refuses, so a caller compares one string;
+# ``<field>`` names the payload field (``question_id``, ``options[1].label``).
+ASK_CONTROL_CHARACTER = "ask_control_character"
+
+# The refusal a write gets when item text the item printers show (card, spec
+# show and diff, export-item, context, search, the item listings) holds a
+# code point that can drive a terminal: ``display_control_character:<kind>.<field>``,
+# for example ``display_control_character:item.spec.body_md``. The reason
+# never carries the character itself.
+DISPLAY_CONTROL_CHARACTER = "display_control_character"
+
+# Text a picker displays, per kind, as (field, is the question body). Only
+# the question body may hold a newline (a long question can run to several
+# lines, and a line feed alone cannot move the cursor back over text). The
+# header is ``ask K``, built from the event id, so no payload field holds it.
+_DISPLAYED_TEXT: dict[str, tuple[tuple[str, bool], ...]] = {
+    "decision.asked": (("question", True), ("question_id", False), ("scope", False)),
+    "decision.elected": (
+        ("question", True),
+        ("question_id", False),
+        ("scope", False),
+        ("chosen", False),
+        ("chosen_description", False),
+    ),
+}
+
+# The displayed text rule reads three Unicode tables written out below, because
+# Python's unicodedata has none of their properties: WHITE_SPACE_CODE_POINTS,
+# BLANK_CODE_POINTS and DEFAULT_IGNORABLE_RANGES. Each holds the Unicode
+# 16.0.0 data, and the rule reads it the same way on every interpreter whose
+# database UNICODE_TABLE_VERSIONS names (Python 3.11 carries 14.0.0, 3.12
+# 15.0.0, 3.13 15.1.0 and 3.14 16.0.0): a code point a table holds is decided
+# by the table, never by that interpreter's own database.
+#
+# Update rule: test_ask_display_text_rule.py fails on an interpreter whose
+# unicodedata.unidata_version is not in UNICODE_TABLE_VERSIONS. On a Unicode
+# version bump, run
+#     python3 -m pytest -q -p no:cacheprovider ledger/tests/test_ask_display_text_rule.py -k unicode_table
+# on the new interpreter. Then re-derive each table from that version's
+# Unicode Character Database (https://www.unicode.org/Public/<version>/ucd/):
+# White_Space from PropList.txt, Default_Ignorable_Code_Point from
+# DerivedCoreProperties.txt, and the blank table from its two sources as the
+# comment on BLANK_CODE_POINTS says (UnicodeData.txt names, and the no-ink
+# drawing probe; the test prints every BLANK or FILLER name it does not know).
+# Update a table, the literal copy the test pins it to, and the version list
+# together.
+UNICODE_TABLE_VERSIONS = ("14.0.0", "15.0.0", "15.1.0", "16.0.0")
+
+# Unicode White_Space (PropList.txt): the 25 code points the property names,
+# the same in every version from 6.3.0 (which took U+180E out) to 16.0.0.
+# str.isspace() is another set (it adds U+001C-U+001F), so the set is written
+# out, and every interpreter decides these code points from this table, never
+# from its own database. Displayed text holds none of them but U+0020 (and a
+# newline inside the question).
+WHITE_SPACE_CODE_POINTS = frozenset({
+    0x0009, 0x000A, 0x000B, 0x000C, 0x000D, 0x0020, 0x0085, 0x00A0, 0x1680,
+    0x2000, 0x2001, 0x2002, 0x2003, 0x2004, 0x2005, 0x2006, 0x2007, 0x2008,
+    0x2009, 0x200A, 0x2028, 0x2029, 0x202F, 0x205F, 0x3000,
+})
+
+# Code points that render as blank space but are not White_Space, from two
+# sources.
+#
+# 1. Names: the characters whose name in UnicodeData.txt holds the word BLANK
+#    or FILLER, less the ones whose glyph is a visible mark: U+2422 BLANK
+#    SYMBOL and the scribal gap and line fillers (U+A8F9, U+10AF6, U+1144E,
+#    U+11945, U+11F48). That leaves the Hangul fillers U+115F, U+1160, U+3164
+#    and U+FFA0 (default ignorable too), U+2800 BRAILLE PATTERN BLANK, U+13441
+#    EGYPTIAN HIEROGLYPH FULL BLANK and U+13442 EGYPTIAN HIEROGLYPH HALF BLANK
+#    (which Unicode says are rendered as whitespace), and U+16FE4 KHITAN SMALL
+#    SCRIPT FILLER (it marks an empty place in a Khitan cluster and draws
+#    nothing).
+# 2. No ink: code points the rule otherwise allows that a fallback font draws
+#    with no ink. U+FFFC OBJECT REPLACEMENT CHARACTER (Menlo, the macOS
+#    terminal font CoreText falls back to for it, draws it as a full-width
+#    empty cell) and U+1D159 MUSICAL SYMBOL NULL NOTEHEAD (a notehead
+#    placeholder that carries no ink of its own).
+#
+# Update rule for source 2, on a Unicode version bump and whenever a reviewer
+# reports a blank-looking character: list every code point the rule allows
+# (display_text_problem(f"a{c}b") or the question form is None), draw each one
+# alone with the platform's text renderer and its font fallback (on macOS,
+# CoreText starting from Helvetica and again from Menlo) into a bitmap, and
+# count the inked pixels; draw each allowed combining mark on a base letter
+# and compare with the letter alone. Every code point that leaves no ink,
+# other than U+0020 and U+000A, goes into this table and the test's copy.
+BLANK_CODE_POINTS = frozenset({
+    0x115F, 0x1160, 0x2800, 0x3164, 0xFFA0, 0xFFFC, 0x13441, 0x13442, 0x16FE4,
+    0x1D159,
+})
+
+# Unicode Default_Ignorable_Code_Point (DerivedCoreProperties.txt) as
+# inclusive ranges: code points a renderer may draw as nothing, so text that
+# holds one looks the same as text without it. It is the same list in
+# Unicode 14.0.0 to 16.0.0.
+DEFAULT_IGNORABLE_RANGES: tuple[tuple[int, int], ...] = (
+    (0x00AD, 0x00AD),
+    (0x034F, 0x034F),
+    (0x061C, 0x061C),
+    (0x115F, 0x1160),
+    (0x17B4, 0x17B5),
+    (0x180B, 0x180F),
+    (0x200B, 0x200F),
+    (0x202A, 0x202E),
+    (0x2060, 0x206F),
+    (0x3164, 0x3164),
+    (0xFE00, 0xFE0F),
+    (0xFEFF, 0xFEFF),
+    (0xFFA0, 0xFFA0),
+    (0xFFF0, 0xFFF8),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0000, 0xE0FFF),
+)
+_COMBINING_MARKS = ("Mn", "Mc", "Me")
+
+
+def control_character(text: str, *, allow_newline: bool = False) -> str | None:
+    """``U+XXXX`` of the first control character in ``text``, else None.
+
+    A control character is one of C0 (U+0000-U+001F, so ESC and every ANSI
+    escape), DEL (U+007F) or C1 (U+0080-U+009F): Unicode category ``Cc`` and
+    nothing else. ``allow_newline`` lets U+000A pass. A document's title and
+    stored path use this definition; the text an ask displays uses the
+    wider ``display_text_problem``. It is written as a code point so a
+    message that names it never carries the character itself.
+    """
+    for char in text:
+        if allow_newline and char == "\n":
+            continue
+        if unicodedata.category(char) == "Cc":
+            return f"U+{ord(char):04X}"
+    return None
+
+
+def _code_point(char: str) -> str:
+    return f"U+{ord(char):04X}"
+
+
+def _default_ignorable(code: int) -> bool:
+    return any(low <= code <= high for low, high in DEFAULT_IGNORABLE_RANGES)
+
+
+def _white_space_class(code: int) -> str:
+    """The class named for a White_Space code point, from the code point
+    alone, so it is the same on every interpreter."""
+    if code in (0x2028, 0x2029):
+        return "a line or paragraph separator"
+    if code <= 0x000D or code == 0x0085:
+        return "a control character"
+    return "a space other than U+0020"
+
+
+def _refused_code_point(char: str, *, question: bool) -> str | None:
+    """The class that refuses ``char`` anywhere in displayed text, else
+    None. The two pinned tables decide first, so a White_Space or blank code
+    point gets one answer on every interpreter whatever its database holds;
+    a category this rule does not name is refused, never let through."""
+    code = ord(char)
+    if char == " " or (question and char == "\n"):
+        return None
+    if code in WHITE_SPACE_CODE_POINTS:
+        return _white_space_class(code)
+    if code in BLANK_CODE_POINTS:
+        return "a blank character"
+    category = unicodedata.category(char)
+    if category == "Cc":
+        return "a control character"
+    if category == "Cf":
+        return "a format character"
+    if category == "Cs":
+        return "a surrogate"
+    if category == "Co":
+        return "a private-use character"
+    if category == "Cn":
+        return "an unassigned character"
+    if _default_ignorable(code):
+        return "an invisible character"
+    if category[:1] not in ("L", "M", "N", "P", "S"):
+        return "a character of unknown category"
+    return None
+
+
+def _edge_space(char: str) -> bool:
+    return unicodedata.category(char).startswith("Z") or char in "\t\n"
+
+
+def _nfc_culprit(text: str) -> str:
+    """The code point to name when ``text`` is not NFC: the first one at or
+    after the first place NFC changes that NFC changes alone or that
+    combines, else the code point at that place."""
+    normal = unicodedata.normalize("NFC", text)
+    start = next(
+        (i for i, (a, b) in enumerate(zip(text, normal)) if a != b),
+        min(len(text), len(normal)),
+    )
+    for char in text[start:]:
+        if unicodedata.combining(char) or unicodedata.normalize("NFC", char) != char:
+            return char
+    return text[min(start, len(text) - 1)]
+
+
+def display_text_problem(text: str, *, question: bool = False) -> tuple[str, str] | None:
+    """``(class, U+XXXX)`` of the first reason ``text`` cannot be shown by a
+    picker as it is stored, else None. ``question`` is True for the question
+    body only.
+
+    Displayed text holds no White_Space code point but U+0020
+    (WHITE_SPACE_CODE_POINTS; a newline is allowed inside the question), no
+    blank (BLANK_CODE_POINTS: U+2800, the Hangul fillers, the Egyptian
+    hieroglyph blanks, the Khitan filler, U+FFFC and U+1D159), no code point
+    of category Cc,
+    Cf (the bidi embeddings, overrides and isolates, the zero-width space and
+    joiners), Cs, Co or Cn, and no Default_Ignorable_Code_Point
+    (DEFAULT_IGNORABLE_RANGES, which adds the variation selectors such as
+    U+FE0F and U+034F). There is no emoji exception: U+200D and U+FE0F are
+    refused in the question too. It does not start or end with whitespace
+    (any Z* code point, a tab or a newline), does not start with a combining
+    mark, and is NFC, so one visible string has one stored spelling. The
+    class is a phrase for a message (``a format character``, ``an invisible
+    character``, ``text that is not NFC``); the code point is written as
+    ``U+XXXX`` so a message that names it never carries it.
+    """
+    for char in text:
+        found = _refused_code_point(char, question=question)
+        if found is not None:
+            return found, _code_point(char)
+    if text:
+        if _edge_space(text[0]):
+            return "leading whitespace", _code_point(text[0])
+        if _edge_space(text[-1]):
+            return "trailing whitespace", _code_point(text[-1])
+        if unicodedata.category(text[0]) in _COMBINING_MARKS:
+            return "a leading combining mark", _code_point(text[0])
+    if not unicodedata.is_normalized("NFC", text):
+        return "text that is not NFC", _code_point(_nfc_culprit(text))
+    return None
+
+
+def doc_path_problem(value: Any) -> str | None:
+    """Why ``value`` is not a stored document path, else None.
+
+    A stored path is a string whose UTF-8 encoding is 1 to
+    ``DOC_PATH_MAX_BYTES`` bytes, made of components separated by single
+    ``/``, each 1 to ``DOC_PATH_COMPONENT_MAX_BYTES`` bytes, none empty (so no
+    leading, trailing or doubled ``/``, and never absolute), none ``.`` and
+    none ``..``, with no control character anywhere (``control_character``,
+    which covers NUL). It is relative to the database's document root, and
+    one file has one stored spelling: ``doc add`` stores each component only
+    as its directory's entry list spells it, refusing any other spelling a
+    case-insensitive volume would open (``ledger/verbs/doc.py``).
+    """
+    if type(value) is not str:
+        return "not a string"
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError:
+        return "not UTF-8 text"
+    if not encoded:
+        return "empty"
+    if len(encoded) > DOC_PATH_MAX_BYTES:
+        return f"over {DOC_PATH_MAX_BYTES} bytes"
+    if control_character(value) is not None:
+        return "holds a control character"
+    for component in value.split("/"):
+        if component == "":
+            return "has an empty component (a leading, trailing or doubled '/')"
+        if component in (".", ".."):
+            return f"has a '{component}' component"
+        if len(component.encode("utf-8")) > DOC_PATH_COMPONENT_MAX_BYTES:
+            return f"has a component over {DOC_PATH_COMPONENT_MAX_BYTES} bytes"
+    return None
+
+
+def display_control_character(
+        kind: str, payload: Mapping[str, Any]) -> tuple[str, str, str] | None:
+    """``(field, class, code point)`` of the first ``display_text_problem``
+    in the text a picker displays for a ``decision.asked`` or
+    ``decision.elected`` payload, else None. A value that is not a string is
+    skipped here: the type checks (write time: the schema; read time:
+    ``render_ask_display``) own it.
+    """
+    for name, is_question in _DISPLAYED_TEXT.get(kind, ()):
+        value = payload.get(name)
+        if isinstance(value, str):
+            found = display_text_problem(value, question=is_question)
+            if found is not None:
+                return (name, *found)
+    if kind == "decision.asked":
+        options = payload.get("options")
+        for index, option in enumerate(options if isinstance(options, list) else []):
+            if not isinstance(option, dict):
+                continue
+            for name in ("label", "description"):
+                value = option.get(name)
+                if isinstance(value, str):
+                    found = display_text_problem(value)
+                    if found is not None:
+                        return (f"options[{index}].{name}", *found)
+    elif kind == "decision.elected":
+        rejected = payload.get("rejected")
+        for index, value in enumerate(rejected if isinstance(rejected, list) else []):
+            if isinstance(value, str):
+                found = display_text_problem(value)
+                if found is not None:
+                    return (f"rejected[{index}]", *found)
+    return None
+
+
+# The bidirectional embedding, override and isolate controls.
+_BIDI_CONTROL_CODE_POINTS = frozenset((*range(0x202A, 0x202F), *range(0x2066, 0x206A)))
+# Refused in multi-line item text: every Cc except TAB and LF (so CR, ESC,
+# BEL, NUL, DEL, NEL and the C1 CSI are in it), the Unicode line and
+# paragraph separators, and the bidirectional controls.
+_MULTI_LINE_REFUSED = frozenset((
+    *range(0x00, 0x09),
+    *range(0x0B, 0x20),
+    *range(0x7F, 0xA0),
+    0x2028,
+    0x2029,
+    *_BIDI_CONTROL_CODE_POINTS,
+))
+# Refused in one-line item text: the multi-line set plus TAB and LF.
+_ONE_LINE_REFUSED = _MULTI_LINE_REFUSED | {0x09, 0x0A}
+
+# Item text the item printers show, per kind, as (field, is one line).
+# Only these code-point rules apply: the ask rule's NFC, blank, edge
+# whitespace and invisible classes exist so a one-line picker answer has one
+# spelling to bind an election to, and this text binds nothing. It is prose:
+# Markdown ends in a newline and indents with tabs.
+_ITEM_TEXT: dict[str, tuple[tuple[str, bool], ...]] = {
+    "item.created": (("title", True),),
+    "item.note": (("text", False),),
+    "item.progress": (("text", False),),
+    SPEC_KIND: (("title", True), ("body_md", False), ("acceptance", False)),
+}
+
+
+def item_text_control_character(
+        kind: str, payload: Mapping[str, Any]) -> tuple[str, str] | None:
+    """``(field, code point)`` of the first refused code point in the item
+    text ``_ITEM_TEXT`` names for ``kind``, else None. A value that is not a
+    string is skipped: the schema owns its type."""
+    for name, one_line in _ITEM_TEXT.get(kind, ()):
+        value = payload.get(name)
+        if not isinstance(value, str):
+            continue
+        refused = _ONE_LINE_REFUSED if one_line else _MULTI_LINE_REFUSED
+        for char in value:
+            if ord(char) in refused:
+                return name, f"U+{ord(char):04X}"
+    return None
+
+
+def refuse_display_control_characters(kind: str, payload: Mapping[str, Any]) -> None:
+    """Write-time rule: refuse an ask or election whose displayed text breaks
+    ``display_text_problem`` (a control, format, separator, invisible or
+    blank code point, text that is not NFC, and the rest), always with
+    ``ask_control_character:<field>``; then refuse item text that holds a
+    code point ``item_text_control_character`` names, with
+    ``display_control_character:<kind>.<field>`` (a carriage return adds the
+    advice to convert line endings to LF to the message, never to the
+    reason). Not part of ``validate_payload``: verify, export and restore
+    re-validate rows written before this rule, and those must still read;
+    ``render_ask_display`` makes such an ask unpickable instead, and the item
+    printers escape such text."""
+    hit = display_control_character(kind, payload)
+    if hit is not None:
+        _fail(f"{ASK_CONTROL_CHARACTER}:{hit[0]}")
+    found = item_text_control_character(kind, payload)
+    if found is not None:
+        name, code_point = found
+        hint = f"{code_point}: convert line endings to LF" if code_point == "U+000D" else None
+        raise ValidationError(f"{DISPLAY_CONTROL_CHARACTER}:{kind}.{name}", hint=hint)
 
 
 def known_kinds() -> tuple[str, ...]:
@@ -590,26 +1275,69 @@ def schema_for(kind: str, payload_version: int) -> dict[str, Any]:
     return schema
 
 
+def _is_json(value: Any) -> bool:
+    """True for a JSON value: null, a string, a boolean, an integer, a finite
+    number, or an array or string-keyed object of JSON values."""
+    try:
+        if value is None or type(value) in (str, bool, int):
+            return True
+        if type(value) is float:
+            return math.isfinite(value)
+        if type(value) is list:
+            return all(_is_json(item) for item in value)
+        if type(value) is dict:
+            return all(type(key) is str and _is_json(item) for key, item in value.items())
+    except RecursionError:
+        return False
+    return False
+
+
+def _field_error(reason: str, path: str, spec: Mapping[str, Any]) -> str:
+    """The refusal for ``path``: ``reason:path``, the one prefix a caller
+    matches on, then ``; allowed: ...`` when the spec says what is allowed
+    (an enum with ``show_allowed``, or free text in ``allowed_text``). A spec
+    that says neither keeps the bare prefix."""
+    message = f"{reason}:{path}"
+    if spec.get("show_allowed"):
+        message += f"; allowed: {', '.join(spec['enum'])}"
+    elif spec.get("allowed_text"):
+        message += f"; allowed: {spec['allowed_text']}"
+    return message
+
+
+def _too_long(path: str, max_len: int, given: int) -> str:
+    """``too-long:path`` then the limit and the length given."""
+    return f"too-long:{path}; max {max_len}, got {given}"
+
+
 def _check_field(value: Any, spec: Mapping[str, Any], path: str) -> None:
     if "enum" in spec:
         if not isinstance(value, str) or value not in spec["enum"]:
-            _fail(f"bad-type:{path}")
+            _fail(_field_error("bad-type", path, spec))
         return
     field_type = spec["type"]
     if field_type == "string":
         if type(value) is not str:
-            _fail(f"bad-type:{path}")
+            _fail(_field_error("bad-type", path, spec))
         min_len = spec.get("min_len", 0)
         if min_len and len(value) < min_len:
-            _fail(f"bad-type:{path}")
+            _fail(_field_error("bad-type", path, spec))
         max_len = spec.get("max_len")
         if max_len is not None and len(value) > max_len:
-            _fail(f"too-long:{path}")
+            _fail(_too_long(path, max_len, len(value)))
         if spec.get("single_line") and ("\n" in value or "\r" in value):
             _fail(f"not-single-line:{path}")
+        if spec.get("no_nul") and "\x00" in value:
+            _fail(f"nul-character:{path}")
+        if spec.get("no_control") and control_character(value) is not None:
+            _fail(f"{ASK_CONTROL_CHARACTER}:{path}")
+        if spec.get("display_text") and display_text_problem(value) is not None:
+            _fail(f"not-display-text:{path}")
+        if spec.get("doc_path") and doc_path_problem(value) is not None:
+            _fail(f"{DOC_PATH_REFUSAL}:{path}")
         pattern = spec.get("pattern")
         if pattern is not None and re.fullmatch(pattern, value) is None:
-            _fail(f"bad-type:{path}")
+            _fail(_field_error("bad-type", path, spec))
         if spec.get("calendar_stamp"):
             from . import lease
 
@@ -624,6 +1352,9 @@ def _check_field(value: Any, spec: Mapping[str, Any], path: str) -> None:
         minimum = spec.get("min")
         if minimum is not None and value < minimum:
             _fail(f"bad-type:{path}")
+        maximum = spec.get("max")
+        if maximum is not None and value > maximum:
+            _fail(f"too-large:{path}")
         return
     if field_type == "array":
         if type(value) is not list:
@@ -633,7 +1364,7 @@ def _check_field(value: Any, spec: Mapping[str, Any], path: str) -> None:
             _fail(f"bad-type:{path}")
         max_len = spec.get("max_len")
         if max_len is not None and len(value) > max_len:
-            _fail(f"too-long:{path}")
+            _fail(_too_long(path, max_len, len(value)))
         item_spec = spec["items"]
         for index, item in enumerate(value):
             _check_field(item, item_spec, f"{path}[{index}]")
@@ -645,6 +1376,17 @@ def _check_field(value: Any, spec: Mapping[str, Any], path: str) -> None:
         if min_keys and len(value) < min_keys:
             _fail(f"bad-type:{path}")
         _check_object(value, spec.get("required", {}), spec.get("optional", {}), path)
+        return
+    if field_type == "boolean":
+        if type(value) is not bool:
+            _fail(f"bad-type:{path}")
+        if spec.get("only_true") and value is not True:
+            _fail(f"bad-type:{path}")
+        return
+    if field_type == "json_object":
+        # Any JSON object, kept verbatim: data whose keys the ledger does not own.
+        if type(value) is not dict or not _is_json(value):
+            _fail(f"bad-type:{path}")
         return
     _fail(f"bad-type:{path}")
 
@@ -663,12 +1405,43 @@ def _check_object(
     missing = set(required) - actual
     if missing:
         key = sorted(missing)[0]
-        _fail(f"missing-key:{path}.{key}" if path else f"missing-key:{key}")
+        field_path = f"{path}.{key}" if path else key
+        _fail(_field_error("missing-key", field_path, required[key]))
     for key, spec in required.items():
         _check_field(obj[key], spec, f"{path}.{key}" if path else key)
     for key, spec in optional.items():
         if key in obj:
             _check_field(obj[key], spec, f"{path}.{key}" if path else key)
+
+
+def strip_directory_ref_slash(kind: str, payload: Any, payload_version: int = 1) -> Any:
+    """``payload`` with one trailing slash stripped from each directory ref.
+
+    The writing verbs call this before validation, so ``some/dir/`` in a
+    ``refs`` list is stored as ``some/dir``. Only a ref that is a directory
+    path once the slash is gone is changed; every other value, kind and
+    payload is returned as given, and validation then refuses what it refused
+    before.
+    """
+    schema = SCHEMAS.get((kind, payload_version))
+    if schema is None or type(payload) is not dict:
+        return payload
+    out = payload
+    for key, spec in (*schema["required"].items(), *schema["optional"].items()):
+        value = payload.get(key)
+        if spec.get("type") != "array" or spec.get("items") is not _REF_TARGET:
+            continue
+        if type(value) is not list:
+            continue
+        refs = [
+            ref[:-1]
+            if type(ref) is str and ref.endswith("/") and _DIRECTORY_REF.fullmatch(ref[:-1])
+            else ref
+            for ref in value
+        ]
+        if refs != value:
+            out = {**out, key: refs}
+    return out
 
 
 def validate_payload(kind: str, payload: Any, payload_version: int = 1) -> dict[str, Any]:
@@ -682,6 +1455,15 @@ def validate_payload(kind: str, payload: Any, payload_version: int = 1) -> dict[
         present = [key for key in group if key in payload]
         if present and len(present) != len(group):
             _fail(f"incomplete-group:{','.join(group)}")
+    # Keys of which exactly one appears: both and neither are refused.
+    for group in schema.get("exactly_one_of", ()):
+        present = [key for key in group if key in payload]
+        if len(present) != 1:
+            _fail(f"exactly-one-of:{','.join(group)}")
+    # Rules across fields, for a kind that declares them.
+    check = schema.get("check")
+    if check is not None:
+        check(payload)
     return payload
 
 

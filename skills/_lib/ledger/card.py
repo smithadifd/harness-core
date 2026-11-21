@@ -13,6 +13,7 @@ Format (stable — a later reader should parse this layout, not invent one):
     type: ...
     title: ...
     status: ...
+    expired claim: ...         (card verb only, when a claim's lease expired: status reads open)
     owner: ...
     claim: ...
     spec v<N>                  (or "spec -" when the item has no spec)
@@ -50,6 +51,30 @@ bounded.
 Links lists the item's own links, then a "duplicated-by: <item>" row for
 each item linked to this one as its duplicate (the duplicate's own card lists
 "duplicate-of: <this item>").
+
+A capped Links or Blockers section names a command for each kind of row it
+cut. Rows held by the item's own events (its links, the blockers its state
+names) end "(+K cut; ledger export-item --json -- <item>)". Rows held by other
+items' events get their own line: inbound duplicated-by rows end "(+K cut;
+ledger query --duplicate-of=<item> --all)", and blockers that come only from
+another item's blocks link end "(+K cut; ledger query --blocks=<item> --open
+--all)"; --open keeps only the blockers that are not closed, the set the card
+counts. Each query prints every item that holds such a row when it runs, so
+every row the cut removed comes back. A section whose cut rows are all of one
+kind has one marker. The next step's count of the blockers past
+NEXT_STEP_BLOCKERS names the same commands, split by the same kinds.
+
+The JSON form (``Card.as_dict``) keeps ``truncated`` (the names) and adds
+``cuts``: one entry for each marker the text form prints, in the same order,
+each {section, count, unit, command} with the count and the command exactly as
+the text prints them; unit is "rows" for a "(+K cut; ...)" marker and "words"
+for a "(+K words cut; ...)" one. An ask field's entry also names the event
+that holds its full text (event_id). Words cut from an ask the card then
+capped away get one ask entry with no event_id, after the ask's field entries,
+so every name in ``truncated`` has at least one entry with a count and a
+command. The order comes from rendering the text card itself. A name with no
+marker of its own gets one entry naming the item's export, in its section's
+place, or after the rest when the text card does not render that section.
 
 An anchor's card has a Children section after Links: one line per child
 (id, title, status, holder), a child that blocks another first, then in
@@ -94,7 +119,19 @@ the header always names every row the card shows. Owner, claim and title
 are then trimmed to what the cap needs, never below FIELD_MIN_WORDS words,
 each marked "(+K words cut; ledger export-item --json -- <item>)".
 
-Truncation drops Links, then Notes, then shortens ask fields (ask texts,
+Links show the newest LINK_LIMIT links (by event id) and end with a count
+of the rest; the count's marker names the command that prints them (see
+above). Under the word limit the oldest shown link is capped next, one at a
+time, before anything else.
+
+``project_card(..., full=True)`` (``ledger card --full``) is the same shape
+unbounded: every row, every word of every row and every source id, with no
+cap, no clip and no cut marker; it can run past WORD_LIMIT.
+
+Truncation caps Links, then drops Notes (ordinary notes first, then decided:
+notes oldest first; a cut decided: note is counted and marked under Decisions,
+not Notes, and the Truncated line names decisions for it), then shortens ask
+fields (ask texts,
 then option descriptions, then the other fields; each down to
 ASK_MIN_WORDS words, marked "… (+K words cut; full text in event <id>; ledger
 export-item <item> --json)"),
@@ -115,18 +152,61 @@ WORD_LIMIT words.
 """
 from __future__ import annotations
 
+import re
 import shlex
 import unicodedata
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable, Iterator, Mapping
 
+from . import lease
 from .export import decay_boundary, decayed
 from .schema import SPEC_KIND
+from .search import DECIDED_PREFIX
 from .store import Ledger
 
 WORD_LIMIT = 400
 FOOTER = "This card is a projection; the events are the authority"
+
+
+def _is_decided_note(row: Mapping[str, Any]) -> bool:
+    """True when note ``text``, after leading whitespace, starts with
+    ``DECIDED_PREFIX`` exactly (the same grammar search uses)."""
+    text = row.get("text")
+    return isinstance(text, str) and text.lstrip().startswith(DECIDED_PREFIX)
+
+
+def _decided_note_rows(notes: tuple[dict[str, Any], ...]) -> list[dict[str, Any]]:
+    """``item.note`` rows listed under Decisions as notes, never elections."""
+    return [
+        {"event_id": row["event_id"], "as": "note", "text": row["text"]}
+        for row in notes
+        if _is_decided_note(row)
+    ]
+
+
+def _cut_section(section: str, row: Mapping[str, Any]) -> str:
+    """The section a cut ``row`` is reported against. A decided: note is
+    listed under Decisions, so its cut is counted and marked there; every
+    other row is reported against the section it was cut from."""
+    if section == "notes" and _is_decided_note(row):
+        return "decisions"
+    return section
+
+
+def _election_rows(
+    decisions: tuple[dict[str, Any], ...],
+) -> tuple[dict[str, Any], ...]:
+    """Rows a pick or election check may count: never a decided: note."""
+    return tuple(
+        row
+        for row in decisions
+        if row.get("as") != "note" and "chosen" in row
+    )
+# Links are capped oldest first in this stage, never dropped whole at once.
 DROP_ORDER = ("links", "notes")
+# A bounded card shows at most this many links, the newest, then a count.
+LINK_LIMIT = 8
 CAP_ORDER = ("decisions", "blockers", "open_questions")
 # Rows that show an event id, capped oldest first when the header ids
 # would not otherwise fit.
@@ -195,14 +275,88 @@ POINTER_LIMIT = 10
 PointerSource = Callable[[str], Iterable[Mapping[str, Any]]]
 
 
-def word_count(text: str) -> int:
+# The verbs of the commands the card prints: the next step's resume command,
+# the recovery command, the footer, the children query and the queries that
+# list a section's rows held by other items' events.
+_COMMAND_VERBS = (
+    "resume --item=",
+    "export-item ",
+    "query --parent=",
+    "query --duplicate-of=",
+    "query --blocks=",
+)
+
+
+def _prefix_words(prefix: str) -> int:
+    """How many shell words ``prefix`` holds; a quoted argument is one."""
+    try:
+        return max(1, len(shlex.split(prefix)))
+    except ValueError:
+        return max(1, len(prefix.split()))
+
+
+def _stand_in(prefix: str) -> str:
+    """Plain words that count exactly as ``prefix`` does, one per shell word."""
+    return " ".join("command" for _ in range(_prefix_words(prefix)))
+
+
+def word_count(text: str, *, command_prefix: str | None = None) -> int:
+    """Count the words of printed text.
+
+    With ``command_prefix`` the prefix counts one word per shell argument, but
+    only where it starts a command the card prints (it is followed by one of
+    the card's command verbs); the same text anywhere else counts as ordinary
+    words. The card's own bound does not use this: it counts the commands it
+    generated by rendering them (see ``_card_word_count``), so no text a
+    person wrote can pass for one.
+    """
+    if command_prefix:
+        stand_in = _stand_in(command_prefix)
+        verbs = "|".join(re.escape(verb) for verb in _COMMAND_VERBS)
+        pattern = re.escape(command_prefix) + f"(?= (?:{verbs}))"
+        text = re.sub(pattern, lambda _match: stand_in, text)
     return len(text.split())
 
 
-def _clip(text: str, limit: int) -> str:
-    """At most ``limit`` words of ``text``, then "…" when any were cut."""
+def _card_word_count(card: Card, source: Card | None = None) -> int:
+    """Words in the printed card, a generated command prefix counting one
+    word per shell argument.
+
+    The card is rendered again with a plain stand-in for its program, so only
+    the commands the card itself generates change; text a person wrote (a
+    note, a title, a decision) is never searched and counts as ordinary
+    words. ``source`` is the uncapped card the next step was derived from; the
+    next step is derived again with the stand-in while it is still that
+    derived text, and counts as plain words once it has been trimmed.
+    """
+    source = source or card
+    stand_in = _stand_in(card.program)
+    changes: dict[str, Any] = {"program": stand_in}
+
+    def derived(program: str) -> str:
+        return derive_next_step(
+            status=source.status,
+            blockers=source.blockers,
+            open_questions=source.open_questions,
+            owner=source.owner,
+            claim=source.claim,
+            item_type=source.type,
+            chosen=_latest_choice(source.decisions),
+            item_id=source.item_id,
+            program=program,
+            linked_blockers=source.inbound_blockers,
+        )
+
+    if card.next_step == derived(card.program):
+        changes["next_step"] = derived(stand_in)
+    return len(format_card(replace(card, **changes)).split())
+
+
+def _clip(text: str, limit: int | None) -> str:
+    """At most ``limit`` words of ``text`` (every word for None), then "…"
+    when any were cut."""
     words = text.split()
-    if len(words) <= limit:
+    if limit is None or len(words) <= limit:
         return " ".join(words)
     return " ".join(words[:limit]) + " …"
 
@@ -217,6 +371,9 @@ def derive_next_step(
     item_type: str = "",
     chosen: str | None = None,
     item_id: str = "",
+    program: str = "ledger",
+    full: bool = False,
+    linked_blockers: Iterable[str] = (),
 ) -> str:
     """Project a next step from current status, blockers, and open questions.
 
@@ -233,16 +390,32 @@ def derive_next_step(
     is clipped to a fixed number of words, so the step stays bounded and is
     never trimmed in a way that loses its structure: the omitted-blocker
     count and "; then answer open questions" always survive.
+
+    ``full`` (the unbounded card) names every blocker and clips no name.
+
+    The count of blockers past NEXT_STEP_BLOCKERS names the commands that
+    print them, as a capped Blockers section does: the item's own export for
+    blockers its state names, and the open-blockers query for those in
+    ``linked_blockers`` (named only by another item's blocks link).
     """
+    name_words = None if full else STEP_NAME_WORDS
     if status == "closed":
         return "None — item is closed."
     clear = "Clear blockers."
     if blockers:
-        named = ", ".join(
-            _clip(name, STEP_NAME_WORDS) for name in blockers[:NEXT_STEP_BLOCKERS]
-        )
-        if len(blockers) > NEXT_STEP_BLOCKERS:
-            named += f" {_cut_count(len(blockers) - NEXT_STEP_BLOCKERS, item_id)}"
+        shown = blockers if full else blockers[:NEXT_STEP_BLOCKERS]
+        named = ", ".join(_clip(name, name_words) for name in shown)
+        rest = blockers[len(shown):]
+        if rest:
+            linked = set(linked_blockers)
+            cuts = _cut_commands(
+                "blockers",
+                len(rest),
+                sum(1 for name in rest if name in linked),
+                item_id,
+                program,
+            )
+            named += " " + " ".join(_row_marker(count, command) for count, command in cuts)
         clear = f"Clear blockers: {named}."
     if open_questions:
         if blockers:
@@ -252,11 +425,12 @@ def derive_next_step(
         return clear
     claimed = None
     if status == "claimed":
-        who = _clip(claim or owner or "", STEP_NAME_WORDS)
+        who = _clip(claim or owner or "", name_words)
         claimed = f"Continue claimed work ({who})." if who else "Continue claimed work."
     if item_type == "decision":
         if chosen is not None:
-            head = f"Decided: {_clip(chosen.strip().rstrip('.'), STEP_CHOSEN_WORDS)}."
+            chosen_words = None if full else STEP_CHOSEN_WORDS
+            head = f"Decided: {_clip(chosen.strip().rstrip('.'), chosen_words)}."
             if status == "blocked" or blockers:
                 return f"{head} {clear}"
             return f"{head} {claimed or 'Nothing left to answer.'}"
@@ -270,7 +444,7 @@ def derive_next_step(
     if status == "blocked":
         return "Clear blockers."
     return claimed or (
-        f"Resume with: {shlex.join(['ledger', 'resume', f'--item={item_id}'])}".rstrip()
+        f"Resume with: {_command(program, ['resume', f'--item={item_id}'])}".rstrip()
     )
 
 
@@ -314,20 +488,37 @@ class Card:
     children: tuple[dict[str, Any], ...] = ()
     children_closed: int = 0
     children_total: int = 0
+    # Rows held by other items' events: the event ids of inbound
+    # duplicated-by links, and the blockers named only by another item's
+    # blocks link. A cut of these rows names a query, not export-item.
+    inbound_links: tuple[int, ...] = ()
+    inbound_blockers: tuple[str, ...] = ()
+    # Of each section's cut rows (``omitted``), how many are held elsewhere.
+    omitted_elsewhere: tuple[tuple[str, int], ...] = ()
+    # Invocation prefix used only to preserve runnable commands while bounding.
+    program: str = "ledger"
+    # The card verb's read-side status (lease.read_status), set by
+    # project_card(lease_status=True) only: ``open`` for a claim whose lease
+    # expired, with the old holder and the stamp. ``status`` stays the
+    # recorded status, which the next step and every guard read.
+    shown_status: str | None = None
+    expired_holder: str | None = None
+    expires_at: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         """Structured form of the same content the text card shows."""
-        return {
+        out = {
             "item_id": self.item_id,
             "type": self.type,
             "title": self.title,
-            "status": self.status,
+            "status": self.status if self.shown_status is None else self.shown_status,
             "owner": self.owner,
             "claim": self.claim,
             "revision": {"id": self.revision_id, "hash": self.revision_hash},
             "source_event_ids": list(self.source_event_ids),
             "source_event_ids_omitted": self.source_omitted,
-            "decisions": [dict(row) for row in self.decisions],
+            "decisions": [dict(row) for row in self.decisions]
+            + _decided_note_rows(self.notes),
             "open_questions": [dict(row) for row in self.open_questions],
             "next_step": self.next_step,
             "links": [dict(row) for row in self.links],
@@ -355,8 +546,14 @@ class Card:
                 self.spec_hash,
             ),
             "truncated": list(self.truncated),
-            "footer": footer_line(self.item_id),
+            "cuts": _cut_entries(self),
+            "footer": footer_line(self.item_id, self.program),
         }
+        if self.shown_status is not None:
+            out["recorded_status"] = self.status
+            out["expired_holder"] = self.expired_holder
+            out["expires_at"] = self.expires_at
+        return out
 
 
 def spec_moved_line(
@@ -429,11 +626,16 @@ def spec_content_hash(events: Iterable[Any], version: int | None) -> str | None:
 
 
 def item_spec_moved(lg: Ledger, item_id: str) -> str | None:
-    """The ``spec moved`` line for one item, or None (see ``spec_moved_line``)."""
-    item = lg.item(item_id)
-    if item is None:
-        return None
-    events = lg.events(item_id=item_id)
+    """The ``spec moved`` line for one item, or None (see ``spec_moved_line``).
+
+    The item row and its events are read in one snapshot (see _read_snapshot),
+    so the line never mixes the claim of one state with the spec of another.
+    """
+    with _read_snapshot(lg):
+        item = lg.item(item_id)
+        if item is None:
+            return None
+        events = lg.events(item_id=item_id)
     spec = latest_spec_event(events)
     current = None if spec is None else spec.payload.get("version")
     claimed = claim_spec_version(events, item)
@@ -445,6 +647,43 @@ def item_spec_moved(lg: Ledger, item_id: str) -> str | None:
     )
 
 
+_NAMED_ESCAPES = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
+# The bidirectional embedding, override and isolate controls (U+202A-U+202E,
+# U+2066-U+2069): they reorder what a terminal shows, so both escapers write
+# them as visible escapes, as they do the control characters.
+_BIDI_CONTROLS = frozenset(chr(code) for code in (*range(0x202A, 0x202F), *range(0x2066, 0x206A)))
+
+
+def _escaped(char: str) -> bool:
+    """True for a code point no printer writes raw: a control character
+    (Cc), a line or paragraph separator, or a bidirectional control."""
+    return unicodedata.category(char) in ("Cc", "Zl", "Zp") or char in _BIDI_CONTROLS
+
+
+def _one_line(value: Any) -> str:
+    """The value as text that cannot end its line or reach the terminal as a
+    control sequence: LF, CR and TAB become ``\\n``, ``\\r`` and ``\\t``, and
+    every other control character, the Unicode line and paragraph separators
+    and the bidirectional controls become ``\\uXXXX``. No escape is
+    whitespace, so escaping never adds a word."""
+    out = []
+    for char in str(value):
+        if char in _NAMED_ESCAPES:
+            out.append(_NAMED_ESCAPES[char])
+        elif _escaped(char):
+            out.append(f"\\u{ord(char):04x}")
+        else:
+            out.append(char)
+    return "".join(out)
+
+
+def _multi_line(value: Any) -> str:
+    """Multi-line text (a spec body, acceptance, a ticket section) with its
+    lines and indentation kept: LF and TAB stay, and every other code point
+    ``_one_line`` escapes gets the same visible escape (CR as ``\\r``)."""
+    return "".join(char if char in "\n\t" else _one_line(char) for char in str(value))
+
+
 def _dash(value: str | None) -> str:
     return value if value else "-"
 
@@ -453,14 +692,21 @@ def _fmt_list(lines: list[str]) -> str:
     return "\n".join(lines) if lines else "(none)"
 
 
-def _fmt_decisions(rows: tuple[dict[str, Any], ...]) -> str:
+def _fmt_decisions(
+    rows: tuple[dict[str, Any], ...],
+    notes: tuple[dict[str, Any], ...] = (),
+) -> str:
     lines = [
         (
-            f"- event={row['event_id']} quote_ref={row['quote_ref']}: "
-            f"{row['question']} -> {row['chosen']}"
+            f"- event={row['event_id']} quote_ref={_one_line(row['quote_ref'])}: "
+            f"{_one_line(row['question'])} -> {_one_line(row['chosen'])}"
         )
         for row in rows
     ]
+    for note in _decided_note_rows(notes):
+        lines.append(
+            f"- event={note['event_id']} note: {_one_line(note['text'])}"
+        )
     return _fmt_list(lines)
 
 
@@ -468,39 +714,116 @@ def _fmt_decisions(rows: tuple[dict[str, Any], ...]) -> str:
 # the command that prints the item's events and so recovers it.
 
 
-def recover_command(item_id: str) -> str:
+def _shell_arg(arg: str) -> str:
+    """``arg`` quoted for a shell, safe to print. An argument with no code
+    point ``_escaped`` names is ``shlex.quote``d. One that holds such a code
+    point (shlex would leave it raw) is spelled ``"$(printf '%b' '...')"``,
+    which bash, zsh, macOS ``/bin/sh`` and dash all decode the same way. In
+    the single-quoted ``%b`` operand a backslash is ``\\\\``, a quote is
+    ``\\0047`` and every escaped code point is its UTF-8 bytes as
+    ``\\0NNN`` (octal), so the printed text holds no control character and
+    no quote that could end the word early, and the operand is one literal
+    word to every shell.
+
+    Known limit: command substitution drops trailing newlines, so an
+    argument that ends in LF comes back without them (no one-word spelling
+    keeps them in all four shells). An argument cannot hold NUL at all."""
+    if not any(_escaped(char) for char in arg):
+        return shlex.quote(arg)
+    out = []
+    for char in arg:
+        if char == "\\":
+            out.append("\\\\")
+        elif char == "'":
+            out.append("\\0047")
+        elif _escaped(char):
+            out.extend(f"\\0{byte:03o}" for byte in char.encode("utf-8"))
+        else:
+            out.append(char)
+    return "\"$(printf '%b' '" + "".join(out) + "')\""
+
+
+def _command(program: str, args: list[str]) -> str:
+    """A printed command: ``program`` (already shell-quoted by
+    ``invocation_prefix``) and each argument quoted by ``_shell_arg``, so an
+    id holding a control character prints no raw control and a copied
+    command still passes the stored id."""
+    return " ".join([program, *(_shell_arg(arg) for arg in args)])
+
+
+def recover_command(item_id: str, program: str = "ledger") -> str:
     """The command that prints every event the card was cut from."""
     # Flags first, then ``--``: an id with a leading hyphen or shell
     # metacharacters stays one safe token in a copied command.
-    return shlex.join(["ledger", "export-item", "--json", "--", item_id])
+    return _command(program, ['export-item', '--json', '--', item_id])
 
 
-def footer_line(item_id: str) -> str:
+def footer_line(item_id: str, program: str = "ledger") -> str:
     """The card's last line: a projection, with what is authoritative."""
-    return f"{FOOTER} ({shlex.join(['ledger', 'export-item', '--', item_id])})"
+    return f"{FOOTER} ({_command(program, ['export-item', '--', item_id])})"
 
 
-def _cut_count(count: int, item_id: str) -> str:
+def _row_marker(count: int, command: str) -> str:
+    """Marker for ``count`` rows cut, naming the command that prints them."""
+    return f"(+{count} cut; {command})"
+
+
+def _cut_count(count: int, item_id: str, program: str = "ledger") -> str:
     """Marker for rows or ids cut from a section or the header."""
-    return f"(+{count} cut; {recover_command(item_id)})"
+    return _row_marker(count, recover_command(item_id, program))
 
 
-def children_command(item_id: str) -> str:
+def children_command(item_id: str, program: str = "ledger") -> str:
     """The command that prints every child ``item_id`` has when it runs."""
     # The --flag=value form keeps an id with a leading hyphen one argument.
-    return shlex.join(["ledger", "query", f"--parent={item_id}", "--all"])
+    return _command(program, ['query', f'--parent={item_id}', '--all'])
 
 
-def _cut_words(count: int, item_id: str) -> str:
+def duplicates_command(item_id: str, program: str = "ledger") -> str:
+    """The command that prints every item linked to ``item_id`` as its duplicate."""
+    return _command(program, ['query', f'--duplicate-of={item_id}', '--all'])
+
+
+def blockers_command(item_id: str, program: str = "ledger") -> str:
+    """The command that prints every item with a blocks link to ``item_id``
+    that is not closed: the blockers the card counts (closed ones are left
+    out of the card)."""
+    return _command(program, ['query', f'--blocks={item_id}', '--open', '--all'])
+
+
+# The command that prints a section's rows held by other items' events.
+_ELSEWHERE_COMMANDS: dict[str, Callable[[str, str], str]] = {
+    "links": duplicates_command,
+    "blockers": blockers_command,
+}
+
+
+def _cut_commands(
+    section: str, count: int, elsewhere: int, item_id: str, program: str = "ledger"
+) -> list[tuple[int, str]]:
+    """(count, command) for each kind of row cut from ``section``: rows the
+    item's own events hold first, then the ``elsewhere`` rows other items'
+    events hold, under the query that lists them."""
+    cuts: list[tuple[int, str]] = []
+    if count > elsewhere:
+        cuts.append((count - elsewhere, recover_command(item_id, program)))
+    if elsewhere > 0:
+        cuts.append((elsewhere, _ELSEWHERE_COMMANDS[section](item_id, program)))
+    return cuts
+
+
+def _cut_words(count: int, item_id: str, program: str = "ledger") -> str:
     """Marker for words trimmed from the title or next step."""
-    return f"(+{count} words cut; {recover_command(item_id)})"
+    return f"(+{count} words cut; {recover_command(item_id, program)})"
 
 
-def _cut_marker(count: int, event_id: int, item_id: str) -> str:
+def _cut_marker(
+    count: int, event_id: int, item_id: str, program: str = "ledger"
+) -> str:
     """Inline marker for words cut from an ask field held by ``event_id``."""
     return (
         f"… (+{count} words cut; full text in event {event_id}; "
-        f"{recover_command(item_id)})"
+        f"{recover_command(item_id, program)})"
     )
 
 
@@ -508,25 +831,31 @@ def _cut_marker(count: int, event_id: int, item_id: str) -> str:
 _MARKER_WORDS = len(_cut_marker(1, 1, "x").split())
 
 
-def _shown(row: Mapping[str, Any], path: str, value: str, item_id: str) -> str:
+def _shown(
+    row: Mapping[str, Any], path: str, value: str, item_id: str, program: str = "ledger"
+) -> str:
     cut = int((row.get("omitted_words") or {}).get(path, 0))
     if cut <= 0:
         return value
-    return f"{value} {_cut_marker(cut, int(row['asked_event_id']), item_id)}"
+    return f"{value} {_cut_marker(cut, int(row['asked_event_id']), item_id, program)}"
 
 
-def _option_lines(row: Mapping[str, Any], item_id: str) -> list[str]:
+def _option_lines(
+    row: Mapping[str, Any], item_id: str, program: str = "ledger"
+) -> list[str]:
     lines: list[str] = []
     for index, option in enumerate(row.get("options") or []):
         label = str(option.get("label") or "").strip()
         description = str(option.get("description") or "").strip()
         if description:
-            description = _shown(row, f"options.{index}.description", description, item_id)
+            description = _shown(
+                row, f"options.{index}.description", _one_line(description), item_id, program
+            )
         letter = chr(ord("A") + index) if index < 26 else str(index + 1)
         # An option pick already labels its options with letters.
         if len(label) == 1 and "A" <= label <= "Z":
             letter, label = label, ""
-        text = " — ".join(part for part in (label, description) if part)
+        text = " — ".join(part for part in (_one_line(label), description) if part)
         lines.append(f"    {letter}) {text}" if text else f"    {letter})")
     return lines
 
@@ -545,49 +874,43 @@ def _default_only(payload: Mapping[str, Any]) -> bool:
     )
 
 
-def _fmt_questions(rows: tuple[dict[str, Any], ...], item_id: str) -> str:
+def _fmt_questions(
+    rows: tuple[dict[str, Any], ...],
+    item_id: str,
+    program: str,
+    order: list[str],
+) -> str:
+    # The ask-field markers print here, before the section's own marker.
+    _rendered(order, "ask")
     lines: list[str] = []
     for row in rows:
-        lines.append(f"- event={row['asked_event_id']}: {row['question']}")
+        lines.append(f"- event={row['asked_event_id']}: {_one_line(row['question'])}")
         if row.get("ask"):
-            lines.append(f"  ask: {_shown(row, 'ask', row['ask'], item_id)}")
+            lines.append(f"  ask: {_shown(row, 'ask', _one_line(row['ask']), item_id, program)}")
         if row.get("options") and not row.get("default_only"):
             lines.append("  options:")
-            lines.extend(_option_lines(row, item_id))
+            lines.extend(_option_lines(row, item_id, program))
         for name in ASK_FIELDS:
             value = row.get(name)
             if value:
-                lines.append(f"  {name}: {_shown(row, name, value, item_id)}")
+                lines.append(f"  {name}: {_shown(row, name, _one_line(value), item_id, program)}")
     return _fmt_list(lines)
 
 
 def _fmt_links(rows: tuple[dict[str, Any], ...]) -> str:
     lines = [
-        f"- {row['rel']}: {row['target']} (event={row['event_id']})" for row in rows
+        f"- {_one_line(row['rel'])}: {_one_line(row['target'])} (event={row['event_id']})"
+        for row in rows
     ]
     return _fmt_list(lines)
 
 
 def _fmt_notes(rows: tuple[dict[str, Any], ...]) -> str:
-    lines = [f"- event={row['event_id']}: {row['text']}" for row in rows]
+    lines = [
+        f"- event={row['event_id']}: {_one_line(row['text'])}"
+        for row in rows
+    ]
     return _fmt_list(lines)
-
-
-_NAMED_ESCAPES = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
-
-
-def _one_line(value: Any) -> str:
-    """The value as text that cannot end its line: every control character,
-    and the Unicode line and paragraph separators, becomes a visible escape."""
-    out = []
-    for char in str(value):
-        if char in _NAMED_ESCAPES:
-            out.append(_NAMED_ESCAPES[char])
-        elif unicodedata.category(char) in ("Cc", "Zl", "Zp"):
-            out.append(f"\\u{ord(char):04x}")
-        else:
-            out.append(char)
-    return "".join(out)
 
 
 def _fmt_children(rows: tuple[dict[str, Any], ...]) -> str:
@@ -599,15 +922,15 @@ def _fmt_children(rows: tuple[dict[str, Any], ...]) -> str:
     return _fmt_list(lines)
 
 
-def _children_block(card: Card) -> list[str]:
+def _children_block(card: Card, order: list[str]) -> list[str]:
     """The Children section, or nothing for an item with no children."""
     if card.children_total <= 0:
         return []
+    _rendered(order, "children")
     body = _fmt_children(card.children)
-    count = _omitted_count(card, "children")
-    if count > 0:
-        # The children are other items' events: name the query that lists them.
-        marker = f"(+{count} cut; {children_command(card.item_id)})"
+    cuts = _section_cuts(card, "children")
+    if cuts:
+        marker = "\n".join(_row_marker(count, command) for count, command in cuts)
         body = marker if body == "(none)" else f"{body}\n{marker}"
     return [
         "",
@@ -617,53 +940,60 @@ def _children_block(card: Card) -> list[str]:
 
 
 def _fmt_blockers(blockers: tuple[str, ...]) -> str:
-    return _fmt_list([f"- {item}" for item in blockers])
+    return _fmt_list([f"- {_one_line(item)}" for item in blockers])
 
 
 def _fmt_records(rows: tuple[dict[str, Any], ...]) -> str:
     lines: list[str] = []
     for row in rows:
-        standing = row["standing"]
-        if standing == "superseded" and row.get("superseded_by"):
+        standing = _one_line(row["standing"])
+        if row["standing"] == "superseded" and row.get("superseded_by"):
             standing += f" (by event {row['superseded_by']})"
         elif row.get("source_event_id"):
             standing += f" (source event {row['source_event_id']})"
-        who = f"{row['who']} ({row['who_kind']}"
+        who = f"{_one_line(row['who'])} ({_one_line(row['who_kind'])}"
         if row.get("relayed_by"):
-            who += f", relayed by {row['relayed_by']}"
+            who += f", relayed by {_one_line(row['relayed_by'])}"
         who += ")"
         lines.append(
-            f"- event={row['event_id']} {standing}: {who} [{row['phase']}] "
-            f"\"{row['verbatim']}\""
+            f"- event={row['event_id']} {standing}: {who} [{_one_line(row['phase'])}] "
+            f"\"{_one_line(row['verbatim'])}\""
         )
-        lines.append(f"  effect: {row['effect']}")
-        tags = ", ".join(f"{tag['type']}:{tag['id']}" for tag in row["tags"])
+        lines.append(f"  effect: {_one_line(row['effect'])}")
+        tags = ", ".join(
+            f"{_one_line(tag['type'])}:{_one_line(tag['id'])}" for tag in row["tags"]
+        )
         lines.append(f"  tags: {tags}")
         if row.get("evidence"):
-            lines.append(f"  evidence: {row['evidence']}")
+            lines.append(f"  evidence: {_one_line(row['evidence'])}")
         if row.get("result"):
-            lines.append(f"  result: {row['result']}")
+            lines.append(f"  result: {_one_line(row['result'])}")
     return _fmt_list(lines)
 
 
 def _fmt_tried(rows: tuple[dict[str, Any], ...]) -> str:
     lines = []
     for row in rows:
-        line = f"- event={row['event_id']}: {row['what']}"
+        line = f"- event={row['event_id']}: {_one_line(row['what'])}"
         if row.get("outcome"):
-            line += f" -> {row['outcome']}"
+            line += f" -> {_one_line(row['outcome'])}"
         lines.append(line)
     return _fmt_list(lines)
 
 
-def _fmt_reviews(rows: tuple[dict[str, Any], ...], item_id: str) -> str:
+def _fmt_reviews(
+    rows: tuple[dict[str, Any], ...], item_id: str, program: str = "ledger"
+) -> str:
     lines: list[str] = []
     for row in rows:
-        lines.append(f"- event={row['event_id']} round {row['round']}: {row['verdict']}")
-        lines.extend(f"  finding: {finding}" for finding in row["findings"])
+        lines.append(
+            f"- event={row['event_id']} round {_one_line(row['round'])}: "
+            f"{_one_line(row['verdict'])}"
+        )
+        lines.extend(f"  finding: {_one_line(finding)}" for finding in row["findings"])
         if row.get("findings_cut"):
             lines.append(
-                f"  {_cut_count(row['findings_cut'], item_id)} findings; "
+                f"  {_cut_count(row['findings_cut'], item_id, program)} findings; "
                 f"full list in event {row['event_id']}"
             )
     return _fmt_list(lines)
@@ -671,16 +1001,19 @@ def _fmt_reviews(rows: tuple[dict[str, Any], ...], item_id: str) -> str:
 
 def _fmt_stop(rows: tuple[dict[str, Any], ...]) -> str:
     return _fmt_list(
-        [f"event={row['event_id']} [{row['phase']}]: {row['point']}" for row in rows]
+        [
+            f"event={row['event_id']} [{_one_line(row['phase'])}]: {_one_line(row['point'])}"
+            for row in rows
+        ]
     )
 
 
 def _fmt_pointers(rows: tuple[dict[str, Any], ...]) -> str:
     lines = []
     for row in rows:
-        line = f"- {row['ref']}"
+        line = f"- {_one_line(row['ref'])}"
         if row.get("note"):
-            line += f": {row['note']}"
+            line += f": {_one_line(row['note'])}"
         lines.append(line)
     return _fmt_list(lines)
 
@@ -704,37 +1037,164 @@ def _omitted_count(card: Card, section: str) -> int:
     return 0
 
 
-def _with_marker(body: str, card: Card, section: str) -> str:
+def _elsewhere_count(card: Card, section: str) -> int:
+    for name, count in card.omitted_elsewhere:
+        if name == section:
+            return count
+    return 0
+
+
+def _section_cuts(card: Card, section: str) -> list[tuple[int, str]]:
+    """(count, command) of each marker a capped section prints, in order."""
     count = _omitted_count(card, section)
     if count <= 0:
+        return []
+    if section == "children":
+        # The children are other items' events: name the query that lists them.
+        return [(count, children_command(card.item_id, card.program))]
+    elsewhere = _elsewhere_count(card, section) if section in _ELSEWHERE_COMMANDS else 0
+    return _cut_commands(section, count, elsewhere, card.item_id, card.program)
+
+
+# Fields trimmed in place, each with one "(+K words cut; ...)" marker.
+_INLINE_FIELDS = ("title", "owner", "claim", "next_step")
+
+
+def _ask_cuts(card: Card) -> list[dict[str, Any]]:
+    """One entry per ask-field marker the text prints, in print order, then
+    the words cut from asks the card capped away (no marker prints them)."""
+    command = recover_command(card.item_id, card.program)
+    entries: list[dict[str, Any]] = []
+    for row in card.open_questions:
+        omitted_words = row.get("omitted_words") or {}
+        options = range(len(row.get("options") or []))
+        paths = ["ask", *(f"options.{index}.description" for index in options), *ASK_FIELDS]
+        for path in paths:
+            cut = int(omitted_words.get(path, 0))
+            if cut > 0:
+                entries.append(
+                    {
+                        "section": "ask",
+                        "count": cut,
+                        "unit": "words",
+                        "command": command,
+                        "event_id": int(row["asked_event_id"]),
+                    }
+                )
+    left = _omitted_count(card, "ask") - sum(entry["count"] for entry in entries)
+    if left > 0:
+        entries.append({"section": "ask", "count": left, "unit": "words", "command": command})
+    return entries
+
+
+def _render_order(card: Card) -> list[str]:
+    """The sections that can carry a cut marker, in the order the text card
+    renders them: read off one rendering, so the JSON cannot drift from it."""
+    order: list[str] = []
+    _render_card(card, order)
+    return order
+
+
+def _cut_entries(card: Card) -> list[dict[str, Any]]:
+    """The JSON ``cuts``: each marker the text card prints, as
+    {section, count, unit, command}, in the order the text card prints them.
+    A name with no marker of its own still gets one entry naming the item's
+    export (after the rest when its section does not render), so no cut
+    section goes out without its count and command."""
+    order = _render_order(card)
+    sections = [name for name in order if name in card.truncated]
+    sections += [name for name in card.truncated if name not in order]
+    entries: list[dict[str, Any]] = []
+    for section in sections:
+        if section == "ask":
+            found = _ask_cuts(card)
+        elif section in _INLINE_FIELDS:
+            count = _omitted_count(card, section)
+            found = []
+            if count > 0:
+                found.append(
+                    {
+                        "section": section,
+                        "count": count,
+                        "unit": "words",
+                        "command": recover_command(card.item_id, card.program),
+                    }
+                )
+        else:
+            found = [
+                {"section": section, "count": count, "unit": "rows", "command": command}
+                for count, command in _section_cuts(card, section)
+            ]
+        if not found:
+            found = [
+                {
+                    "section": section,
+                    "count": _omitted_count(card, section),
+                    "unit": "rows",
+                    "command": recover_command(card.item_id, card.program),
+                }
+            ]
+        entries.extend(found)
+    return entries
+
+
+def _rendered(order: list[str], section: str) -> None:
+    """Note that ``section`` renders here, the first time it does."""
+    if section not in order:
+        order.append(section)
+
+
+def _with_marker(body: str, card: Card, section: str, order: list[str]) -> str:
+    _rendered(order, section)
+    cuts = _section_cuts(card, section)
+    if not cuts:
         return body
-    marker = _cut_count(count, card.item_id)
+    marker = "\n".join(_row_marker(count, command) for count, command in cuts)
     if body == "(none)":
         return marker
     return f"{body}\n{marker}"
 
 
-def _with_inline_marker(text: str, card: Card, section: str) -> str:
+def _with_inline_marker(text: str, card: Card, section: str, order: list[str]) -> str:
+    _rendered(order, section)
     count = _omitted_count(card, section)
     if count <= 0:
         return text
-    return f"{text} {_cut_words(count, card.item_id)}"
+    return f"{text} {_cut_words(count, card.item_id, card.program)}"
+
+
+def _expired_claim_lines(card: Card) -> list[str]:
+    """The line under ``status: open`` when the recorded claim's lease expired."""
+    if card.shown_status is None or card.shown_status == card.status:
+        return []
+    return [
+        f"expired claim: holder {_one_line(_dash(card.expired_holder))}, "
+        f"lease expired {_one_line(_dash(card.expires_at))}, "
+        f"recorded status {_one_line(card.status)}"
+    ]
 
 
 def format_card(card: Card) -> str:
     """Render the stable text/markdown card, including the authority footer."""
+    return _render_card(card, [])
+
+
+def _render_card(card: Card, order: list[str]) -> str:
+    """Render the card; append to ``order`` each section that can carry a cut
+    marker, in the order it renders."""
     source = ", ".join(str(i) for i in card.source_event_ids)
     if card.source_omitted > 0:
-        source = f"{source} {_cut_count(card.source_omitted, card.item_id)}"
+        source = f"{source} {_cut_count(card.source_omitted, card.item_id, card.program)}"
     parts = [
-        f"# {card.item_id}",
+        f"# {_one_line(card.item_id)}",
         f"revision: {card.revision_id} {card.revision_hash}",
         f"source_event_ids: {source}",
-        f"type: {card.type}",
-        f"title: {_with_inline_marker(card.title, card, 'title')}",
-        f"status: {card.status}",
-        f"owner: {_with_inline_marker(_dash(card.owner), card, 'owner')}",
-        f"claim: {_with_inline_marker(_dash(card.claim), card, 'claim')}",
+        f"type: {_one_line(card.type)}",
+        f"title: {_with_inline_marker(_one_line(card.title), card, 'title', order)}",
+        f"status: {_one_line(card.status if card.shown_status is None else card.shown_status)}",
+        *_expired_claim_lines(card),
+        f"owner: {_with_inline_marker(_one_line(_dash(card.owner)), card, 'owner', order)}",
+        f"claim: {_with_inline_marker(_one_line(_dash(card.claim)), card, 'claim', order)}",
         f"spec {_dash(None if card.spec_version is None else f'v{card.spec_version}')}",
     ]
     moved = spec_moved_line(
@@ -745,36 +1205,59 @@ def format_card(card: Card) -> str:
     parts += [
         "",
         "## Decisions",
-        _with_marker(_fmt_decisions(card.decisions), card, "decisions"),
+        _with_marker(
+            _fmt_decisions(card.decisions, card.notes), card, "decisions", order
+        ),
         "",
         "## Open questions",
         _with_marker(
-            _fmt_questions(card.open_questions, card.item_id), card, "open_questions"
+            _fmt_questions(card.open_questions, card.item_id, card.program, order),
+            card,
+            "open_questions",
+            order,
         ),
         "",
         "## Next step",
-        _with_inline_marker(card.next_step, card, "next_step"),
+        _with_inline_marker(_one_line(card.next_step), card, "next_step", order),
         "",
         "## Links",
-        _with_marker(_fmt_links(card.links), card, "links"),
-        *_children_block(card),
+        _with_marker(_fmt_links(card.links), card, "links", order),
+        *_children_block(card, order),
         "",
         "## Blockers",
-        _with_marker(_fmt_blockers(card.blockers), card, "blockers"),
+        _with_marker(_fmt_blockers(card.blockers), card, "blockers", order),
         "",
         "## Notes",
-        _with_marker(_fmt_notes(card.notes), card, "notes"),
+        _with_marker(
+            _fmt_notes(tuple(row for row in card.notes if not _is_decided_note(row))),
+            card,
+            "notes",
+            order,
+        ),
     ]
     for section, heading, fmt in _RESUME_FORMAT:
         rows = getattr(card, section)
         if not rows and _omitted_count(card, section) <= 0:
             continue
-        body = fmt(rows, card.item_id) if fmt is _fmt_reviews else fmt(rows)
-        parts.extend(["", f"## {heading}", _with_marker(body, card, section)])
+        body = fmt(rows, card.item_id, card.program) if fmt is _fmt_reviews else fmt(rows)
+        parts.extend(["", f"## {heading}", _with_marker(body, card, section, order)])
     if card.truncated:
         parts.extend(["", "## Truncated", "dropped: " + ", ".join(card.truncated)])
-    parts.extend(["", footer_line(card.item_id)])
+    parts.extend(["", footer_line(card.item_id, card.program)])
     return "\n".join(parts) + "\n"
+
+
+def _record_ref_ids(card: Card) -> set[int]:
+    """The events behind each decision record's standing and result: the
+    latest standing event, the latest result event, the standing's source
+    event and the decision that superseded it. The full card names them."""
+    ids: set[int] = set()
+    for row in card.decision_records:
+        for key in ("standing_event_id", "result_event_id", "source_event_id", "superseded_by"):
+            value = row.get(key)
+            if value is not None:
+                ids.add(int(value))
+    return ids
 
 
 def _content_ids(card: Card) -> set[int]:
@@ -811,16 +1294,18 @@ def _record_omission(
 
 
 def _latest_choice(decisions: tuple[dict[str, Any], ...]) -> str | None:
-    if not decisions:
+    rows = _election_rows(decisions)
+    if not rows:
         return None
-    return max(decisions, key=lambda row: int(row["event_id"]))["chosen"]
+    return max(rows, key=lambda row: int(row["event_id"]))["chosen"]
 
 
 def _next_step_ids(card: Card) -> set[int]:
     """Events the next step reads: every open ask and the latest election."""
     ids = {int(row["asked_event_id"]) for row in card.open_questions}
-    if card.decisions:
-        ids.add(max(int(row["event_id"]) for row in card.decisions))
+    elected = _election_rows(card.decisions)
+    if elected:
+        ids.add(max(int(row["event_id"]) for row in elected))
     return ids
 
 
@@ -829,8 +1314,9 @@ def _key_step_ids(card: Card) -> set[int]:
     ids: set[int] = set()
     if card.open_questions:
         ids.add(max(int(row["asked_event_id"]) for row in card.open_questions))
-    if card.decisions:
-        ids.add(max(int(row["event_id"]) for row in card.decisions))
+    elected = _election_rows(card.decisions)
+    if elected:
+        ids.add(max(int(row["event_id"]) for row in elected))
     return ids
 
 
@@ -898,6 +1384,7 @@ def _shorten_one(
     excess: int,
     *,
     overhead: int = 0,
+    marker_words: int = _MARKER_WORDS,
 ) -> tuple[tuple[dict[str, Any], ...], int]:
     """Cut ``excess`` words (plus a new marker's own) from one ask field.
 
@@ -911,7 +1398,7 @@ def _shorten_one(
     words = _get_path(row, path).split()
     omitted_words = dict(row.get("omitted_words") or {})
     already = int(omitted_words.get(path, 0))
-    marker = 0 if already else _MARKER_WORDS
+    marker = 0 if already else marker_words
     room = len(words) - ASK_MIN_WORDS
     if room <= marker + overhead:
         return rows, 0
@@ -930,8 +1417,11 @@ def bound_card(card: Card) -> Card:
        so the header always names each row the card shows.
     2. Trim owner, claim and title to what the cap needs, never below
        FIELD_MIN_WORDS words, each with a "(+K words cut)" marker.
-    3. Drop links, then notes; shorten ask fields; cap decisions, blockers,
+    3. Cap links (oldest first), then drop ordinary notes, then decided:
+       notes oldest first; shorten ask fields; cap decisions, blockers,
        then questions; and as a last resort trim the title and next step.
+
+    Before any of these, links are capped to the newest LINK_LIMIT.
     """
     # Keep naming the events the next step is derived from, even once their
     # rows are capped off the card. The header keeps them first when it has
@@ -943,10 +1433,9 @@ def bound_card(card: Card) -> Card:
     def ids_over(candidate: Card) -> bool:
         return len(required | _content_ids(candidate)) > SOURCE_ID_LIMIT
 
-    if word_count(format_card(card)) <= WORD_LIMIT and not ids_over(card):
-        return card
     truncated: list[str] = list(card.truncated)
     omitted: dict[str, int] = dict(card.omitted)
+    elsewhere: dict[str, int] = dict(card.omitted_elsewhere)
     current = card
     keep_newest = {
         "decision_records": True,
@@ -971,14 +1460,40 @@ def bound_card(card: Card) -> Card:
                 item_type=current.type,
                 chosen=_latest_choice(card.decisions),
                 item_id=current.item_id,
+                program=current.program,
+                linked_blockers=card.inbound_blockers,
             )
         updated = replace(
             current,
             truncated=tuple(truncated),
             omitted=tuple((name, omitted[name]) for name in truncated),
+            omitted_elsewhere=tuple(
+                (name, elsewhere[name]) for name in truncated if name in elsewhere
+            ),
             **changes,
         )
         return _with_source(updated, anchor, required)
+
+    def cut_rows(section: str, rows: Iterable[Any]) -> None:
+        """Count ``rows`` cut from ``section``, and those held elsewhere."""
+        rows = list(rows)
+        _record_omission(truncated, omitted, section, len(rows))
+        if section == "links":
+            held = sum(1 for row in rows if int(row["event_id"]) in card.inbound_links)
+        elif section == "blockers":
+            held = sum(1 for row in rows if row in card.inbound_blockers)
+        else:
+            held = 0
+        if held:
+            elsewhere[section] = elsewhere.get(section, 0) + held
+
+    if len(card.links) > LINK_LIMIT:
+        # The newest links stay, in their listed order; the rest are counted.
+        newest = set(sorted(int(row["event_id"]) for row in card.links)[-LINK_LIMIT:])
+        cut_rows("links", [row for row in card.links if int(row["event_id"]) not in newest])
+        current = apply(links=tuple(row for row in card.links if int(row["event_id"]) in newest))
+    if _card_word_count(current, card) <= WORD_LIMIT and not ids_over(current):
+        return current
 
     for section in RESUME_ID_CAP_ORDER + ID_CAP_ORDER:
         items = list(getattr(current, section))
@@ -986,23 +1501,29 @@ def bound_card(card: Card) -> Card:
             if section == "links":
                 # Own links are listed before inbound duplicated-by rows, so
                 # the oldest link is not always first: drop the lowest event id.
-                items.remove(min(items, key=lambda row: row["event_id"]))
+                row = min(items, key=lambda row: row["event_id"])
+                items.remove(row)
+            elif section == "notes":
+                ordinary = [row for row in items if not _is_decided_note(row)]
+                pool = ordinary if ordinary else items
+                row = min(pool, key=lambda row: int(row["event_id"]))
+                items.remove(row)
             else:
-                items.pop(0)
-            _record_omission(truncated, omitted, section, 1)
+                row = items.pop(0)
+            cut_rows(_cut_section(section, row), [row])
             current = apply(**{section: tuple(items)})
 
     for field in ("owner", "claim", "title"):
         words = (getattr(current, field) or "").split()
         if len(words) <= FIELD_MIN_WORDS:
             continue
-        size = word_count(format_card(current))
+        size = _card_word_count(current, card)
         if size <= WORD_LIMIT:
             break
         saved = (list(truncated), dict(omitted))
         _record_omission(truncated, omitted, field, len(words) - FIELD_MIN_WORDS)
         trial = apply(**{field: " ".join(words[:FIELD_MIN_WORDS])})
-        trial_size = word_count(format_card(trial))
+        trial_size = _card_word_count(trial, card)
         if trial_size >= size:
             # The marker would cost more than the cut saves.
             truncated[:] = saved[0]
@@ -1014,12 +1535,34 @@ def bound_card(card: Card) -> Card:
         current = apply(**{field: " ".join(words[:keep])})
 
     for section in RESUME_DROP_ORDER + DROP_ORDER:
-        if word_count(format_card(current)) <= WORD_LIMIT:
+        if _card_word_count(current, card) <= WORD_LIMIT:
             return current
         items = getattr(current, section)
         if not items:
             continue
-        _record_omission(truncated, omitted, section, len(items))
+        if section == "links":
+            # Capped, oldest first, only while the card is over the limit.
+            links = list(items)
+            while links and _card_word_count(current, card) > WORD_LIMIT:
+                row = min(links, key=lambda row: row["event_id"])
+                links.remove(row)
+                cut_rows("links", [row])
+                current = apply(links=tuple(links))
+            continue
+        if section == "notes":
+            remaining = list(items)
+            ordinary = [row for row in remaining if not _is_decided_note(row)]
+            if ordinary:
+                cut_rows("notes", ordinary)
+                remaining = [row for row in remaining if _is_decided_note(row)]
+                current = apply(notes=tuple(remaining))
+            while remaining and _card_word_count(current, card) > WORD_LIMIT:
+                row = min(remaining, key=lambda row: int(row["event_id"]))
+                remaining.remove(row)
+                cut_rows(_cut_section("notes", row), [row])
+                current = apply(notes=tuple(remaining))
+            continue
+        cut_rows(section, items)
         current = apply(**{section: ()})
 
     # Shorten ask fields before any decision or question is capped. Each cut
@@ -1027,20 +1570,23 @@ def bound_card(card: Card) -> Card:
     for index, path in _shorten_paths(current.open_questions):
         if len(_get_path(current.open_questions[index], path).split()) <= ASK_MIN_WORDS:
             continue
-        size = word_count(format_card(current))
+        size = _card_word_count(current, card)
         if size <= WORD_LIMIT:
             break
         # The first cut also adds "ask" to the Truncated section.
         header = 0
         if "ask" not in truncated:
             probe = replace(current, truncated=tuple(truncated) + ("ask",))
-            header = word_count(format_card(probe)) - size
+            header = _card_word_count(probe, card) - size
         rows, cut = _shorten_one(
             current.open_questions,
             index,
             path,
             size + header - WORD_LIMIT,
             overhead=header,
+            marker_words=word_count(
+                _cut_marker(1, 1, "x", _stand_in(current.program)),
+            ),
         )
         if cut:
             _record_omission(truncated, omitted, "ask", cut)
@@ -1050,17 +1596,14 @@ def bound_card(card: Card) -> Card:
     # go last, the last listed first, only when nothing else is left to cut.
     for section in ("children", "decision_records") + CAP_ORDER + ("refs",):
         items = list(getattr(current, section))
-        while word_count(format_card(current)) > WORD_LIMIT and items:
-            if keep_newest[section]:
-                items.pop(0)
-            else:
-                items.pop()
-            _record_omission(truncated, omitted, section, 1)
+        while _card_word_count(current, card) > WORD_LIMIT and items:
+            row = items.pop(0) if keep_newest[section] else items.pop()
+            cut_rows(section, [row])
             current = apply(**{section: tuple(items)})
 
     for field in ("title", "next_step"):
         words = getattr(current, field).split()
-        while word_count(format_card(current)) > WORD_LIMIT and len(words) > 1:
+        while _card_word_count(current, card) > WORD_LIMIT and len(words) > 1:
             words.pop()
             _record_omission(truncated, omitted, field, 1)
             current = apply(**{field: " ".join(words)})
@@ -1135,64 +1678,78 @@ def _note_row(event: Any) -> dict[str, Any]:
     return {"event_id": event.id, "text": event.payload["text"]}
 
 
-def _row_text(text: str, event_id: int, limit: int = ROW_WORDS) -> str:
-    """At most ``limit`` words, then a marker naming the event with the rest."""
+def _row_text(text: str, event_id: int, limit: int | None = ROW_WORDS) -> str:
+    """At most ``limit`` words (every word for None), then a marker naming the
+    event with the rest."""
     words = text.split()
-    if len(words) <= limit:
+    if limit is None or len(words) <= limit:
         return " ".join(words)
     return f"{' '.join(words[:limit])} … (full text in event {event_id})"
 
 
-def _record_row(record: Mapping[str, Any]) -> dict[str, Any]:
+def _record_row(record: Mapping[str, Any], full: bool = False) -> dict[str, Any]:
     event_id = int(record["decision_event_id"])
+    words = None if full else ROW_WORDS
+    name_words = None if full else STEP_NAME_WORDS
     row = {
         "event_id": event_id,
-        "who": _clip(record["who"], STEP_NAME_WORDS),
+        "who": _clip(record["who"], name_words),
         "who_kind": record["who_kind"],
         "relayed_by": record["relayed_by"],
         "standing": record["standing"],
         "source_event_id": record["source_event_id"],
         "superseded_by": record["superseded_by"],
-        "effect": _row_text(record["effect"], event_id),
+        "standing_event_id": record.get("standing_event_id"),
+        "result_event_id": record.get("result_event_id"),
+        "effect": _row_text(record["effect"], event_id, words),
         "tags": [dict(tag) for tag in record["tags"]],
-        "verbatim": _row_text(record["verbatim"], event_id),
+        "verbatim": _row_text(record["verbatim"], event_id, words),
         "phase": record["phase"],
         "evidence": record["evidence"],
         "result": None,
     }
     if record["relayed_by"]:
-        row["relayed_by"] = _clip(record["relayed_by"], STEP_NAME_WORDS)
+        row["relayed_by"] = _clip(record["relayed_by"], name_words)
     if record["result"]:
-        row["result"] = _row_text(record["result"], int(record["result_event_id"]))
+        row["result"] = _row_text(record["result"], int(record["result_event_id"]), words)
     return row
 
 
-def _tried_row(event: Any) -> dict[str, Any]:
+def _tried_row(event: Any, full: bool = False) -> dict[str, Any]:
     payload = event.payload
+    words = None if full else ROW_WORDS
     return {
         "event_id": event.id,
-        "what": _row_text(payload["what"], event.id),
-        "outcome": _row_text(payload["outcome"], event.id) if payload.get("outcome") else None,
+        "what": _row_text(payload["what"], event.id, words),
+        "outcome": (
+            _row_text(payload["outcome"], event.id, words) if payload.get("outcome") else None
+        ),
     }
 
 
-def _progress_row(event: Any) -> dict[str, Any]:
-    return {"event_id": event.id, "text": _row_text(event.payload["text"], event.id)}
+def _progress_row(event: Any, full: bool = False) -> dict[str, Any]:
+    words = None if full else ROW_WORDS
+    return {"event_id": event.id, "text": _row_text(event.payload["text"], event.id, words)}
 
 
-def _review_row(event: Any) -> dict[str, Any]:
+def _review_row(event: Any, full: bool = False) -> dict[str, Any]:
     findings = list(event.payload.get("findings") or [])
+    shown = findings if full else findings[:REVIEW_FINDINGS]
+    words = None if full else ROW_WORDS
     return {
         "event_id": event.id,
         "round": event.payload["round"],
         "verdict": event.payload["verdict"],
-        "findings": [_row_text(text, event.id) for text in findings[:REVIEW_FINDINGS]],
-        "findings_cut": max(0, len(findings) - REVIEW_FINDINGS),
+        "findings": [_row_text(text, event.id, words) for text in shown],
+        "findings_cut": len(findings) - len(shown),
     }
 
 
-def _pointer_rows(pointers: PointerSource | None, item_id: str) -> tuple[dict[str, Any], ...]:
-    """At most POINTER_LIMIT one-line pointers from an installed sidecar."""
+def _pointer_rows(
+    pointers: PointerSource | None, item_id: str, full: bool = False
+) -> tuple[dict[str, Any], ...]:
+    """At most POINTER_LIMIT one-line pointers from an installed sidecar
+    (every pointer, unclipped, for the full card)."""
     if pointers is None:
         return ()
     rows: list[dict[str, Any]] = []
@@ -1202,10 +1759,10 @@ def _pointer_rows(pointers: PointerSource | None, item_id: str) -> tuple[dict[st
             continue
         note = " ".join(str(entry.get("note") or "").split())
         rows.append({
-            "ref": _clip(ref, REF_WORDS),
-            "note": _clip(note, STEP_CHOSEN_WORDS) if note else None,
+            "ref": _clip(ref, None if full else REF_WORDS),
+            "note": _clip(note, None if full else STEP_CHOSEN_WORDS) if note else None,
         })
-        if len(rows) >= POINTER_LIMIT:
+        if not full and len(rows) >= POINTER_LIMIT:
             break
     return tuple(rows)
 
@@ -1215,6 +1772,7 @@ def _resume_sections(
     item_id: str,
     item_events: list[Any],
     pointers: PointerSource | None,
+    full: bool = False,
 ) -> dict[str, Any]:
     stops = [event for event in item_events if event.kind == "item.stopped"]
     stop: tuple[dict[str, Any], ...] = ()
@@ -1225,22 +1783,93 @@ def _resume_sections(
         stop = ({
             "event_id": latest.id,
             "phase": latest.payload["phase"],
-            "point": _row_text(latest.payload["point"], latest.id, 3 * ROW_WORDS),
+            "point": _row_text(
+                latest.payload["point"], latest.id, None if full else 3 * ROW_WORDS
+            ),
         },)
         skills = tuple(latest.payload.get("skills") or ())
-        refs = tuple(_clip(ref, REF_WORDS) for ref in latest.payload.get("refs") or ())
+        ref_words = None if full else REF_WORDS
+        refs = tuple(_clip(ref, ref_words) for ref in latest.payload.get("refs") or ())
     return {
         "decision_records": tuple(
-            _record_row(record) for record in lg.decision_records(item_id=item_id)
+            _record_row(record, full) for record in lg.decision_records(item_id=item_id)
         ),
-        "tried": tuple(_tried_row(e) for e in item_events if e.kind == "item.tried"),
-        "progress": tuple(_progress_row(e) for e in item_events if e.kind == "item.progress"),
-        "reviews": tuple(_review_row(e) for e in item_events if e.kind == "review.recorded"),
+        "tried": tuple(_tried_row(e, full) for e in item_events if e.kind == "item.tried"),
+        "progress": tuple(
+            _progress_row(e, full) for e in item_events if e.kind == "item.progress"
+        ),
+        "reviews": tuple(
+            _review_row(e, full) for e in item_events if e.kind == "review.recorded"
+        ),
         "stop": stop,
         "skills": skills,
         "refs": refs,
-        "pointers": _pointer_rows(pointers, item_id),
+        "pointers": _pointer_rows(pointers, item_id, full),
     }
+
+
+def _children_with_sources(
+    rows: Iterable[Mapping[str, Any]], events: Iterable[Any], item_id: str
+) -> list[tuple[dict[str, Any], dict[str, int | None]]]:
+    """Each child row of ``item_id`` (see children_of) with the ids of the
+    events it was rendered from.
+
+    The sources are the child's creation event, its current state event
+    (None when it has none) and the child-of link that makes it a child of
+    ``item_id``: the child's latest child-of link, as v_items resolves
+    parent_id. That link is None when the events read do not hold it.
+    """
+    kids = sorted(
+        (row for row in rows if row.get("parent_id") == item_id),
+        key=lambda row: int(row["created_event_id"]),
+    )
+    ids = {row["item_id"] for row in kids}
+    before: dict[str, set[str]] = {i: set() for i in ids}
+    anchor_link: dict[str, Any] = {}
+    for event in events:
+        if event.kind != "item.linked":
+            continue
+        rel = event.payload.get("rel")
+        if rel == "child-of":
+            if event.item_id in ids:
+                held = anchor_link.get(event.item_id)
+                if held is None or event.id > held.id:
+                    anchor_link[event.item_id] = event
+            continue
+        if rel != "blocks":
+            continue
+        blocker, blocked = event.item_id, event.payload.get("target")
+        if blocker in ids and blocked in ids and blocker != blocked:
+            before[blocked].add(blocker)
+    ordered: list[tuple[dict[str, Any], dict[str, int | None]]] = []
+    placed: set[str] = set()
+    left = list(kids)
+    while left:
+        pick = next((row for row in left if before[row["item_id"]] <= placed), left[0])
+        left.remove(pick)
+        placed.add(pick["item_id"])
+        link = anchor_link.get(pick["item_id"])
+        state_id = pick.get("state_event_id")
+        ordered.append(
+            (
+                {
+                    "item_id": pick["item_id"],
+                    "title": pick["title"],
+                    "status": pick["status"],
+                    "holder": pick["owner"] if pick["owner"] is not None else pick["claim"],
+                },
+                {
+                    "created_event_id": int(pick["created_event_id"]),
+                    "state_event_id": None if state_id is None else int(state_id),
+                    "link_event_id": (
+                        link.id
+                        if link is not None and link.payload.get("target") == item_id
+                        else None
+                    ),
+                },
+            )
+        )
+    return ordered
 
 
 def children_of(
@@ -1252,45 +1881,180 @@ def children_of(
     order. A cycle among the blocks links falls back to creation order for
     what is left.
     """
-    kids = sorted(
-        (row for row in rows if row.get("parent_id") == item_id),
-        key=lambda row: int(row["created_event_id"]),
-    )
-    ids = {row["item_id"] for row in kids}
-    before: dict[str, set[str]] = {i: set() for i in ids}
-    for event in events:
-        if event.kind != "item.linked" or event.payload.get("rel") != "blocks":
+    return [row for row, _sources in _children_with_sources(rows, events, item_id)]
+
+
+def _child_source_ids(
+    item_id: str, children: Iterable[tuple[Mapping[str, Any], Mapping[str, int | None]]]
+) -> set[int]:
+    """The events behind the child rows: each child's creation, state (when it
+    has one) and child-of link event. A child whose creation or link event is
+    missing is refused, never left out of the full card's header."""
+    ids: set[int] = set()
+    for row, sources in children:
+        for key in ("created_event_id", "link_event_id"):
+            value = sources[key]
+            if value is None:
+                # Internal invariant, not a reachable refusal. The rows and the
+                # events come from one read snapshot (_read_snapshot), and
+                # v_items resolves parent_id from the child's latest child-of
+                # link, the same link _children_with_sources takes; a
+                # concurrent writer cannot split them. Reaching this means the
+                # view and this code disagree, so fail rather than drop the id.
+                raise RuntimeError(
+                    f"card --full: child {row['item_id']} of {item_id} has no {key}"
+                    " in its read snapshot; the items view and the events disagree"
+                )
+            ids.add(int(value))
+        state_id = sources["state_event_id"]
+        if state_id is not None:
+            ids.add(int(state_id))
+    return ids
+
+
+def _blockers_with_sources(
+    item_id: str,
+    item_events: Iterable[Any],
+    events: Iterable[Any],
+    closed: set[str],
+) -> list[tuple[str, dict[str, Any]]]:
+    """Each Blockers row of ``item_id`` with the ids of the events that name it.
+
+    A blocker is named by the item's own ``blocked_by`` (the latest item.state
+    that states the set, carried forward by a later "blocked" state that does
+    not restate it) or by a ``blocks`` link on the blocker that targets
+    ``item_id``: a link {rel: "blocks", target: T} on item S blocks T, the
+    direction v_ready reads (migrations/0001_initial.sql). The sources are
+    that state event (None when only links name the blocker) and every such
+    link event. Closed blockers are left out. Order: the ``blocked_by``
+    order, then the blockers only links name, in link order.
+    """
+    named: list[str] = []
+    named_by: int | None = None
+    for event in item_events:
+        if event.kind != "item.state":
             continue
-        blocker, blocked = event.item_id, event.payload.get("target")
-        if blocker in ids and blocked in ids and blocker != blocked:
-            before[blocked].add(blocker)
-    ordered: list[dict[str, Any]] = []
-    placed: set[str] = set()
-    left = list(kids)
-    while left:
-        pick = next((row for row in left if before[row["item_id"]] <= placed), left[0])
-        left.remove(pick)
-        placed.add(pick["item_id"])
-        ordered.append(
+        if "blocked_by" in event.payload:
+            seen: list[str] = []
+            for blocker in event.payload["blocked_by"]:
+                text = str(blocker)
+                if text not in seen:
+                    seen.append(text)
+            named = seen
+            named_by = event.id
+        elif event.payload["status"] != "blocked":
+            # A transition to a non-blocked status ends the block. Only a
+            # transition back to "blocked" without a restated set may carry
+            # the previous set forward.
+            named = []
+            named_by = None
+    order = list(named)
+    links: dict[str, list[int]] = {}
+    for event in events:
+        if event.kind != "item.linked":
+            continue
+        if event.payload.get("rel") != "blocks":
+            continue
+        if event.payload.get("target") != item_id:
+            continue
+        if event.item_id in closed:
+            continue
+        if event.item_id not in order:
+            order.append(event.item_id)
+        links.setdefault(event.item_id, []).append(event.id)
+    return [
+        (
+            blocker,
             {
-                "item_id": pick["item_id"],
-                "title": pick["title"],
-                "status": pick["status"],
-                "holder": pick["owner"] if pick["owner"] is not None else pick["claim"],
-            }
+                "state_event_id": named_by if blocker in named else None,
+                "link_event_ids": tuple(links.get(blocker, ())),
+            },
         )
-    return ordered
+        for blocker in order
+        if blocker not in closed
+    ]
+
+
+def _blocker_source_ids(
+    item_id: str, blockers: Iterable[tuple[str, Mapping[str, Any]]]
+) -> set[int]:
+    """The events behind the Blockers rows: the state event whose
+    ``blocked_by`` names the blocker and every ``blocks`` link event that
+    names it. A row with neither is refused, never left out of the full
+    card's header."""
+    ids: set[int] = set()
+    for blocker, sources in blockers:
+        state_id = sources["state_event_id"]
+        link_ids = sources["link_event_ids"]
+        if state_id is None and not link_ids:
+            # Internal invariant, not a reachable refusal:
+            # _blockers_with_sources only yields a blocker that a state
+            # event or a link event named.
+            raise RuntimeError(
+                f"card --full: blocker {blocker} of {item_id} has no source event"
+                " in its read snapshot"
+            )
+        if state_id is not None:
+            ids.add(int(state_id))
+        ids.update(int(value) for value in link_ids)
+    return ids
+
+
+@contextmanager
+def _read_snapshot(lg: Ledger) -> Iterator[None]:
+    """Hold one SQLite read snapshot over every read made inside the block.
+
+    With no transaction open on the connection, BEGIN before the first read
+    and ROLLBACK when the block ends, also on an exception. A caller that
+    already holds a transaction is read inside it and left as it was.
+    """
+    conn = lg._conn
+    own = not conn.in_transaction
+    if own:
+        conn.execute("BEGIN")
+    try:
+        yield
+    finally:
+        if own and conn.in_transaction:
+            conn.execute("ROLLBACK")
 
 
 def project_item(
-    lg: Ledger, item: Mapping[str, Any], *, pointers: PointerSource | None = None
+    lg: Ledger,
+    item_id: str,
+    *,
+    pointers: PointerSource | None = None,
+    program: str = "ledger",
+    full: bool = False,
 ) -> Card:
-    """Build an unbounded card from current views and the item's events.
+    """Build an unbounded card for ``item_id`` from current views and the
+    item's events; raise KeyError if missing.
 
     Ephemeral events recorded before the item's latest close have decayed
     and are left out. ``pointers`` is the conversation-pointer sidecar, when
-    installed.
+    installed. The rows are still clipped to a few dozen words, findings and
+    pointers capped and the header bounded to SOURCE_ID_LIMIT ids, unless
+    ``full``: then nothing is clipped, capped or cut.
+
+    The item's own row and every other ledger read are made in one read
+    snapshot, so no row or source id on the card is newer than its
+    revision_id.
     """
+    with _read_snapshot(lg):
+        item = lg.item(item_id)
+        if item is None:
+            raise KeyError(item_id)
+        return _project_item(lg, item, pointers=pointers, program=program, full=full)
+
+
+def _project_item(
+    lg: Ledger,
+    item: Mapping[str, Any],
+    *,
+    pointers: PointerSource | None,
+    program: str,
+    full: bool,
+) -> Card:
     item_id = item["item_id"]
     events = lg.events()
     tail = events[-1]
@@ -1334,7 +2098,7 @@ def project_item(
     )
     # A duplicate-of link lives on the duplicate and names the item kept; the
     # kept item's card shows it too, as duplicated-by.
-    links = _projected_links(item_events) + tuple(
+    inbound = tuple(
         {"event_id": event.id, "rel": "duplicated-by", "target": event.item_id}
         for event in events
         if event.kind == "item.linked"
@@ -1342,41 +2106,22 @@ def project_item(
         and event.payload.get("target") == item_id
         and event.item_id != item_id
     )
+    links = _projected_links(item_events) + inbound
     notes = tuple(
         _note_row(event) for event in item_events if event.kind == "item.note"
     )
-    blocked_by: list[str] = []
-    for event in item_events:
-        if event.kind != "item.state":
-            continue
-        if "blocked_by" in event.payload:
-            seen: list[str] = []
-            for blocker in event.payload["blocked_by"]:
-                text = str(blocker)
-                if text not in seen:
-                    seen.append(text)
-            blocked_by = seen
-        elif event.payload["status"] != "blocked":
-            # A transition to a non-blocked status ends the block. Only a
-            # transition back to "blocked" without a restated set may carry
-            # the previous set forward.
-            blocked_by = []
-    # A "blocks" link lives on the blocker and names the item it blocks,
-    # the same direction v_ready reads (migrations/0001_initial.sql): a
-    # link {rel: "blocks", target: T} on item S blocks T.
     rows = lg.items()
     closed = {row["item_id"] for row in rows if row["status"] == "closed"}
-    children = children_of(rows, events, item_id)
-    for event in events:
-        if event.kind != "item.linked":
-            continue
-        if event.payload.get("rel") != "blocks":
-            continue
-        if event.payload.get("target") != item_id:
-            continue
-        if event.item_id not in closed and event.item_id not in blocked_by:
-            blocked_by.append(event.item_id)
-    blockers = tuple(b for b in blocked_by if b not in closed)
+    child_sources = _children_with_sources(rows, events, item_id)
+    children = [row for row, _sources in child_sources]
+    blocker_sources = _blockers_with_sources(item_id, item_events, events, closed)
+    blockers = tuple(blocker for blocker, _sources in blocker_sources)
+    # Named only by the blockers' own link events, not by this item's.
+    linked_only = {
+        blocker
+        for blocker, sources in blocker_sources
+        if sources["state_event_id"] is None
+    }
     owner = item["owner"]
     claim = item["claim"]
     next_step = derive_next_step(
@@ -1388,6 +2133,9 @@ def project_item(
         item_type=item["type"],
         chosen=_latest_choice(elected),
         item_id=item_id,
+        program=program,
+        full=full,
+        linked_blockers=tuple(b for b in blockers if b in linked_only),
     )
     base: set[int] = set()
     created_id = item.get("created_event_id")
@@ -1419,25 +2167,69 @@ def project_item(
         children=tuple(children),
         children_closed=sum(1 for row in children if row["status"] == "closed"),
         children_total=len(children),
-        **_resume_sections(lg, item_id, item_events, pointers),
+        inbound_links=tuple(int(row["event_id"]) for row in inbound),
+        inbound_blockers=tuple(b for b in blockers if b in linked_only),
+        **_resume_sections(lg, item_id, item_events, pointers, full),
         spec_version=None if spec is None else spec.payload.get("version"),
         spec_claim_version=spec_claim,
         spec_hash=None if spec is None else spec.payload.get("content_hash"),
         spec_claim_hash=spec_content_hash(own_events, spec_claim),
+        program=program,
     )
+    if full:
+        # The full card names every event it was projected from, including
+        # each decision record's standing, result, source and superseding events,
+        # each child row's creation, state and child-of link events, and each
+        # Blockers row's blocked_by state event and blocks link events.
+        ids = (
+            base
+            | _content_ids(card)
+            | _record_ref_ids(card)
+            | _child_source_ids(item_id, child_sources)
+            | _blocker_source_ids(item_id, blocker_sources)
+        )
+        return replace(card, source_event_ids=tuple(sorted(ids)))
     # The creation, state and current spec events are always named; past SOURCE_ID_LIMIT
     # the header keeps them, the newest open ask and the latest election,
     # then the newest of the rest.
     return _with_source(card, base, base | _key_step_ids(card))
 
 
+def _with_lease_status(lg: Ledger, item: Mapping[str, Any], card: Card) -> Card:
+    """``card`` with the read-side status; the recorded one stays in ``status``."""
+    held = lease.current_lease(lg._conn, item["item_id"])
+    shown = lease.read_status(item, held)
+    expired = shown != item["status"]
+    return replace(
+        card,
+        shown_status=shown,
+        expired_holder=held["holder"] if expired else None,
+        expires_at=held["expires_at"] if expired else None,
+    )
+
+
 def project_card(
-    lg: Ledger, item_id: str, *, pointers: PointerSource | None = None
+    lg: Ledger,
+    item_id: str,
+    *,
+    pointers: PointerSource | None = None,
+    program: str = "ledger",
+    full: bool = False,
+    lease_status: bool = False,
 ) -> Card:
-    """Project a bounded card for ``item_id``; raise KeyError if missing."""
-    for row in lg.items():
-        if row["item_id"] == item_id:
-            return bound_card(project_item(lg, row, pointers=pointers))
+    """Project a bounded card for ``item_id`` (unbounded with ``full``);
+    raise KeyError if missing. The item lookup and the whole projection read
+    one snapshot (see _read_snapshot). ``lease_status`` (the card verb) adds
+    the read-side status (``lease.read_status``) from the same snapshot."""
+    with _read_snapshot(lg):
+        for row in lg.items():
+            if row["item_id"] == item_id:
+                card = _project_item(
+                    lg, row, pointers=pointers, program=program, full=full
+                )
+                if lease_status:
+                    card = _with_lease_status(lg, row, card)
+                return card if full else bound_card(card)
     raise KeyError(item_id)
 
 
@@ -1447,14 +2239,17 @@ __all__ = [
     "CAP_ORDER",
     "DROP_ORDER",
     "FOOTER",
+    "LINK_LIMIT",
     "footer_line",
     "recover_command",
     "RESUME_SECTIONS",
     "WORD_LIMIT",
     "Card",
     "PointerSource",
+    "blockers_command",
     "bound_card",
     "children_command",
+    "duplicates_command",
     "children_of",
     "claim_spec_version",
     "derive_next_step",

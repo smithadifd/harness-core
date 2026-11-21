@@ -13,6 +13,18 @@ the write transaction. The latest ``item.spec`` event is the current spec;
 ``set_spec`` is the only writer of ``item.spec``: the store reserves the
 kind, so ``ledger append`` and ``append-many`` refuse it and no version can
 skip the N+1 and content-hash rules. A merge class is one of MC-0 to MC-4.
+
+``spec set`` is the verb's only write and needs ``LEDGER_HARNESS``; ``show``
+and ``diff`` are reads and do not, so the verb is not ``writes`` and
+``spec set`` checks for itself, as ``doc add`` does.
+
+``spec set --expect-revision ID`` is the compare-and-set ``append``,
+``state``, ``note`` and ``append-many`` take, parsed by the same code: inside
+the write transaction, after the not-found check and before the unchanged
+compare, the item's newest event id must still be ID. Otherwise
+``StaleRevision`` (exit 5, ``stale_revision``) is raised and nothing is
+written, even when the content and source are unchanged. ``none`` never
+matches, since every item has its creation event.
 """
 from __future__ import annotations
 
@@ -22,17 +34,27 @@ import re
 from pathlib import Path
 from typing import Any, Mapping
 
-from ledger.schema import SPEC_CONTENT_FIELDS, SPEC_KIND, SPEC_MERGE_CLASSES, SPEC_SIZES
-from ledger.store import Event, Ledger, canonical_dumps
+from ledger.card import _multi_line, _one_line
+from ledger.schema import (
+    SPEC_CONTENT_FIELDS,
+    SPEC_KIND,
+    SPEC_MERGE_CLASSES,
+    SPEC_SIZES,
+    ValidationError,
+)
+from ledger.store import Event, Ledger, _check_expected_revision, canonical_dumps
 from ledger.verbs import (
     EXIT_NOT_FOUND,
+    EXIT_REFUSED,
     CliError,
     Context,
     Result,
     UsageError,
     Verb,
     actor_kwargs,
+    add_expect_revision_argument,
     event_dict,
+    expect_revision_value,
     open_db,
 )
 
@@ -47,6 +69,7 @@ _SET_ONLY = (
     "merge_class",
     "source",
     "source_rev",
+    "expect_revision",
 )
 _VERSION = re.compile(r"v?([1-9][0-9]{0,8})")
 # The store appends item.spec only for a caller holding this (set_spec).
@@ -82,6 +105,7 @@ def set_spec(
     harness: str | None = None,
     model: str | None = None,
     session: str | None = None,
+    expect_revision: int | str | None = None,
 ) -> tuple[Event, bool]:
     """Append the item's next spec version when its content or source changed.
 
@@ -92,13 +116,29 @@ def set_spec(
     content and the new source. A call with no ``source`` compares content
     only and writes no source, as before. The current spec, the compares and
     the version are all read inside the write transaction.
+
+    ``expect_revision`` is a compare-and-set on the item: an event id, or
+    ``"none"`` (which never matches, since every item has its creation
+    event). It is checked inside the write transaction, after the not-found
+    check and before the unchanged compare, so a stale value raises
+    ``StaleRevision`` and writes nothing even when the content and source are
+    unchanged. A value of another type is refused as ``append`` refuses it.
+    ``None`` skips the check.
     """
+    if expect_revision is not None and expect_revision != "none" and (
+        type(expect_revision) is not int or expect_revision < 1
+    ):
+        raise ValidationError("bad-type:expect_revision")
     digest = content_hash(content)
     with lg.transaction():
         if lg.item(item_id) is None:
             raise CliError(
                 f"item not found: {item_id}", code="not_found", exit_code=EXIT_NOT_FOUND
             )
+        if expect_revision is not None:
+            # Before the unchanged compare: a stale revision never reads as
+            # an unchanged no-op.
+            _check_expected_revision(lg._conn, item_id, expect_revision)
         current = current_spec(lg, item_id)
         if (
             current is not None
@@ -148,6 +188,7 @@ def add_arguments(parser) -> None:
     )
     parser.add_argument("--source", help="set: where the content came from (not hashed)")
     parser.add_argument("--source-rev", help="set: the commit it was read at (not hashed)")
+    add_expect_revision_argument(parser)
     parser.add_argument("--version", help="show: this version instead of the current one")
 
 
@@ -196,45 +237,85 @@ def _spec_data(item_id: str, event: Event) -> dict[str, Any]:
 
 
 def _show_text(data: Mapping[str, Any]) -> str:
+    # Stored text is printed through the escapers, so no control sequence it
+    # holds reaches the terminal: one-line fields through _one_line, the
+    # body and acceptance through _multi_line (their lines and tabs kept).
     lines = [
-        f"spec v{data['version']}\t{data['item_id']}\tevent={data['event_id']}",
-        f"title: {data['title']}",
+        f"spec v{data['version']}\t{_one_line(data['item_id'])}\tevent={data['event_id']}",
+        f"title: {_one_line(data['title'])}",
     ]
     for name in ("size", "merge_class") + PROVENANCE_FIELDS:
         if data.get(name) is not None:
-            lines.append(f"{name}: {data[name]}")
+            lines.append(f"{name}: {_one_line(data[name])}")
     lines.append(f"content_hash: {data['content_hash']}")
     if data.get("acceptance") is not None:
-        lines.extend(["", "## Acceptance", data["acceptance"]])
-    lines.extend(["", "## Body", data["body_md"]])
+        lines.extend(["", "## Acceptance", _multi_line(data["acceptance"])])
+    lines.extend(["", "## Body", _multi_line(data["body_md"])])
     return "\n".join(lines)
 
 
+# How the printed diff escapes each diff line of a content field. The diff
+# is computed on the stored lines first, so two different stored values never
+# print as "no change".
+_DIFF_ESCAPERS = {
+    "title": _one_line,
+    "body_md": _multi_line,
+    "acceptance": _multi_line,
+    "size": _one_line,
+    "merge_class": _one_line,
+}
+
+
 def _lines(value: Any) -> list[str]:
-    return [] if value is None else str(value).splitlines()
+    """The value's lines, split on LF only, so U+2028, U+2029, NEL and the
+    other characters ``str.splitlines`` also breaks on stay inside their
+    line. A final LF ends the last line and adds no empty one."""
+    if value is None:
+        return []
+    lines = str(value).split("\n")
+    if lines[-1] == "":
+        lines.pop()
+    return lines
 
 
-def diff_fields(old: Mapping[str, Any], new: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """One entry per content field whose value differs, in field order."""
+def diff_fields(
+    old: Mapping[str, Any], new: Mapping[str, Any], *, escape: bool = False
+) -> list[dict[str, Any]]:
+    """One entry per content field whose value differs, in field order.
+
+    Which fields changed, and the diff lines, are computed on the stored
+    values split on LF. With ``escape`` each emitted diff line (headers
+    included) is then escaped (``_DIFF_ESCAPERS``), for the printed diff;
+    without it the lines keep the stored code points, for ``--json``. An
+    absent field (None) has no lines.
+    """
     changed = []
     for name in SPEC_CONTENT_FIELDS:
         before, after = old.get(name), new.get(name)
         if before == after:
             continue
-        changed.append({
-            "field": name,
-            "from": before,
-            "to": after,
-            "diff": list(difflib.unified_diff(
-                _lines(before), _lines(after),
-                fromfile=f"v{old['version']}", tofile=f"v{new['version']}",
-                lineterm="",
-            )),
-        })
+        diff = list(difflib.unified_diff(
+            _lines(before), _lines(after),
+            fromfile=f"v{old['version']}", tofile=f"v{new['version']}",
+            lineterm="",
+        ))
+        if escape:
+            diff = [_DIFF_ESCAPERS[name](line) for line in diff]
+        changed.append({"field": name, "from": before, "to": after, "diff": diff})
     return changed
 
 
 def _run_set(args, ctx: Context) -> Result:
+    # The verb's one write: it needs the writer identity, refused exactly as
+    # the CLI refuses a write verb without it. show and diff are reads, so
+    # the verb is not ``writes`` and this action checks for itself.
+    if not ctx.harness:
+        raise CliError(
+            "LEDGER_HARNESS is required for writes; set it, e.g. "
+            "LEDGER_HARNESS=claude-code",
+            code="missing_harness",
+            exit_code=EXIT_REFUSED,
+        )
     _refuse_flags(args, ("version",), "set")
     if args.versions:
         raise UsageError("spec set takes no versions")
@@ -245,11 +326,12 @@ def _run_set(args, ctx: Context) -> Result:
     body = args.body
     if args.body_file is not None:
         try:
-            body = Path(args.body_file).read_text(encoding="utf-8")
+            body = Path(args.body_file).read_bytes().decode("utf-8")
         except (OSError, UnicodeDecodeError) as exc:
             raise UsageError(f"--body-file: cannot read {args.body_file}: {exc}") from exc
     if not body:
         raise UsageError("spec set needs a non-empty body")
+    expect = expect_revision_value(args)
     content = {
         "title": args.title,
         "body_md": body,
@@ -265,6 +347,7 @@ def _run_set(args, ctx: Context) -> Result:
             content,
             source=args.source,
             source_rev=args.source_rev,
+            expect_revision=expect,
             **actor_kwargs(ctx),
         )
     finally:
@@ -333,11 +416,15 @@ def _run_diff(args, ctx: Context) -> Result:
             )
         old = _by_version(specs, args.item, previous)
     changed = diff_fields(old.payload, new.payload)
-    head = f"spec diff {args.item} v{old.payload['version']} → v{new.payload['version']}"
+    shown = diff_fields(old.payload, new.payload, escape=True)
+    head = (
+        f"spec diff {_one_line(args.item)} "
+        f"v{old.payload['version']} → v{new.payload['version']}"
+    )
     lines = [head]
-    if not changed:
+    if not shown:
         lines.append("no content change")
-    for entry in changed:
+    for entry in shown:
         lines.extend(["", f"## {entry['field']}", *entry["diff"]])
     return Result(
         data={
@@ -364,5 +451,5 @@ VERB = Verb(
     help="set, show or diff an item's spec (versioned ticket content)",
     add_arguments=add_arguments,
     run=run,
-    writes=True,
+    writes=False,
 )

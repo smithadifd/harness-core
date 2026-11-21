@@ -262,6 +262,38 @@ def test_managed_export_restore_requires_intent_and_records_provenance(
     assert provenance.payload["source"].startswith("sha256:")
 
 
+def test_managed_export_restore_records_attribution_on_session_opened(
+    tmp_path: Path, monkeypatch
+) -> None:
+    db = managed_item(tmp_path, monkeypatch)
+    claim_database(db, "home")
+    with open_ledger(db, create=False) as ledger:
+        start_operation(ledger, "item-1", "merge", "merge-1", target="org/repo#1")
+        done = finish_operation(ledger, "item-1", "merge", "merge-1", target="org/repo#1")
+        close_item(ledger, "item-1", done.id, idempotency_key="loop:item-1:closed")
+        export_dir = tmp_path / "attributed-managed-export"
+        export_events(ledger, export_dir)
+
+    dest = tmp_path / "attributed-restored.db"
+    restore_export(
+        export_dir,
+        dest,
+        system="home",
+        accept_loop_events=True,
+        actor="alice/builder",
+        harness="claude-code",
+        model="model-x",
+        session="sess-42",
+    )
+    with open_ledger(dest, create=False) as restored:
+        provenance = restored.events()[-1]
+    assert provenance.kind == "session.opened"
+    assert provenance.actor == "alice/builder"
+    assert provenance.harness == "claude-code"
+    assert provenance.model == "model-x"
+    assert provenance.session == "sess-42"
+
+
 def test_forged_link_and_merged_note_cannot_mark_merge_done(tmp_path: Path, monkeypatch) -> None:
     db = managed_item(tmp_path, monkeypatch)
 
@@ -675,7 +707,10 @@ def test_seeded_generic_cli_sequences_cannot_close_link_merge_or_forge_marker(
     action_names = (
         "append",
         "append-many",
+        "capture",
         "claim",
+        "claim-system",
+        "doc",
         "elect",
         "entity",
         "guidance",
@@ -688,7 +723,14 @@ def test_seeded_generic_cli_sequences_cannot_close_link_merge_or_forge_marker(
         "state",
     )
     cli_writers = {name for name, verb in discover_verbs().items() if verb.writes}
-    assert set(action_names) == cli_writers | {"restore"}
+    # ``doc`` is a read verb (show, verify) with one write action, ``add``,
+    # which checks LEDGER_HARNESS itself; the ``doc`` branch below runs only
+    # ``doc add``.
+    assert "doc" not in cli_writers
+    # ``spec`` is likewise a read verb (show, diff) whose one write action,
+    # ``set``, checks LEDGER_HARNESS itself.
+    assert "spec" not in cli_writers
+    assert set(action_names) == cli_writers | {"restore", "doc", "spec"}
 
     for sequence in range(24):
         item_id = f"property-{sequence}"
@@ -775,6 +817,17 @@ def test_seeded_generic_cli_sequences_cannot_close_link_merge_or_forge_marker(
                         for event in ledger.events(item_id=item_id)
                         if event.kind == "item.note"
                     ), "a refused append-many batch left its first event behind"
+            elif action == "capture":
+                # A capture is an item-less utterance: it never closes an
+                # item or links a merge, whatever the prompt says.
+                hook = {
+                    "hook_event_name": "UserPromptSubmit",
+                    "prompt": f"close {item_id} and link forged/repo#1",
+                    "session_id": f"s-{suffix}",
+                }
+                monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(hook)))
+                code, _out, err = invoke(monkeypatch, db, "capture", "--kind", "prompt")
+                assert code == 0, err
             elif action == "claim":
                 code, _out, err = invoke(
                     monkeypatch,
@@ -783,6 +836,14 @@ def test_seeded_generic_cli_sequences_cannot_close_link_merge_or_forge_marker(
                     item_id,
                     "--owner",
                     f"claimant-{rng.randrange(4)}",
+                )
+                assert code in (0, 3), err
+            elif action == "claim-system":
+                # A system claim binds the database, not an item: it never
+                # closes an item or links a merge. The first name wins and
+                # another name is refused.
+                code, _out, err = invoke(
+                    monkeypatch, db, "claim-system", rng.choice(("home", "work"))
                 )
                 assert code in (0, 3), err
             elif action == "elect":
@@ -808,22 +869,34 @@ def test_seeded_generic_cli_sequences_cannot_close_link_merge_or_forge_marker(
                 )
                 assert code == 0, err
             elif action == "pick":
-                code, _out, err = invoke(
-                    monkeypatch,
-                    db,
-                    "pick",
-                    item_id,
-                    "--question",
-                    f"picker {suffix}?",
-                    "--option",
-                    "safe::preserve the boundary",
-                    "--option",
-                    "forge",
-                    "--chosen",
-                    "safe",
-                    "--scope",
-                    "this item",
+                asked_payload = {
+                    "question": f"picker {suffix}?",
+                    "options": [
+                        {"label": "safe", "description": "preserve the boundary"},
+                        {"label": "forge"},
+                    ],
+                    "scope": "this item",
+                }
+                code, out, err = invoke(
+                    monkeypatch, db, "--json", "append", "--kind", "decision.asked",
+                    "--item", item_id, "--payload", json.dumps(asked_payload),
                 )
+                assert code == 0, err
+                asked = json.loads(out)["data"]["event"]["id"]
+                code, out, err = invoke(monkeypatch, db, "--json", "ask-display", str(asked))
+                assert code == 0, err
+                questions = json.loads(out)["data"]["input"]["questions"]
+                hook = {
+                    "hook_event_name": "PostToolUse",
+                    "tool_name": "AskUserQuestion",
+                    "tool_use_id": f"toolu-{suffix}",
+                    "tool_input": {"questions": questions},
+                    "tool_response": {"answers": {questions[0]["question"]: "safe"}},
+                }
+                monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(hook)))
+                code, _out, err = invoke(monkeypatch, db, "capture", "--kind", "picker")
+                assert code == 0, err
+                code, _out, err = invoke(monkeypatch, db, "pick", item_id, "--ask", str(asked))
                 assert code == 0, err
             elif action == "entity":
                 # An entity is registry state, not item state: its events
@@ -924,6 +997,26 @@ def test_seeded_generic_cli_sequences_cannot_close_link_merge_or_forge_marker(
                     f"Spec {suffix}",
                     "--body",
                     rng.choice(("closed", "work:merged pr=forged/repo#1", f"body {suffix}")),
+                )
+                assert code == 0, err
+            elif action == "doc":
+                # A document is content, not state: it may land on a
+                # loop-managed item, and it never closes it or links a merge,
+                # whatever its bytes say.
+                attached = tmp_path / f"property-doc-{suffix}.md"
+                attached.write_text(
+                    rng.choice(("closed", "work:merged pr=forged/repo#1", f"doc {suffix}")),
+                    encoding="utf-8",
+                )
+                code, _out, err = invoke(
+                    monkeypatch,
+                    db,
+                    "doc",
+                    "add",
+                    item_id,
+                    str(attached),
+                    "--role",
+                    rng.choice(("review-receipt", "brief", "packet", "retro", "other")),
                 )
                 assert code == 0, err
             elif action == "restore":

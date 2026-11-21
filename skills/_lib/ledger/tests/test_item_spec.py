@@ -14,6 +14,7 @@ import hashlib
 import io
 import json
 import sqlite3
+import subprocess
 import sys
 from pathlib import Path
 
@@ -386,13 +387,31 @@ def test_claim_refuses_when_the_spec_moves_mid_claim(db, monkeypatch) -> None:
         # this again inside the transaction, where a second writer would wait.)
         if not landed:
             landed.append(True)
-            with open_ledger(db) as other:
-                set_spec(other, ITEM, {"title": "Spec title", "body_md": BODY_TWO},
-                         harness="pytest")
+            done = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import sys\n"
+                    "from ledger import open_ledger\n"
+                    "from ledger.verbs.spec import set_spec\n"
+                    "with open_ledger(sys.argv[1], create=False) as other:\n"
+                    "    set_spec(other, sys.argv[2], "
+                    "{'title': 'Spec title', 'body_md': sys.argv[3]}, harness='pytest')\n",
+                    db,
+                    ITEM,
+                    BODY_TWO,
+                ],
+                cwd=Path(__file__).resolve().parents[2],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            assert done.returncode == 0, done.stderr
         return real(*args, **kwargs)
 
     monkeypatch.setattr(lease, "takeover_holder", spec_lands_meanwhile)
     code, body, _err = cli_json(monkeypatch, db, "claim", ITEM)
+    assert landed
     assert code == 3, body
     assert body["error"]["code"] == "claim_changed"
     assert "the spec changed while this claim was being recorded" in body["error"]["message"]
@@ -421,26 +440,44 @@ def test_reclaim_at_the_current_version_clears_the_moved_line(db, monkeypatch) -
     assert "spec moved" not in card_text(monkeypatch, db)
 
 
+def picked(monkeypatch, db: str, question: str):
+    """Raise an ask, capture the owner choosing yes in its picker, then pick."""
+    payload = {"question": question, "options": [{"label": "yes"}, {"label": "no"}],
+               "scope": "this item"}
+    code, asked, err = cli_json(monkeypatch, db, "append", "--kind", "decision.asked",
+                                "--item", ITEM, "--payload", json.dumps(payload))
+    assert code == 0, err
+    asked_id = asked["data"]["event"]["id"]
+    code, shown, err = cli_json(monkeypatch, db, "ask-display", str(asked_id))
+    assert code == 0, err
+    questions = shown["data"]["input"]["questions"]
+    hook = {
+        "hook_event_name": "PostToolUse",
+        "tool_name": "AskUserQuestion",
+        "tool_use_id": f"toolu-{asked_id}",
+        "tool_input": {"questions": questions},
+        "tool_response": {"answers": {questions[0]["question"]: "yes"}},
+    }
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(hook)))
+    code, _out, err = cli(monkeypatch, db, "capture", "--kind", "picker")
+    assert code == 0, err
+    return cli(monkeypatch, db, "pick", ITEM, "--ask", str(asked_id))
+
+
 def test_pick_prints_the_moved_line(db, monkeypatch) -> None:
     assert set_body(monkeypatch, db, BODY_ONE)[0] == 0
     assert cli(monkeypatch, db, "claim", ITEM)[0] == 0
-    pick = ("pick", ITEM, "--question", "go?", "--option", "yes", "--option", "no",
-            "--chosen", "yes", "--scope", "this item")
-    code, out, err = cli(monkeypatch, db, *pick)
+    code, out, err = picked(monkeypatch, db, "go?")
     assert code == 0, err
     assert "spec moved" not in out
     assert set_body(monkeypatch, db, BODY_TWO)[0] == 0
-    code, out, err = cli(monkeypatch, db, *pick[:3], "again?", *pick[4:])
+    code, out, err = picked(monkeypatch, db, "again?")
     assert code == 0, err
     assert out.splitlines()[-1] == "spec moved: v1 → v2"
 
 
-PICK = ("pick", ITEM, "--question", "go?", "--option", "yes", "--option", "no",
-        "--chosen", "yes", "--scope", "this item")
-
-
 def pick_out(monkeypatch, db: str, n: int) -> str:
-    code, out, err = cli(monkeypatch, db, *PICK[:3], f"go {n}?", *PICK[4:])
+    code, out, err = picked(monkeypatch, db, f"go {n}?")
     assert code == 0, err
     return out
 
@@ -542,7 +579,7 @@ def test_spec_versions_are_computed_in_the_write_transaction(db) -> None:
 def test_a_ledger_at_0007_migrates_and_keeps_every_view_column(tmp_path) -> None:
     path = tmp_path / "old.db"
     migrations = store.load_migrations()
-    conn = store.connect(path)
+    conn, _proof = store.connect(path)
     try:
         store.migrate(conn, [m for m in migrations if m.version <= 7])
         before = {

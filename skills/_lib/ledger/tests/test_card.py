@@ -1,11 +1,13 @@
 """Resume cards: revision, types, truncation, JSON, and --md path guard."""
 from __future__ import annotations
 
+import dataclasses
 import io
 import json
 import os
 import random
 import re
+import shlex
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
@@ -13,12 +15,15 @@ import pytest
 
 from ledger.card import (
     Card,
+    _blocker_source_ids,
     _bound_ids,
     _key_step_ids,
     DROP_ORDER,
+    LINK_LIMIT,
     WORD_LIMIT,
     footer_line,
     format_card,
+    item_spec_moved,
     project_card,
     project_item,
     word_count,
@@ -27,6 +32,7 @@ from ledger.cli import main
 from ledger.schema import ITEM_TYPES
 from ledger.store import open_ledger
 from ledger.verbs import EXIT_NOT_FOUND, EXIT_REFUSED, discover_verbs
+from ledger.verbs.spec import set_spec
 
 PAD = " ".join(["alpha"] * 40)
 
@@ -382,7 +388,7 @@ def test_json_structured_same_content(tmp_path: Path, monkeypatch) -> None:
     assert data["revision"]["hash"]
     assert data["decisions"][0]["event_id"] == elected.id
     assert data["decisions"][0]["quote_ref"] == 1
-    assert data["footer"] == footer_line(data["item_id"])
+    assert data["footer"] == footer_line(data["item_id"], f"ledger --db {db}")
     assert f"revision: {data['revision']['id']} {data['revision']['hash']}" in text_out
     assert data["next_step"] in text_out
     assert f"event={elected.id} quote_ref=1" in text_out
@@ -402,7 +408,7 @@ def test_md_writes_human_copy(tmp_path: Path, monkeypatch) -> None:
     assert dest.exists()
     written = dest.read_text(encoding="utf-8")
     assert written == out
-    assert footer_line("it-1") in written
+    assert footer_line("it-1", f"ledger --db {db}") in written
 
 
 def test_md_refuses_synced_root(tmp_path: Path, monkeypatch) -> None:
@@ -638,7 +644,7 @@ def test_reopened_item_matches_ready_after_blocker_closes(
     assert code == 0, err
     assert "## Blockers\n(none)" in card_out
     assert "Clear blockers" not in card_out
-    assert "Resume with: ledger resume --item=C" in card_out
+    assert f"Resume with: ledger --db {db} resume --item=C" in card_out
 
 
 def test_reopen_clears_blockers_while_blocker_still_open(tmp_path: Path) -> None:
@@ -726,7 +732,7 @@ def test_md_overwrites_existing_via_replace(tmp_path: Path, monkeypatch) -> None
     written = dest.read_text(encoding="utf-8")
     assert written == out
     assert written != "stale\n"
-    assert footer_line("it-1") in written
+    assert footer_line("it-1", f"ledger --db {db}") in written
     assert replaced
     src, dst = replaced[0]
     assert dst.resolve() == dest.resolve()
@@ -775,7 +781,7 @@ def test_blocks_link_direction_matches_ready(tmp_path: Path, monkeypatch) -> Non
     assert code == 0, err
     assert "## Blockers\n(none)" in out_a
     assert "Clear blockers" not in out_a
-    assert "Resume with: ledger resume --item=blk-a" in out_a
+    assert f"Resume with: ledger --db {db} resume --item=blk-a" in out_a
     code, out_b, err = invoke(monkeypatch, ["--db", db, "card", "blk-b"])
     assert code == 0, err
     assert "## Blockers\n- blk-a" in out_b
@@ -791,7 +797,7 @@ def test_blocks_link_direction_matches_ready(tmp_path: Path, monkeypatch) -> Non
     assert code == 0, err
     assert "## Blockers\n(none)" in out_b
     assert "Clear blockers" not in out_b
-    assert "Resume with: ledger resume --item=blk-b" in out_b
+    assert f"Resume with: ledger --db {db} resume --item=blk-b" in out_b
 
 
 def test_blocker_flood_next_step_bounded(tmp_path: Path) -> None:
@@ -896,7 +902,12 @@ def _words(prefix: str, count: int) -> str:
 
 
 def _ask_text_line(text: str) -> str:
-    return next(line for line in text.splitlines() if line.startswith("  ask: "))
+    line = next(
+        (line for line in text.splitlines() if line.startswith("  ask: ")),
+        None,
+    )
+    assert line is not None, "missing ask line"
+    return line
 
 
 def test_decision_card_shows_every_ask_field(tmp_path: Path, monkeypatch) -> None:
@@ -1037,8 +1048,18 @@ def test_long_ask_is_shortened_first(tmp_path: Path, monkeypatch) -> None:
     elected = _colour_election(lg, "dc-1")
     asked = _full_ask(lg, ask=_words("a", 600))
     lg.close()
-    card = project_card(open_ledger(db), "dc-1")
+    reader = open_ledger(db)
+    try:
+        card = project_card(reader, "dc-1")
+    finally:
+        reader.close()
+    # Pin the flake: a599 in the revision hash must not fail the ask-line check.
+    card = dataclasses.replace(
+        card,
+        revision_hash="deadbeefa599cafe0123456789abcdef0123456789abcdef0123456789ab",
+    )
     text = format_card(card)
+    assert "a599" in text
     # Exact: the cut pays for its own marker and the Truncated line.
     assert word_count(text) == WORD_LIMIT
     # The ask is shortened, not dropped, and nothing else was capped.
@@ -1056,7 +1077,7 @@ def test_long_ask_is_shortened_first(tmp_path: Path, monkeypatch) -> None:
         "ledger export-item --json -- dc-1)"
     )
     assert row["ask"].startswith("a000 a001")
-    assert "a599" not in text
+    assert "a599" not in _ask_text_line(text)
     for line in (
         "    A) fast synthetic lane",
         "    B) slow synthetic lane",
@@ -1078,8 +1099,30 @@ def test_long_ask_is_shortened_first(tmp_path: Path, monkeypatch) -> None:
     assert data["decisions"][0]["event_id"] == elected.id
     assert data["next_step"] == "Answer open questions before continuing."
     assert data["truncated"] == ["ask"]
-    assert data["open_questions"][0]["omitted_words"] == {"ask": cut}
+    cli_row = data["open_questions"][0]
+    cli_cut = cli_row["omitted_words"]["ask"]
+    assert len(cli_row["ask"].split()) + cli_cut == 600
+    assert cli_cut >= cut
+    # The JSON names the ask marker's count, command and event, as printed.
+    assert data["cuts"] == [
+        {
+            "section": "ask",
+            "count": cli_cut,
+            "unit": "words",
+            "command": f"ledger --db {shlex.quote(db)} export-item --json -- dc-1",
+            "event_id": asked.id,
+        }
+    ]
     assert "a599" not in data["open_questions"][0]["ask"]
+
+
+def test_ask_text_line_fails_by_name_when_missing() -> None:
+    try:
+        _ask_text_line("# dc-1\nrevision: 1 abc\n")
+    except AssertionError as err:
+        assert "missing ask line" in str(err)
+    else:
+        raise AssertionError("expected missing ask line")
 
 
 def test_huge_option_description_is_shortened(tmp_path: Path, monkeypatch) -> None:
@@ -1102,7 +1145,11 @@ def test_huge_option_description_is_shortened(tmp_path: Path, monkeypatch) -> No
         "ask-1",
     )
     lg.close()
-    card = project_card(open_ledger(db), "dc-1")
+    reader = open_ledger(db)
+    try:
+        card = project_card(reader, "dc-1")
+    finally:
+        reader.close()
     text = format_card(card)
     assert word_count(text) <= WORD_LIMIT
     assert card.truncated == ("ask",)
@@ -1178,6 +1225,21 @@ def test_ask_floor_then_question_cap_keeps_next_step(tmp_path: Path) -> None:
     assert card.next_step == "Answer open questions before continuing."
     for event in asked:
         assert event.id in card.source_event_ids
+    # Every ask word the card cut is counted in the JSON: the printed markers
+    # name their events; the words of asks capped away have one entry left.
+    omitted = dict(card.omitted)
+    cuts = [entry for entry in card.as_dict()["cuts"] if entry["section"] == "ask"]
+    assert sum(entry["count"] for entry in cuts) == omitted["ask"]
+    shown = {int(row["asked_event_id"]) for row in card.open_questions}
+    assert {entry["event_id"] for entry in cuts if "event_id" in entry} == shown
+    assert [entry for entry in cuts if "event_id" not in entry] == [
+        {
+            "section": "ask",
+            "count": omitted["ask"] - sum(e["count"] for e in cuts if "event_id" in e),
+            "unit": "words",
+            "command": "ledger export-item --json -- dc-1",
+        }
+    ]
     lg.close()
 
 
@@ -1536,8 +1598,7 @@ def test_capping_never_changes_the_next_step(tmp_path: Path) -> None:
         "dc-1",
         "s-1",
     )
-    item = next(row for row in lg.items() if row["item_id"] == "dc-1")
-    full = project_item(lg, item)
+    full = project_item(lg, "dc-1")
     card = project_card(lg, "dc-1")
     text = format_card(card)
     assert word_count(text) <= WORD_LIMIT
@@ -1667,8 +1728,7 @@ def test_blocker_flood_step_keeps_count_and_question(tmp_path: Path) -> None:
     _append(
         lg, "item.state", {"status": "blocked", "blocked_by": blockers}, "dc-1", "s-1"
     )
-    item = next(row for row in lg.items() if row["item_id"] == "dc-1")
-    full = project_item(lg, item)
+    full = project_item(lg, "dc-1")
     card = project_card(lg, "dc-1")
     text = format_card(card)
     assert word_count(text) <= WORD_LIMIT
@@ -1812,8 +1872,7 @@ def test_fuzzed_cards_fit_and_keep_the_step(tmp_path: Path, seed: int) -> None:
                 state["owner"] = _words("o", rng.choice([1, 3, 40, 600]))
                 state["claim"] = _words("k", rng.choice([1, 3, 40, 600]))
             _append(lg, "item.state", state, "it", "s")
-        item = next(row for row in lg.items() if row["item_id"] == "it")
-        full = project_item(lg, item)
+        full = project_item(lg, "it")
         card = project_card(lg, "it")
         text = format_card(card)
         where = f"seed={seed} case={case}"
@@ -1823,3 +1882,999 @@ def test_fuzzed_cards_fit_and_keep_the_step(tmp_path: Path, seed: int) -> None:
         assert card.next_step == full.next_step, where
         assert "next_step" not in card.truncated, where
         lg.close()
+
+
+_MARKER = re.compile(r"^\(\+(\d+) cut; (.+)\)$")
+
+
+def _section_markers(text: str, heading: str) -> list[tuple[int, str]]:
+    """The ``(+K cut; COMMAND)`` lines that end one section of a card."""
+    body = text.split(f"\n## {heading}\n", 1)[1].split("\n\n", 1)[0]
+    markers = []
+    for line in body.splitlines():
+        match = _MARKER.match(line)
+        if match:
+            markers.append((int(match.group(1)), match.group(2)))
+    return markers
+
+
+def _run_printed(monkeypatch, command: str, db: str) -> str:
+    """Run a command the card printed, as printed, and return its output."""
+    argv = shlex.split(command)
+    assert argv[:3] == ["ledger", "--db", db]
+    code, out, err = invoke(monkeypatch, argv[1:])
+    assert code == 0, err
+    return out
+
+
+def _queried_ids(out: str) -> set[str]:
+    return {line.split("\t", 1)[0] for line in out.splitlines() if line}
+
+
+def _exported_events(out: str) -> list[dict]:
+    return json.loads(out)["data"]["events"]
+
+
+def _printed_card(monkeypatch, db: str, item_id: str) -> str:
+    code, out, err = invoke(monkeypatch, ["--db", db, "card", "--", item_id])
+    assert code == 0, err
+    return out
+
+
+def test_cut_duplicated_by_links_come_back_from_the_printed_query(
+    tmp_path: Path, monkeypatch
+) -> None:
+    db = str(_db(tmp_path))
+    lg = open_ledger(db)
+    _create(lg, "it-kept", "ticket")
+    dups = []
+    for index in range(3):
+        dup = f"it-dup-{index}"
+        _create(lg, dup, "ticket")
+        _append(lg, "item.linked", {"rel": "duplicate-of", "target": "it-kept"}, dup, f"d-{index}")
+        dups.append(dup)
+    # A duplicate of another item is not one of this card's rows.
+    _create(lg, "it-elsewhere", "ticket")
+    _create(lg, "it-dup-x", "ticket")
+    _append(
+        lg, "item.linked", {"rel": "duplicate-of", "target": "it-elsewhere"}, "it-dup-x", "d-x"
+    )
+    for index in range(45):
+        _append(
+            lg, "item.linked", {"rel": "pr", "target": f"org/repo#{index}"}, "it-kept", f"pr-{index}"
+        )
+    full = project_item(lg, "it-kept")
+    lg.close()
+    text = _printed_card(monkeypatch, db, "it-kept")
+    shown = {line for line in text.splitlines() if line.startswith("- ")}
+    removed = [
+        row for row in full.links
+        if f"- {row['rel']}: {row['target']} (event={row['event_id']})" not in shown
+    ]
+    removed_inbound = [row for row in removed if row["rel"] == "duplicated-by"]
+    removed_own = [row for row in removed if row["rel"] != "duplicated-by"]
+    assert {row["target"] for row in removed_inbound} == set(dups)
+    assert removed_own
+    prefix = f"ledger --db {shlex.quote(db)}"
+    markers = _section_markers(text, "Links")
+    assert markers == [
+        (len(removed_own), f"{prefix} export-item --json -- it-kept"),
+        (len(dups), f"{prefix} query --duplicate-of=it-kept --all"),
+    ]
+    # Every cut duplicated-by row comes back from the query, and nothing else.
+    assert _queried_ids(_run_printed(monkeypatch, markers[1][1], db)) == set(dups)
+    # Every cut own link comes back from the item's own export.
+    exported = {
+        event["id"] for event in _exported_events(_run_printed(monkeypatch, markers[0][1], db))
+    }
+    assert {row["event_id"] for row in removed_own} <= exported
+    assert word_count(text, command_prefix=prefix) <= WORD_LIMIT
+
+
+def test_cut_blockers_come_back_from_the_printed_commands(tmp_path: Path, monkeypatch) -> None:
+    db = str(_db(tmp_path))
+    lg = open_ledger(db)
+    _create(lg, "it-x", "ticket")
+    named = [f"own-{index:03d}" for index in range(250)]
+    _append(lg, "item.state", {"status": "blocked", "blocked_by": named}, "it-x", "s-1")
+    linked = []
+    for index in range(60):
+        blocker = f"blk-{index:03d}"
+        _create(lg, blocker, "ticket")
+        _append(lg, "item.linked", {"rel": "blocks", "target": "it-x"}, blocker, f"b-{index}")
+        linked.append(blocker)
+    # A blocks link to another item is not one of this card's rows.
+    _create(lg, "it-y", "ticket")
+    _append(lg, "item.linked", {"rel": "blocks", "target": "it-y"}, "blk-000", "b-y")
+    full = project_item(lg, "it-x")
+    lg.close()
+    text = _printed_card(monkeypatch, db, "it-x")
+    body = text.split("\n## Blockers\n", 1)[1].split("\n\n", 1)[0]
+    shown = {line[2:] for line in body.splitlines() if line.startswith("- ")}
+    removed = [name for name in full.blockers if name not in shown]
+    removed_linked = [name for name in removed if name in linked]
+    removed_named = [name for name in removed if name in named]
+    assert removed_linked and removed_named
+    assert len(removed) == len(removed_linked) + len(removed_named)
+    prefix = f"ledger --db {shlex.quote(db)}"
+    markers = _section_markers(text, "Blockers")
+    assert markers == [
+        (len(removed_named), f"{prefix} export-item --json -- it-x"),
+        (len(removed_linked), f"{prefix} query --blocks=it-x --open --all"),
+    ]
+    queried = _queried_ids(_run_printed(monkeypatch, markers[1][1], db))
+    assert set(removed_linked) <= queried
+    assert queried == set(linked)
+    held = set()
+    for event in _exported_events(_run_printed(monkeypatch, markers[0][1], db)):
+        held.update(event["payload"].get("blocked_by") or ())
+    assert set(removed_named) <= held
+    assert word_count(text, command_prefix=prefix) <= WORD_LIMIT
+
+
+def test_word_count_counts_the_new_query_prefixes_as_commands() -> None:
+    prefix = "ledger --db '/tmp/a b/ledger.db'"
+    for verb in ("query --duplicate-of=it-1 --all", "query --blocks=it-1 --all"):
+        # The quoted path is one argument: three words for the prefix.
+        assert word_count(f"(+3 cut; {prefix} {verb})", command_prefix=prefix) == 8
+    verb = "query --blocks=it-1 --open --all"
+    assert word_count(f"(+3 cut; {prefix} {verb})", command_prefix=prefix) == 9
+
+
+_HEADINGS = {
+    "Decisions": "decisions",
+    "Open questions": "open_questions",
+    "Links": "links",
+    "Blockers": "blockers",
+    "Notes": "notes",
+    "Decision records": "decision_records",
+    "Tried": "tried",
+    "Progress": "progress",
+    "Review rounds": "reviews",
+    "References": "refs",
+    "Conversation pointers": "pointers",
+}
+
+
+def _text_row_cuts(text: str) -> list[tuple[str, int, str]]:
+    """Every (section, count, command) row marker the text card prints."""
+    cuts = []
+    section = None
+    for line in text.splitlines():
+        if line.startswith("## "):
+            heading = line[3:]
+            section = "children" if heading.startswith("Children (") else _HEADINGS.get(heading)
+            continue
+        match = _MARKER.match(line)
+        if match and section is not None:
+            cuts.append((section, int(match.group(1)), match.group(2)))
+    return cuts
+
+
+def _card_json(monkeypatch, db: str, item_id: str) -> dict:
+    code, out, err = invoke(monkeypatch, ["--db", db, "--json", "card", "--", item_id])
+    assert code == 0, err
+    return json.loads(out)["data"]
+
+
+def test_json_cut_sections_carry_the_text_count_and_command(
+    tmp_path: Path, monkeypatch
+) -> None:
+    db = str(_db(tmp_path))
+    lg = open_ledger(db)
+    _create(lg, "it-anchor", "ticket")
+    blockers = [f"blk-{index}" for index in range(7)]
+    for blocker in blockers:
+        _create(lg, blocker, "ticket")
+        _append(lg, "item.linked", {"rel": "blocks", "target": "it-anchor"}, blocker, f"b-{blocker}")
+    for index in range(40):
+        child = f"it-child-{index:02d}"
+        _create(lg, child, "ticket", " ".join([f"t{index}"] * 12))
+        _append(lg, "item.linked", {"rel": "child-of", "target": "it-anchor"}, child, f"l-{child}")
+    lg.close()
+    text = _printed_card(monkeypatch, db, "it-anchor")
+    data = _card_json(monkeypatch, db, "it-anchor")
+    assert "children" in data["truncated"]
+    prefix = f"ledger --db {shlex.quote(db)}"
+    # Every name the card cut has an entry, each with its count and command.
+    assert {entry["section"] for entry in data["cuts"]} == set(data["truncated"])
+    for entry in data["cuts"]:
+        assert isinstance(entry["count"], int) and entry["count"] > 0, entry
+        assert entry["command"].startswith(prefix + " "), entry
+    # The row markers are the text form's, word for word and in order.
+    rows = [entry for entry in data["cuts"] if entry["unit"] == "rows"]
+    assert [(e["section"], e["count"], e["command"]) for e in rows] == _text_row_cuts(text)
+    children = [entry for entry in rows if entry["section"] == "children"]
+    assert [(e["count"], e["command"]) for e in children] == [
+        (40 - len(data["children"]), f"{prefix} query --parent=it-anchor --all")
+    ]
+    # The next step names five blockers and the query that prints the rest,
+    # not export-item, which holds no blocks link of another item.
+    command = f"{prefix} query --blocks=it-anchor --open --all"
+    assert data["next_step"] == (
+        f"Clear blockers: {', '.join(blockers[:5])} (+2 cut; {command})."
+    )
+    assert "export-item" not in data["next_step"]
+    assert f"## Next step\n{data['next_step']}\n" in text
+    assert set(blockers[5:]) <= _queried_ids(_run_printed(monkeypatch, command, db))
+    assert word_count(text, command_prefix=prefix) <= WORD_LIMIT
+
+
+def test_next_step_names_each_kind_of_blocker_it_cut(tmp_path: Path) -> None:
+    lg = open_ledger(_db(tmp_path))
+    _create(lg, "it-x", "ticket")
+    named = [f"own-{index}" for index in range(6)]
+    _append(lg, "item.state", {"status": "blocked", "blocked_by": named}, "it-x", "s-1")
+    for index in range(2):
+        _create(lg, f"blk-{index}", "ticket")
+        _append(lg, "item.linked", {"rel": "blocks", "target": "it-x"}, f"blk-{index}", f"b-{index}")
+    card = project_card(lg, "it-x")
+    lg.close()
+    # The state names own-0..own-5, the links add blk-0 and blk-1: the step
+    # names five, then the item's export for own-5 and the query for the
+    # linked two, in the order a capped Blockers section prints them.
+    assert card.next_step == (
+        "Clear blockers: own-0, own-1, own-2, own-3, own-4 "
+        "(+1 cut; ledger export-item --json -- it-x) "
+        "(+2 cut; ledger query --blocks=it-x --open --all)."
+    )
+    assert card.as_dict()["cuts"] == []
+
+
+def test_cut_blockers_query_returns_only_the_open_blockers(
+    tmp_path: Path, monkeypatch
+) -> None:
+    db = str(_db(tmp_path))
+    lg = open_ledger(db)
+    _decision(lg, "dc-x")
+    pad = " ".join(["w"] * 60)
+    for index in range(8):
+        _append(
+            lg,
+            "decision.asked",
+            {
+                "question": f"q{index}?",
+                "ask": pad,
+                "options": [
+                    {"label": "A", "description": pad},
+                    {"label": "B", "description": pad},
+                ],
+                "recommendation": pad,
+                "default": "B",
+            },
+            "dc-x",
+            f"ask-{index}",
+        )
+    for blocker in ("blk-open-1", "blk-open-2", "blk-closed"):
+        _create(lg, blocker, "ticket")
+        _append(lg, "item.linked", {"rel": "blocks", "target": "dc-x"}, blocker, f"b-{blocker}")
+    _append(lg, "item.state", {"status": "closed"}, "blk-closed", "s-closed")
+    lg.close()
+    text = _printed_card(monkeypatch, db, "dc-x")
+    prefix = f"ledger --db {shlex.quote(db)}"
+    command = f"{prefix} query --blocks=dc-x --open --all"
+    assert _section_markers(text, "Blockers") == [(2, command)]
+    data = _card_json(monkeypatch, db, "dc-x")
+    assert [
+        (entry["count"], entry["command"]) for entry in data["cuts"]
+        if entry["section"] == "blockers"
+    ] == [(2, command)]
+    # The printed command returns exactly the two open blockers the card cut.
+    assert _queried_ids(_run_printed(monkeypatch, command, db)) == {"blk-open-1", "blk-open-2"}
+    # Without the flag, query --blocks still returns every linking item.
+    unfiltered = f"{prefix} query --blocks=dc-x --all"
+    assert _queried_ids(_run_printed(monkeypatch, unfiltered, db)) == {
+        "blk-open-1", "blk-open-2", "blk-closed"
+    }
+
+
+_WORDS_MARKER = re.compile(r"\(\+(\d+) words cut; (.+)\)$")
+_ASK_MARKER = re.compile(r"… \(\+(\d+) words cut; full text in event (\d+); ([^)]+)\)")
+_FIELD_LINE = re.compile(r"^(title|owner|claim): ")
+
+
+def _text_cut_markers(text: str) -> list[tuple[str, int, str, str]]:
+    """Every (section, count, unit, command) cut marker the text card prints
+    for a ``truncated`` name, in the order it prints them."""
+    cuts = []
+    heading = None
+    for line in text.splitlines():
+        if line.startswith("## "):
+            heading = line[3:]
+            continue
+        field = _FIELD_LINE.match(line)
+        if heading is None and field:
+            match = _WORDS_MARKER.search(line)
+            if match:
+                cuts.append((field.group(1), int(match.group(1)), "words", match.group(2)))
+            continue
+        if heading == "Next step":
+            match = _WORDS_MARKER.search(line)
+            if match:
+                cuts.append(("next_step", int(match.group(1)), "words", match.group(2)))
+            continue
+        if heading == "Open questions":
+            for match in _ASK_MARKER.finditer(line):
+                cuts.append(("ask", int(match.group(1)), "words", match.group(3)))
+        match = _MARKER.match(line)
+        if match and heading is not None:
+            section = "children" if heading.startswith("Children (") else _HEADINGS[heading]
+            cuts.append((section, int(match.group(1)), "rows", match.group(2)))
+    return cuts
+
+
+def _json_cut_markers(data: dict) -> list[tuple[str, int, str, str]]:
+    return [(e["section"], e["count"], e["unit"], e["command"]) for e in data["cuts"]]
+
+
+def test_json_cuts_follow_the_text_order_of_title_owner_and_claim(
+    tmp_path: Path, monkeypatch
+) -> None:
+    db = str(_db(tmp_path))
+    lg = open_ledger(db)
+    _create(lg, "it-1", "ticket", _words("t", 300))
+    state = {"status": "claimed", "owner": _words("o", 300), "claim": _words("k", 300)}
+    _append(lg, "item.state", state, "it-1", "s-1")
+    lg.close()
+    text = _printed_card(monkeypatch, db, "it-1")
+    data = _card_json(monkeypatch, db, "it-1")
+    # The card trims owner, then claim, then title; the text prints the
+    # title first, then owner and claim. The JSON follows the text.
+    assert data["truncated"] == ["owner", "claim", "title"]
+    markers = _text_cut_markers(text)
+    assert [marker[0] for marker in markers] == ["title", "owner", "claim"]
+    assert _json_cut_markers(data) == markers
+
+
+def test_json_cuts_follow_the_text_order_of_an_ask_children_and_blockers(
+    tmp_path: Path, monkeypatch
+) -> None:
+    db = str(_db(tmp_path))
+    lg = open_ledger(db)
+    _decision(lg, "dc-x")
+    pad = " ".join(["w"] * 60)
+    for index in range(2):
+        _append(
+            lg,
+            "decision.asked",
+            {
+                "question": f"q{index}?",
+                "ask": pad,
+                "options": [
+                    {"label": "A", "description": pad},
+                    {"label": "B", "description": pad},
+                ],
+                "recommendation": pad,
+                "default": "B",
+            },
+            "dc-x",
+            f"ask-{index}",
+        )
+    for index in range(6):
+        child = f"ch-{index:02d}"
+        _create(lg, child, "ticket", " ".join([f"c{index}"] * 12))
+        _append(lg, "item.linked", {"rel": "child-of", "target": "dc-x"}, child, f"l-{child}")
+    for index in range(80):
+        blocker = f"blk-{index:02d}"
+        _create(lg, blocker, "ticket")
+        _append(lg, "item.linked", {"rel": "blocks", "target": "dc-x"}, blocker, f"b-{blocker}")
+    lg.close()
+    text = _printed_card(monkeypatch, db, "dc-x")
+    data = _card_json(monkeypatch, db, "dc-x")
+    assert data["truncated"] == ["ask", "children", "blockers"]
+    markers = _text_cut_markers(text)
+    sections = [marker[0] for marker in markers]
+    assert sections[-2:] == ["children", "blockers"]
+    assert set(sections[:-2]) == {"ask"}
+    assert _json_cut_markers(data) == markers
+    # Each ask entry names the event the text marker names, in the same order.
+    asked = [int(m.group(2)) for m in _ASK_MARKER.finditer(text.split("\n## Open questions\n")[1])]
+    assert [e["event_id"] for e in data["cuts"] if e["section"] == "ask"] == asked
+
+
+def test_a_truncated_name_with_no_marker_gets_the_export_entry(tmp_path: Path) -> None:
+    lg = open_ledger(_db(tmp_path))
+    _create(lg, "it-x", "ticket")
+    card = project_card(lg, "it-x")
+    lg.close()
+    # Notes is named as cut, but no count was recorded, so the text prints
+    # no marker for it. The JSON still gives it one entry, under the export.
+    card = dataclasses.replace(card, truncated=("notes",))
+    text = format_card(card)
+    assert _text_cut_markers(text) == []
+    assert "dropped: notes" in text
+    assert card.as_dict()["cuts"] == [
+        {
+            "section": "notes",
+            "count": 0,
+            "unit": "rows",
+            "command": "ledger export-item --json -- it-x",
+        }
+    ]
+
+
+def _links_body(text: str) -> list[str]:
+    return text.split("\n## Links\n", 1)[1].split("\n\n", 1)[0].splitlines()
+
+
+def test_bounded_card_caps_links_to_the_newest_eight(tmp_path: Path, monkeypatch) -> None:
+    db = str(_db(tmp_path))
+    lg = open_ledger(db)
+    _create(lg, "it-l", "ticket")
+    links = [
+        _append(lg, "item.linked", {"rel": "url", "target": f"https://example.invalid/{n}"},
+                "it-l", f"l-{n}")
+        for n in range(11)
+    ]
+    lg.close()
+    text = _printed_card(monkeypatch, db, "it-l")
+    assert LINK_LIMIT == 8
+    assert word_count(text) <= WORD_LIMIT
+    prefix = f"ledger --db {shlex.quote(db)}"
+    assert _links_body(text) == [
+        f"- url: https://example.invalid/{n} (event={event.id})"
+        for n, event in enumerate(links)
+        if n >= 3
+    ] + [f"(+3 cut; {prefix} export-item --json -- it-l)"]
+    assert "dropped: links" in text
+
+
+def test_link_cap_counts_cut_duplicated_by_rows_under_their_query(
+    tmp_path: Path, monkeypatch
+) -> None:
+    db = str(_db(tmp_path))
+    lg = open_ledger(db)
+    _create(lg, "it-l", "ticket")
+    for n in range(3):
+        _create(lg, f"it-dup-{n}", "ticket")
+        _append(lg, "item.linked", {"rel": "duplicate-of", "target": "it-l"}, f"it-dup-{n}",
+                f"d-{n}")
+    for n in range(8):
+        _append(lg, "item.linked", {"rel": "url", "target": f"https://example.invalid/{n}"},
+                "it-l", f"l-{n}")
+    lg.close()
+    text = _printed_card(monkeypatch, db, "it-l")
+    body = _links_body(text)
+    assert len(body) == 9
+    assert not any("duplicated-by" in line for line in body)
+    command = f"ledger --db {shlex.quote(db)} query --duplicate-of=it-l --all"
+    assert body[-1] == f"(+3 cut; {command})"
+    assert _queried_ids(_run_printed(monkeypatch, command, db)) == {
+        "it-dup-0", "it-dup-1", "it-dup-2"
+    }
+
+
+def test_full_card_shows_every_row_and_no_cut_marker(tmp_path: Path, monkeypatch) -> None:
+    db = str(_db(tmp_path))
+    lg = open_ledger(db)
+    title = _words("t", 600)
+    _create(lg, "it-f", "ticket", title)
+    for n in range(3):
+        _create(lg, f"it-dup-{n}", "ticket")
+        _append(lg, "item.linked", {"rel": "duplicate-of", "target": "it-f"}, f"it-dup-{n}",
+                f"d-{n}")
+    for n in range(4):
+        _create(lg, f"it-kid-{n}", "ticket", f"kid {n}")
+        _append(lg, "item.linked", {"rel": "child-of", "target": "it-f"}, f"it-kid-{n}",
+                f"k-{n}")
+    blockers = [f"{_words('b', 12)} blocker-{n}" for n in range(9)]
+    _append(lg, "item.state", {"status": "blocked", "blocked_by": blockers}, "it-f", "s-1")
+    for n in range(4):
+        _create(lg, f"it-blk-{n}", "ticket")
+        _append(lg, "item.linked", {"rel": "blocks", "target": "it-f"}, f"it-blk-{n}", f"b-{n}")
+    elected = [_elect(lg, "it-f", n, f"e-{n}", pad=PAD) for n in range(30)]
+    asked = [
+        _append(lg, "decision.asked",
+                {"question": f"ask-{n}? {PAD}", "options": [{"label": "yes"}, {"label": "no"}]},
+                "it-f", f"a-{n}")
+        for n in range(6)
+    ]
+    links = [
+        _append(lg, "item.linked",
+                {"rel": "url", "target": f"https://example.invalid/{n}/{PAD.replace(' ', '-')}"},
+                "it-f", f"l-{n}")
+        for n in range(12)
+    ]
+    notes = [
+        _append(lg, "item.note", {"text": f"note-{n} {PAD}"}, "it-f", f"n-{n}")
+        for n in range(60)
+    ]
+    long_text = _words("x", 70)
+    tried = _append(lg, "item.tried", {"what": long_text, "outcome": _words("o", 50)}, "it-f",
+                    "tr-1")
+    findings = [f"finding-{n} {_words('f', 40)}" for n in range(9)]
+    _append(lg, "review.recorded", {"round": 1, "verdict": "changes", "findings": findings},
+            "it-f", "rv-1")
+    point = _words("p", 110)
+    refs = [f"plans/plan-{n}.md" for n in range(3)]
+    _append(lg, "item.stopped", {"point": point, "phase": "build", "refs": refs}, "it-f",
+            "st-1")
+    full = project_item(lg, "it-f", full=True)
+    bounded = project_card(lg, "it-f")
+    lg.close()
+
+    # The bounded card of the same item does cut: every cap is exceeded.
+    assert "cut;" in format_card(bounded)
+    assert bounded.truncated and len(bounded.links) <= LINK_LIMIT
+
+    code, text, err = invoke(monkeypatch, ["--db", db, "card", "--full", "--", "it-f"])
+    assert code == 0, err
+    assert "cut;" not in text
+    assert "(+" not in text
+    assert "…" not in text
+    assert "full text in event" not in text
+    assert "## Truncated" not in text
+    assert word_count(text) > WORD_LIMIT
+    assert f"title: {title}\n" in text
+    for event in elected + asked + links + notes:
+        assert f"event={event.id}" in text
+    for n in range(3):
+        assert f"- duplicated-by: it-dup-{n} (event=" in text
+    for n in range(4):
+        assert f"- it-kid-{n}: kid {n} [open] holder: -" in text
+        assert f"- it-blk-{n}\n" in text
+    for name in blockers:
+        assert f"- {name}\n" in text
+    # The next step names every blocker in full.
+    step = text.split("\n## Next step\n", 1)[1].split("\n", 1)[0]
+    for name in blockers:
+        assert name in step
+    assert f"event={tried.id}: {long_text} -> {_words('o', 50)}" in text
+    for finding in findings:
+        assert f"  finding: {finding}\n" in text
+    assert f"[build]: {point}\n" in text
+    for ref in refs:
+        assert f"- {ref}\n" in text
+    header = [int(part) for part in text.splitlines()[2].split(": ", 1)[1].split(", ")]
+    assert len(header) > 40
+    assert _shown_event_ids(text) <= set(header)
+    assert header == list(full.source_event_ids)
+
+    code, out, err = invoke(monkeypatch, ["--json", "--db", db, "card", "--full", "it-f"])
+    assert code == 0, err
+    data = json.loads(out)["data"]
+    assert data["truncated"] == []
+    assert data["source_event_ids_omitted"] == 0
+    assert len(data["notes"]) == 60
+    assert len(data["links"]) == 15
+    assert len(data["decisions"]) == 30
+    assert len(data["open_questions"]) == 6
+    assert len(data["blockers"]) == 13
+    assert len(data["children"]) == 4
+    assert data["reviews"][0]["findings_cut"] == 0
+
+
+def test_full_card_header_names_decision_standing_and_result_events(
+    tmp_path: Path, monkeypatch
+) -> None:
+    db = str(_db(tmp_path))
+    lg = open_ledger(db)
+    _create(lg, "it-d", "ticket")
+    _create(lg, "it-o", "ticket")
+    recorded = {
+        "who": "tester",
+        "who_kind": "person",
+        "standing": "lean",
+        "effect": "synthetic effect",
+        "tags": [{"type": "ticket", "id": "it-d"}],
+        "verbatim": "synthetic words",
+        "phase": "build",
+    }
+    # The source event and the replacing decision live on another item, so
+    # nothing else on this card names them.
+    source = _append(lg, "item.note", {"text": "source"}, "it-o", "src")
+    decision = _append(
+        lg, "decision.recorded", {**recorded, "source_event_id": source.id}, "it-d", "dec"
+    )
+    replacement = _append(
+        lg, "decision.recorded", {**recorded, "tags": [{"type": "ticket", "id": "it-o"}]},
+        "it-o", "dec-2",
+    )
+    _append(
+        lg, "decision.standing",
+        {"decision_event_id": decision.id, "standing": "lean", "source_event_id": source.id},
+        "it-d", "st-0",
+    )
+    result = _append(
+        lg, "decision.result", {"decision_event_id": decision.id, "result": "shipped"},
+        "it-d", "res",
+    )
+    standing = _append(
+        lg, "decision.standing",
+        {
+            "decision_event_id": decision.id,
+            "standing": "superseded",
+            "superseded_by": replacement.id,
+            "source_event_id": source.id,
+        },
+        "it-d", "st-1",
+    )
+    lg.close()
+    code, text, err = invoke(monkeypatch, ["--db", db, "card", "--full", "--", "it-d"])
+    assert code == 0, err
+    header = {int(part) for part in text.splitlines()[2].split(": ", 1)[1].split(", ")}
+    assert {source.id, standing.id, result.id, replacement.id} <= header
+    assert decision.id in header
+    code, out, err = invoke(monkeypatch, ["--json", "--db", db, "card", "--full", "it-d"])
+    assert code == 0, err
+    [row] = json.loads(out)["data"]["decision_records"]
+    assert row["standing_event_id"] == standing.id
+    assert row["result_event_id"] == result.id
+    assert row["superseded_by"] == replacement.id
+    assert row["source_event_id"] == source.id
+
+
+def test_full_card_keeps_every_pointer_unclipped(tmp_path: Path) -> None:
+    lg = open_ledger(_db(tmp_path))
+    _create(lg, "it-p", "ticket")
+    pointers = [{"ref": f"{_words('q', 20)}-{n}", "note": _words("m", 30)} for n in range(15)]
+    full = project_item(lg, "it-p", pointers=lambda _item: pointers, full=True)
+    capped = project_item(lg, "it-p", pointers=lambda _item: pointers)
+    lg.close()
+    assert [row["ref"] for row in full.pointers] == [row["ref"] for row in pointers]
+    assert [row["note"] for row in full.pointers] == [row["note"] for row in pointers]
+    assert len(capped.pointers) < len(pointers)
+
+
+def _child_ledger(lg):
+    """A parent and one child: created, state set, linked child-of the parent."""
+    parent = _create(lg, "it-parent", "ticket", "parent")
+    child = _create(lg, "it-child", "ticket", "child")
+    state = _append(
+        lg, "item.state", {"status": "claimed", "owner": "tester"}, "it-child", "s-child"
+    )
+    link = _append(
+        lg, "item.linked", {"rel": "child-of", "target": "it-parent"}, "it-child", "l-child"
+    )
+    return parent, child, state, link
+
+
+def test_full_card_names_child_creation_state_and_link_events(
+    tmp_path: Path, monkeypatch
+) -> None:
+    db = str(_db(tmp_path))
+    lg = open_ledger(db)
+    parent, child, state, link = _child_ledger(lg)
+    card = project_card(lg, "it-parent", full=True)
+    lg.close()
+    assert card.children[0]["item_id"] == "it-child"
+    assert card.source_event_ids == tuple(sorted({parent.id, child.id, state.id, link.id}))
+    code, text, err = invoke(monkeypatch, ["--db", db, "card", "--full", "--", "it-parent"])
+    assert code == 0, err
+    header = {int(part) for part in text.splitlines()[2].split(": ", 1)[1].split(", ")}
+    assert {child.id, state.id, link.id} <= header
+
+
+def test_full_card_child_without_state_names_creation_and_link_only(tmp_path: Path) -> None:
+    lg = open_ledger(_db(tmp_path))
+    parent = _create(lg, "it-parent", "ticket", "parent")
+    child = _create(lg, "it-child", "ticket", "child")
+    link = _append(
+        lg, "item.linked", {"rel": "child-of", "target": "it-parent"}, "it-child", "l-child"
+    )
+    card = project_card(lg, "it-parent", full=True)
+    lg.close()
+    assert card.children[0]["status"] == "open"
+    assert card.source_event_ids == tuple(sorted({parent.id, child.id, link.id}))
+
+
+def test_full_card_child_linked_twice_names_the_resolved_link(tmp_path: Path) -> None:
+    lg = open_ledger(_db(tmp_path))
+    parent = _create(lg, "it-parent", "ticket", "parent")
+    _create(lg, "it-other", "ticket", "other")
+    child = _create(lg, "it-child", "ticket", "child")
+    first = _append(
+        lg, "item.linked", {"rel": "child-of", "target": "it-parent"}, "it-child", "l-1"
+    )
+    moved = _append(
+        lg, "item.linked",
+        {"rel": "child-of", "target": "it-other", "moved_from": "it-parent"},
+        "it-child", "l-2",
+    )
+    back = _append(
+        lg, "item.linked",
+        {"rel": "child-of", "target": "it-parent", "moved_from": "it-other"},
+        "it-child", "l-3",
+    )
+    card = project_card(lg, "it-parent", full=True)
+    other = project_card(lg, "it-other", full=True)
+    lg.close()
+    # v_items resolves the child's anchor from its latest child-of link.
+    assert [row["item_id"] for row in card.children] == ["it-child"]
+    assert card.source_event_ids == tuple(sorted({parent.id, child.id, back.id}))
+    assert first.id not in card.source_event_ids
+    assert moved.id not in card.source_event_ids
+    assert other.children == ()
+    assert child.id not in other.source_event_ids
+
+
+def test_bounded_card_source_ids_unchanged_by_child_rows(tmp_path: Path) -> None:
+    lg = open_ledger(_db(tmp_path))
+    parent, child, state, link = _child_ledger(lg)
+    card = project_card(lg, "it-parent")
+    unbounded = project_item(lg, "it-parent")
+    lg.close()
+    assert [row["item_id"] for row in card.children] == ["it-child"]
+    assert card.source_event_ids == (parent.id,)
+    assert unbounded.source_event_ids == (parent.id,)
+    assert card.source_omitted == 0
+
+
+def test_card_json_child_rows_keep_their_keys(tmp_path: Path, monkeypatch) -> None:
+    db = str(_db(tmp_path))
+    lg = open_ledger(db)
+    _child_ledger(lg)
+    lg.close()
+    expected = [
+        {"item_id": "it-child", "title": "child", "status": "claimed", "holder": "tester"}
+    ]
+    for argv in (["card", "it-parent"], ["card", "--full", "it-parent"]):
+        code, out, err = invoke(monkeypatch, ["--json", "--db", db, *argv])
+        assert code == 0, err
+        rows = json.loads(out)["data"]["children"]
+        assert [sorted(row) for row in rows] == [["holder", "item_id", "status", "title"]]
+        assert rows == expected
+
+
+def _append_after_events_read(lg, db, append):
+    """Make ``append`` land through a second connection right after the
+    projection's first ``events`` read, before any later read.
+
+    The injection is the test-local ledger's own ``events`` method; the writer
+    is another connection to the same file, as a concurrent process would be.
+    """
+    writer = open_ledger(db)
+    read = lg.events
+    landed = []
+
+    def events(*args, **kwargs):
+        result = read(*args, **kwargs)
+        if not landed:
+            landed.append(append(writer))
+        return result
+
+    lg.events = events
+    return writer, landed
+
+
+def test_full_card_child_link_race_reads_one_snapshot(tmp_path: Path) -> None:
+    db = _db(tmp_path)
+    lg = open_ledger(db)
+    parent = _create(lg, "it-parent", "ticket", "parent")
+    child = _create(lg, "it-child", "ticket", "child")
+    writer, landed = _append_after_events_read(
+        lg,
+        db,
+        lambda w: _append(
+            w, "item.linked", {"rel": "child-of", "target": "it-parent"}, "it-child", "l-race"
+        ),
+    )
+    card = project_card(lg, "it-parent", full=True)
+    assert len(landed) == 1
+    # The link committed mid-projection; the card is the state before it.
+    assert card.revision_id == child.id
+    assert card.children == ()
+    assert card.source_event_ids == (parent.id,)
+    assert max(card.source_event_ids) <= card.revision_id
+    # A fresh projection sees the link, with every source in its own revision.
+    del lg.events
+    after = project_card(lg, "it-parent", full=True)
+    writer.close()
+    lg.close()
+    assert [row["item_id"] for row in after.children] == ["it-child"]
+    assert after.source_event_ids == tuple(sorted({parent.id, child.id, landed[0].id}))
+    assert max(after.source_event_ids) <= after.revision_id == landed[0].id
+
+
+def test_full_card_child_state_race_reads_one_snapshot(tmp_path: Path) -> None:
+    db = _db(tmp_path)
+    lg = open_ledger(db)
+    parent = _create(lg, "it-parent", "ticket", "parent")
+    child = _create(lg, "it-child", "ticket", "child")
+    link = _append(
+        lg, "item.linked", {"rel": "child-of", "target": "it-parent"}, "it-child", "l-child"
+    )
+    writer, landed = _append_after_events_read(
+        lg,
+        db,
+        lambda w: _append(
+            w, "item.state", {"status": "claimed", "owner": "tester"}, "it-child", "s-race"
+        ),
+    )
+    card = project_card(lg, "it-parent", full=True)
+    writer.close()
+    lg.close()
+    assert len(landed) == 1
+    state = landed[0]
+    # The child row and the ids agree: the row is the open child, not the
+    # claimed one, and no id names the state event appended mid-projection.
+    assert card.revision_id == link.id
+    assert card.children == (
+        {"item_id": "it-child", "title": "child", "status": "open", "holder": None},
+    )
+    assert card.source_event_ids == tuple(sorted({parent.id, child.id, link.id}))
+    assert state.id not in card.source_event_ids
+    assert max(card.source_event_ids) <= card.revision_id
+
+
+def test_card_projection_keeps_a_callers_transaction(tmp_path: Path) -> None:
+    lg = open_ledger(_db(tmp_path))
+    _child_ledger(lg)
+    conn = lg._conn
+    # With no caller transaction, the projection ends the one it opened.
+    project_card(lg, "it-parent", full=True)
+    assert not conn.in_transaction
+    conn.execute("BEGIN")
+    full = project_card(lg, "it-parent", full=True)
+    assert conn.in_transaction
+    bounded = project_card(lg, "it-parent")
+    assert conn.in_transaction
+    project_item(lg, "it-parent", full=True)
+    assert conn.in_transaction
+    conn.execute("ROLLBACK")
+    lg.close()
+    assert [row["item_id"] for row in full.children] == ["it-child"]
+    assert [row["item_id"] for row in bounded.children] == ["it-child"]
+
+
+def test_card_projection_ends_its_snapshot_on_an_exception(tmp_path: Path) -> None:
+    lg = open_ledger(_db(tmp_path))
+    _child_ledger(lg)
+    conn = lg._conn
+
+    def broken(*args, **kwargs):
+        assert conn.in_transaction
+        raise OSError("events read failed")
+
+    lg.events = broken
+    with pytest.raises(OSError, match="events read failed"):
+        project_card(lg, "it-parent", full=True)
+    assert not conn.in_transaction
+    with pytest.raises(OSError, match="events read failed"):
+        project_item(lg, "it-parent")
+    assert not conn.in_transaction
+    lg.close()
+
+
+def _append_after_item_read(lg, db, append):
+    """Make ``append`` land through a second connection right after the
+    caller's first ``item`` read, before any later read.
+
+    The injection is the test-local ledger's own ``item`` method; the writer
+    is another connection to the same file, as a concurrent process would be.
+    """
+    writer = open_ledger(db)
+    read = lg.item
+    landed = []
+
+    def item(*args, **kwargs):
+        row = read(*args, **kwargs)
+        if not landed:
+            landed.extend(append(writer))
+        return row
+
+    lg.item = item
+    return writer, landed
+
+
+def test_item_spec_moved_reads_one_snapshot(tmp_path: Path) -> None:
+    db = _db(tmp_path)
+    lg = open_ledger(db)
+    _create(lg, "it-s", "ticket", "spec")
+    set_spec(lg, "it-s", {"title": "T", "body_md": "one"}, harness="pytest")
+    _append(
+        lg,
+        "item.state",
+        {"status": "claimed", "owner": "tester", "spec_version": 1},
+        "it-s",
+        "s-claim",
+    )
+    # Before the writes: claimed against v1, and v1 is current.
+    assert item_spec_moved(lg, "it-s") is None
+
+    def release_then_move(w):
+        release = _append(w, "item.state", {"status": "open"}, "it-s", "s-release")
+        spec, created = set_spec(w, "it-s", {"title": "T", "body_md": "two"}, harness="pytest")
+        assert created
+        return [release, spec]
+
+    writer, landed = _append_after_item_read(lg, db, release_then_move)
+    moved = item_spec_moved(lg, "it-s")
+    assert len(landed) == 2
+    # Every state the store passed through says no line: claimed on v1 with
+    # v1 current, then released, then released with v2 current. The claimed
+    # row read before the writes with the v2 spec read after them would say
+    # "spec moved: v1 → v2", which matches none of them.
+    assert moved is None
+    del lg.item
+    assert item_spec_moved(lg, "it-s") is None
+    assert lg.item("it-s")["status"] == "open"
+    writer.close()
+    lg.close()
+
+
+def test_project_item_reads_its_row_in_the_snapshot(tmp_path: Path) -> None:
+    db = _db(tmp_path)
+    lg = open_ledger(db)
+    created = _create(lg, "it-r", "ticket", "row")
+    writer, landed = _append_after_item_read(
+        lg,
+        db,
+        lambda w: [
+            _append(w, "item.state", {"status": "claimed", "owner": "tester"}, "it-r", "s-race")
+        ],
+    )
+    card = project_item(lg, "it-r", full=True)
+    assert len(landed) == 1
+    state = landed[0]
+    # The claim committed right after the row read; the card is the state
+    # before it, row and events alike.
+    assert (card.status, card.owner) == ("open", None)
+    assert card.revision_id == created.id
+    assert card.source_event_ids == (created.id,)
+    del lg.item
+    after = project_item(lg, "it-r", full=True)
+    assert (after.status, after.owner) == ("claimed", "tester")
+    assert after.revision_id == state.id
+    assert after.source_event_ids == (created.id, state.id)
+    with pytest.raises(KeyError):
+        project_item(lg, "it-missing")
+    assert not lg._conn.in_transaction
+    writer.close()
+    lg.close()
+
+
+def test_full_card_names_the_blocks_link_behind_a_blockers_row(tmp_path: Path) -> None:
+    lg = open_ledger(_db(tmp_path))
+    created = _create(lg, "it-a", "ticket", "a")
+    _create(lg, "it-b", "ticket", "b")
+    link = _append(lg, "item.linked", {"rel": "blocks", "target": "it-a"}, "it-b", "l-b")
+    state = _append(lg, "item.state", {"status": "claimed", "owner": "tester"}, "it-a", "s-a")
+    # Only it-b's link names the blocker.
+    card = project_card(lg, "it-a", full=True)
+    assert card.blockers == ("it-b",)
+    assert card.inbound_blockers == ("it-b",)
+    assert "\n## Blockers\n- it-b\n" in format_card(card)
+    assert link.id in card.source_event_ids
+    assert card.source_event_ids == (created.id, link.id, state.id)
+    # This item's own state names the blocker too: the link stays a source.
+    named = _append(
+        lg, "item.state", {"status": "blocked", "blocked_by": ["it-b"]}, "it-a", "s-named"
+    )
+    card = project_card(lg, "it-a", full=True)
+    assert card.blockers == ("it-b",)
+    assert card.inbound_blockers == ()
+    assert card.source_event_ids == (created.id, link.id, named.id)
+    # A later "blocked" state that does not restate the set carries it
+    # forward; the state that named the blocker stays a source.
+    carried = _append(lg, "item.state", {"status": "blocked"}, "it-a", "s-carried")
+    card = project_card(lg, "it-a", full=True)
+    assert card.blockers == ("it-b",)
+    assert card.source_event_ids == (created.id, link.id, named.id, carried.id)
+    # A closed blocker leaves the row, and its link leaves the sources.
+    _append(lg, "item.state", {"status": "closed"}, "it-b", "s-b-closed")
+    card = project_card(lg, "it-a", full=True)
+    assert card.blockers == ()
+    assert card.source_event_ids == (created.id, carried.id)
+    lg.close()
+
+
+def test_full_card_names_the_state_behind_a_named_blocker(tmp_path: Path) -> None:
+    lg = open_ledger(_db(tmp_path))
+    created = _create(lg, "it-a", "ticket", "a")
+    named = _append(
+        lg, "item.state", {"status": "blocked", "blocked_by": ["it-x"]}, "it-a", "s-named"
+    )
+    carried = _append(lg, "item.state", {"status": "blocked"}, "it-a", "s-carried")
+    card = project_card(lg, "it-a", full=True)
+    assert card.blockers == ("it-x",)
+    assert card.source_event_ids == (created.id, named.id, carried.id)
+    lg.close()
+
+
+def test_a_blockers_row_without_a_source_is_refused() -> None:
+    sources = {"state_event_id": None, "link_event_ids": ()}
+    with pytest.raises(RuntimeError, match="blocker it-b of it-a has no source event"):
+        _blocker_source_ids("it-a", [("it-b", sources)])
+    named = {"state_event_id": 4, "link_event_ids": (3, 5)}
+    assert _blocker_source_ids("it-a", [("it-b", named)]) == {3, 4, 5}

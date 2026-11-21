@@ -1,4 +1,4 @@
-"""Render a bounded resume card for one item."""
+"""Render a bounded resume card for one item, or with ``--full`` every row of it."""
 from __future__ import annotations
 
 import os
@@ -7,7 +7,7 @@ import tempfile
 from ledger.card import format_card, project_card
 from ledger.paths import resolve_db_path
 from ledger.pointers import sidecar_from_env
-from ledger.verbs import Context, Result, Verb, open_db, require_item
+from ledger.verbs import Context, Result, Verb, invocation_prefix, open_db, require_item
 
 
 def add_arguments(parser) -> None:
@@ -17,13 +17,25 @@ def add_arguments(parser) -> None:
         metavar="PATH",
         help="write a human markdown copy to PATH (overwrites PATH if it exists)",
     )
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="the same card unbounded: every row and every word, no caps and no cut markers",
+    )
 
 
 def run(args, ctx: Context) -> Result:
     lg = open_db(ctx, write=False)
     try:
         require_item(lg, args.item)
-        card = project_card(lg, args.item, pointers=sidecar_from_env())
+        card = project_card(
+            lg,
+            args.item,
+            pointers=sidecar_from_env(),
+            program=invocation_prefix(ctx.program, str(lg.path), ctx.db_explicit),
+            full=args.full,
+            lease_status=True,
+        )
         text = format_card(card)
         data = card.as_dict()
     finally:
