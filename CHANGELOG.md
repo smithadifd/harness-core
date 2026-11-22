@@ -3,6 +3,40 @@
 Each tag of this repository gets an entry: what changed in the vendored files,
 and any pin move of the vendored ledger.
 
+## v0.3.0
+
+Everything merged since v0.2.0. Neither plugin moves, so a machine that
+installed v0.2.0 keeps the same plugin builds when it moves to this tag:
+`harness` and `rails` stay at 0.2.0. The marketplace's `ledger-hooks` pin
+moves from ledger `v0.4.0` to `v0.6.1`, and `ledger-vendor.pin` and the
+vendored `skills/_lib/ledger` copy move from `v0.1.13` to `v0.6.1`. The
+marketplace's `sdlc` pin stays at skills `v1.5.0`.
+
+The pin and the vendored ledger (#29):
+
+- Installing this tag gets ledger `v0.6.1` for `ledger-hooks` (plugin list
+  version 0.6.1) and for the copy under `skills/_lib/ledger`. The three
+  plugin options are unchanged, and v0.6.1 adds no new hook. No new SQL
+  migration: first open of an existing database still applies only
+  migrations already present at `v0.1.13`.
+- The search index format is 4. An index built by an earlier version reads
+  as stale; the next `search`, `index` or `doctor` rebuilds it. `doctor`
+  now brings the index up to date before it reports it.
+- Generic writers refuse these reserved event kinds: `review.receipt` and
+  `review.grant-cite` (review rounds), and `review.merge-intent` and
+  `review.merge-done` (merge write-ahead). `review.recorded` stays an
+  ordinary kind.
+- The vendored copy ships new verbs including `claim-system`, `capture`,
+  `contract`, `doc`, `links`, `ask-display`, `search-miss` and
+  `search-audit`.
+
+No plugin change:
+
+- `scripts/check-no-person.py` allows one tokenized `os.open` of the
+  document-root home attribute in the vendored ledger's `verbs/doc.py` (#29).
+- The core window and pool tables register Fable 5.2 (#30).
+- The README's named current tag moves to `v0.3.0`.
+
 ## v0.2.0
 
 Everything merged since v0.1.6. Both plugins move, so a machine that installed
