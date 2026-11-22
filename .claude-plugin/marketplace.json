@@ -32,8 +32,8 @@
         "source": "git-subdir",
         "url": "https://github.com/smithadifd/ledger.git",
         "path": "plugins/ledger-hooks",
-        "ref": "v0.6.1",
-        "sha": "ac8b7aa9f8a4f40a329dbf9a63c757435c0fc8c6"
+        "ref": "v0.6.3",
+        "sha": "f6021b4796f3a3f1fc931bec7ae70a1162bc9cf1"
       }
     }
   ]

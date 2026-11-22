@@ -131,6 +131,7 @@ skills/_lib/ledger/tests/test_session_model.py
 skills/_lib/ledger/tests/test_source_locator.py
 skills/_lib/ledger/tests/test_spec_expect_revision.py
 skills/_lib/ledger/tests/test_spec_read_harness.py
+skills/_lib/ledger/tests/test_spec_title_projection.py
 skills/_lib/ledger/tests/test_utterance_origin.py
 skills/_lib/ledger/tests/test_verb_discovery.py
 skills/_lib/ledger/tests/test_verb_plugins.py

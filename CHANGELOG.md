@@ -3,6 +3,38 @@
 Each tag of this repository gets an entry: what changed in the vendored files,
 and any pin move of the vendored ledger.
 
+## v0.3.1
+
+Everything merged since v0.3.0. Neither plugin moves, so a machine that
+installed v0.3.0 keeps the same plugin builds when it moves to this tag:
+`harness` and `rails` stay at 0.2.0. The marketplace's `ledger-hooks` pin
+moves from ledger `v0.6.1` to `v0.6.3`, and `ledger-vendor.pin` and the
+vendored `skills/_lib/ledger` copy move from `v0.6.1` to `v0.6.3`. The
+marketplace's `sdlc` pin stays at skills `v1.5.0`.
+
+The pin and the vendored ledger:
+
+- Installing this tag gets ledger `v0.6.3` for `ledger-hooks` (plugin list
+  version 0.6.3) and for the copy under `skills/_lib/ledger`. The three
+  plugin options are unchanged, and v0.6.2 and v0.6.3 add no new hook. No
+  new SQL migration: schema 10 in both v0.6.1 and v0.6.3, verified from the
+  ledger diff `v0.6.1..v0.6.3` (no file under `ledger/migrations` changes).
+- The search index format is 4 in both v0.6.1 and v0.6.3, verified from the
+  same diff (`INDEX_FORMAT` stays 4). An index built at v0.6.1 stays current.
+- Ledger v0.6.2: `card`, `query`, `ready` and children rows show the newest
+  spec title (the same version `spec show` prints). An item with no usable
+  spec title still prints the created title. `card --full` names each child's
+  newest `item.spec` event in `source_event_ids`. No new verb, flag or hook.
+- Ledger v0.6.3: `context` related-item clip notes cite the spec event that
+  holds the printed title (`full text in event <spec>`) instead of the
+  created event. An item with no usable spec title still cites
+  `item.created`. `links --json` `data.title` and `resume --item` keep
+  printing the newest spec title. No new verb, flag or hook.
+
+No plugin change:
+
+- The README's named current tag moves to `v0.3.1`.
+
 ## v0.3.0
 
 Everything merged since v0.2.0. Neither plugin moves, so a machine that
