@@ -13,11 +13,16 @@ from __future__ import annotations
 
 from ledger.verbs import append
 from ledger.verbs import append_many
+from ledger.verbs import ask_display
 from ledger.verbs import backup
+from ledger.verbs import capture
 from ledger.verbs import card
 from ledger.verbs import claim
+from ledger.verbs import claim_system
 from ledger.verbs import context
+from ledger.verbs import contract
 from ledger.verbs import decisions
+from ledger.verbs import doc
 from ledger.verbs import doctor
 from ledger.verbs import elect
 from ledger.verbs import entities
@@ -29,6 +34,7 @@ from ledger.verbs import grants
 from ledger.verbs import guidance
 from ledger.verbs import index
 from ledger.verbs import link
+from ledger.verbs import links
 from ledger.verbs import lint_quotes
 from ledger.verbs import new
 from ledger.verbs import note
@@ -39,6 +45,8 @@ from ledger.verbs import ready
 from ledger.verbs import restore
 from ledger.verbs import resume
 from ledger.verbs import search
+from ledger.verbs import search_audit
+from ledger.verbs import search_miss
 from ledger.verbs import spec
 from ledger.verbs import state
 from ledger.verbs import verify
@@ -46,11 +54,16 @@ from ledger.verbs import verify
 MODULES = (
     append,
     append_many,
+    ask_display,
     backup,
+    capture,
     card,
     claim,
+    claim_system,
     context,
+    contract,
     decisions,
+    doc,
     doctor,
     elect,
     entities,
@@ -62,6 +75,7 @@ MODULES = (
     guidance,
     index,
     link,
+    links,
     lint_quotes,
     new,
     note,
@@ -72,6 +86,8 @@ MODULES = (
     restore,
     resume,
     search,
+    search_audit,
+    search_miss,
     spec,
     state,
     verify,

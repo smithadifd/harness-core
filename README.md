@@ -224,7 +224,7 @@ plugin's release tag names now, and fails when it is not the pinned commit
 
 **Status at this tag.** Setup stores three options on the ledger plugin and
 makes the first ledger write through the ledger plugin's `ledger` command. The
-ledger plugin pinned here (`v0.4.0`) declares those three options
+ledger plugin pinned here (`v0.6.1`) declares those three options
 (`ledger_db`, `ledger_operator` and `ledger_harness`) and ships the `ledger`
 command, so `/harness:setup` gets past its ledger options step. The skills
 plugin pinned here is `sdlc` at `v1.5.0` (commit
@@ -264,7 +264,7 @@ The list shows `harness`, `sdlc` and `ledger-hooks` enabled. Its version
 column is each plugin's own version, not this repository's tag: `harness` and
 `rails` show 0.2.0, the version in their manifests at this repository's tag,
 and `sdlc` shows 0.15.0, which is the skills release `v1.5.0` at the pinned
-commit; `ledger-hooks` shows 0.4.0, which is the ledger release `v0.4.0` at
+commit; `ledger-hooks` shows 0.6.1, which is the ledger release `v0.6.1` at
 the pinned commit. Start a new session, or run `/reload-plugins` in an
 open one, to load them. On its first run in a folder, Claude Code asks whether
 you trust it, and the highlighted answer is "No, exit": move to "Yes" before

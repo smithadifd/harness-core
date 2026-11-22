@@ -108,9 +108,16 @@ def test_every_v1_kind_is_registered() -> None:
         "ledger.system",
         # set_spec alone writes it (test_item_spec covers it).
         "item.spec",
+        # attach_document alone writes it (test_doc_verb covers it).
+        "doc.attached",
         # the entity verb alone writes them (test_entities covers them).
         "entity.registered",
         "entity.state",
+        # the receipt writer alone writes them (test_receipt_*.py cover them).
+        "review.receipt",
+        "review.grant-cite",
+        "review.merge-intent",
+        "review.merge-done",
     }
 
 
@@ -121,6 +128,25 @@ def test_valid_payload_appends(tmp_path: Path, kind: str) -> None:
     assert event.kind == kind
     assert event.payload == VALID_PAYLOADS[kind]
     lg.verify()
+
+
+@pytest.mark.parametrize(
+    ("payload", "reason"),
+    [
+        ({"point": "waiting"}, "missing-key:phase"),
+        ({"point": "waiting", "phase": 1}, "bad-type:phase"),
+    ],
+)
+def test_stopped_phase_errors_name_allowed_values(tmp_path, payload, reason) -> None:
+    lg = open_ledger(_db(tmp_path))
+    with pytest.raises(ValidationError) as caught:
+        lg.append(
+            kind="item.stopped",
+            payload=payload,
+            idempotency_key=f"k-{reason}",
+            item_id="item-1",
+        )
+    assert str(caught.value) == f"{reason}; allowed: orient, plan, build, review, close"
 
 
 def test_unknown_kind_refused(tmp_path: Path) -> None:
@@ -574,9 +600,9 @@ def test_schema_version_recorded_and_migrate_is_idempotent(tmp_path: Path) -> No
 
 def test_loop_identity_migration_preserves_existing_events(tmp_path: Path) -> None:
     path = _db(tmp_path)
-    conn = connect(path)
+    conn, proof = connect(path)
     migrate(conn, load_migrations()[:2])
-    legacy = Ledger(conn, path)
+    legacy = Ledger(conn, path, proof)
     created = legacy.append(
         kind="item.created",
         payload={"type": "ticket", "title": "existing item"},
@@ -604,9 +630,9 @@ def test_v1_migration_preserves_other_ask_with_shared_question_id(
     tmp_path: Path,
 ) -> None:
     path = _db(tmp_path)
-    conn = connect(path)
+    conn, proof = connect(path)
     migrate(conn, load_migrations()[:1])
-    lg = Ledger(conn, path)
+    lg = Ledger(conn, path, proof)
     lg.append(
         kind="item.created",
         payload={"type": "decision", "title": "two questions"},

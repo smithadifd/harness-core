@@ -17,8 +17,10 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, Callable, Iterable, Mapping
 
+from ledger.dbfile import UnsafeDatabaseFile
 from ledger.paths import SharedDatabaseError
 from ledger.schema import ValidationError
+from ledger.session_model import resolve_model
 from ledger.store import (
     ChainBroken,
     ForestRefusal,
@@ -34,6 +36,7 @@ from ledger.verbs import (
     EXIT_REFUSED,
     EXIT_STALE,
     EXIT_USAGE,
+    VERSION_LINE,
     CliError,
     Context,
     Result,
@@ -41,6 +44,7 @@ from ledger.verbs import (
     Verb,
     compose_actor,
     discover_verbs,
+    quote_command_arg,
 )
 
 
@@ -56,9 +60,27 @@ def _env(name: str) -> str | None:
     return value
 
 
+def _program_name() -> str:
+    configured = _env("LEDGER_PROG")
+    if configured and not any(char in configured for char in "\r\n"):
+        return configured
+    try:
+        started = Path(sys.argv[0])
+        if started.name == "__main__.py":
+            if started.parent.name == "ledger":
+                return "python3 -m ledger"
+            return "ledger"
+        return quote_command_arg(started.name or "ledger")
+    except (OSError, TypeError, ValueError):
+        return "ledger"
+
+
 def build_parser(table: dict[str, Verb]) -> LedgerParser:
+    # allow_abbrev=False on the parser and on every subparser: a long option
+    # matches only by its full name, so "--d" can never stand for "--db".
     parser = LedgerParser(
         prog="ledger",
+        allow_abbrev=False,
         description=(
             "Append-only item ledger. Generic writes require LEDGER_HARNESS; "
             "loop-reserved events use the internal library writer. Actor fields come from "
@@ -68,6 +90,11 @@ def build_parser(table: dict[str, Verb]) -> LedgerParser:
         ),
     )
     parser.add_argument(
+        "--version",
+        action="version",
+        version=VERSION_LINE,
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help="print a stable {ok, data, error} envelope",
@@ -75,7 +102,7 @@ def build_parser(table: dict[str, Verb]) -> LedgerParser:
     parser.add_argument("--db", help="database path (overrides LEDGER_DB)")
     sub = parser.add_subparsers(dest="verb", required=True)
     for name, verb in sorted(table.items()):
-        subparser = sub.add_parser(name, help=verb.help)
+        subparser = sub.add_parser(name, help=verb.help, allow_abbrev=False)
         subparser.add_argument(
             "--json",
             action="store_true",
@@ -109,15 +136,32 @@ def _fail(json_mode: bool, code: str, message: str, exit_code: int) -> int:
     return exit_code
 
 
+def _write_raw(raw: bytes) -> None:
+    """Write ``raw`` to standard output exactly: no newline, no envelope."""
+    sys.stdout.flush()
+    buffer = getattr(sys.stdout, "buffer", None)
+    if buffer is None:
+        # A text-only stream an embedding caller supplied: the bytes as text,
+        # undecodable ones kept as surrogate escapes.
+        sys.stdout.write(raw.decode("utf-8", errors="surrogateescape"))
+        return
+    buffer.write(raw)
+    buffer.flush()
+
+
 def _ok(json_mode: bool, result: Result) -> int:
     if json_mode:
-        print(
-            json.dumps(
-                {"data": result.data, "error": None, "ok": True},
-                sort_keys=True,
-                default=str,
-            )
-        )
+        if result.error_code is not None:
+            envelope = {
+                "data": result.data,
+                "error": {"code": result.error_code, "message": result.text},
+                "ok": False,
+            }
+        else:
+            envelope = {"data": result.data, "error": None, "ok": True}
+        print(json.dumps(envelope, sort_keys=True, default=str))
+    elif result.raw is not None:
+        _write_raw(result.raw)
     elif result.text:
         sys.stdout.write(result.text if result.text.endswith("\n") else result.text + "\n")
     return result.exit_code
@@ -167,6 +211,7 @@ def _run(
     verb: Verb = args._verb
     operator = _env("LEDGER_OPERATOR")
     agent = _env("LEDGER_AGENT")
+    session = _env("LEDGER_SESSION")
     ctx = Context(
         db=db,
         json_mode=json_mode,
@@ -174,14 +219,21 @@ def _run(
         operator=operator,
         agent=agent,
         harness=_env("LEDGER_HARNESS"),
-        model=_env("LEDGER_MODEL"),
-        session=_env("LEDGER_SESSION"),
+        # The session's own model record beside the database wins over
+        # LEDGER_MODEL (ledger/session_model.py). Resolved once, so one
+        # invocation stamps one model on every event it writes.
+        model=resolve_model(db, session, _env("LEDGER_MODEL")),
+        session=session,
         roadmap_parser=roadmap_parser,
         search_fallback_root=search_fallback_root,
+        program=_program_name(),
+        # Decided from the parse: the database was passed on the command line.
+        db_explicit=bool(args.db),
     )
     if verb.writes and not ctx.harness:
         raise CliError(
-            "LEDGER_HARNESS is required for writes",
+            "LEDGER_HARNESS is required for writes; set it, e.g. "
+            "LEDGER_HARNESS=claude-code",
             code="missing_harness",
             exit_code=EXIT_REFUSED,
         )
@@ -218,6 +270,8 @@ def main(
         return _fail(json_mode, exc.code, str(exc), EXIT_USAGE)
     except CliError as exc:
         return _fail(json_mode, exc.code, str(exc), exc.exit_code)
+    except UnsafeDatabaseFile as exc:
+        return _fail(json_mode, exc.code, str(exc), EXIT_REFUSED)
     except SyncPathError as exc:
         return _fail(json_mode, "synced_path", str(exc), EXIT_REFUSED)
     except SharedDatabaseError as exc:

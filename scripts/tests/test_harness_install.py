@@ -1000,7 +1000,7 @@ def test_the_v0_2_0_entry_names_each_plugin_move_and_the_manifests_carry_it():
     assert "No pin move" in entry
     sources = {e["name"]: e["source"] for e in marketplace_manifest()["plugins"]
                if isinstance(e["source"], dict)}
-    assert sources["sdlc"]["ref"] == "v1.5.0" and sources["ledger-hooks"]["ref"] == "v0.4.0"
+    assert sources["sdlc"]["ref"] == "v1.5.0" and sources["ledger-hooks"]["ref"] == "v0.6.1"
 
 
 def test_the_readme_and_changelog_do_not_use_the_word_builder():

@@ -1,6 +1,8 @@
 """Query current items with filters and a bounded row cap."""
 from __future__ import annotations
 
+from ledger import lease
+from ledger.card import _read_snapshot
 from ledger.search import in_window, newest_event_times
 from ledger.verbs import (
     DEFAULT_LIMIT,
@@ -12,7 +14,9 @@ from ledger.verbs import (
     Verb,
     format_items,
     item_dict,
+    lease_rows,
     open_db,
+    read_item,
     resolve_limit,
 )
 from ledger.verbs.search import UNTIL_HELP, when_option
@@ -26,6 +30,24 @@ def add_arguments(parser) -> None:
         "--parent",
         metavar="ITEM",
         help="only the children of ITEM (items whose current child-of anchor is ITEM)",
+    )
+    parser.add_argument(
+        "--duplicate-of",
+        dest="duplicate_of",
+        metavar="ITEM",
+        help="only the duplicates of ITEM (other items with a duplicate-of link to ITEM)",
+    )
+    parser.add_argument(
+        "--blocks",
+        metavar="ITEM",
+        help="only the items that block ITEM (items with a blocks link to ITEM), "
+        "whatever their status",
+    )
+    parser.add_argument(
+        "--open",
+        action="store_true",
+        help="only the items that are not closed (open, claimed or blocked); with "
+        "--blocks, the blockers a card counts",
     )
     parser.add_argument(
         "--since",
@@ -65,9 +87,33 @@ def run(args, ctx: Context) -> Result:
                     "SELECT item_id, recorded_at FROM events WHERE item_id IS NOT NULL"
                 )
             )
+        duplicates: set[str] = set()
+        blocking: set[str] = set()
+        if args.duplicate_of is not None or args.blocks is not None:
+            # The rows a card's Links and Blockers hold in other items' events.
+            for event in lg.events(kind="item.linked"):
+                rel = event.payload.get("rel")
+                target = event.payload.get("target")
+                if (
+                    rel == "duplicate-of"
+                    and target == args.duplicate_of
+                    and event.item_id != target
+                ):
+                    duplicates.add(event.item_id)
+                if rel == "blocks" and target == args.blocks:
+                    blocking.add(event.item_id)
         matched = []
-        for row in lg.items_with_revision():
-            item = item_dict(row)
+        moment = lease.now()
+        with _read_snapshot(lg):
+            rows = lg.items_with_revision()
+            leases = lease_rows(lg)
+        for row in rows:
+            # The status a reader acts on: an expired claim reads open.
+            held = leases.get(row["item_id"])
+            item = read_item(item_dict(row), held, at=moment)
+            age = lease.stale_age(held, at=moment) if item["recorded_status"] == "claimed" else None
+            item["stale_claim"] = age is not None
+            item["claim_age_seconds"] = age
             item["revision"] = row["revision"]
             item["parent_id"] = row["parent_id"]
             item["children_open"] = row["children_open"]
@@ -77,7 +123,13 @@ def run(args, ctx: Context) -> Result:
                 continue
             if args.status and item["status"] != args.status:
                 continue
+            if args.open and item["status"] == "closed":
+                continue
             if args.parent is not None and row.get("parent_id") != args.parent:
+                continue
+            if args.duplicate_of is not None and item["item_id"] not in duplicates:
+                continue
+            if args.blocks is not None and item["item_id"] not in blocking:
                 continue
             if not in_window(newest.get(item["item_id"], (None,))[0], since, until):
                 continue

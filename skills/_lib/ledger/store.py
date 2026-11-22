@@ -28,32 +28,50 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping, Sequence
+from typing import Any, Callable, Collection, Iterator, Mapping, Sequence
 
+from .dbfile import OpenProof, checked_connect, precheck_files, verify_bound
 from .decisions import check_event as check_decision_event
 from .decisions import decision_records
 from .paths import SharedDatabaseError, SyncPathError, SyncPathWarning, resolve_db_path
 from .schema import (
+    CAPTURE_CHANNEL_PREFIX,
+    CAPTURE_CHANNELS,
+    DOC_KIND,
     ENTITY_REGISTERED_KIND,
     ENTITY_STATE_KIND,
+    PICKER_CHANNEL,
+    RECEIPT_KINDS,
     SPEC_KIND,
     SYSTEM_CLAIM_KIND,
     ValidationError,
+    refuse_display_control_characters,
     validate_item_id,
     validate_payload,
 )
 
 BUSY_TIMEOUT_MS = 5_000
 APPEND_RETRIES = 8
+# Settling a claim after ``UnsettledClaimError`` (``Ledger.claim_outcome``):
+# up to CLAIM_SETTLE_ATTEMPTS checkpoints, none started after
+# CLAIM_SETTLE_SECONDS. Each waits at most CLAIM_SETTLE_WAIT_MS on other
+# connections, with CLAIM_SETTLE_PAUSE_SECONDS between attempts.
+CLAIM_SETTLE_ATTEMPTS = 5
+CLAIM_SETTLE_SECONDS = 1.0
+CLAIM_SETTLE_WAIT_MS = 150
+CLAIM_SETTLE_PAUSE_SECONDS = 0.05
 GENESIS_HASH = "0" * 64
 _MIGRATION_NAME = re.compile(r"^(\d{4})_[a-z0-9_]+\.sql$")
 _RECORDED_AT = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$")
 RESERVED_KIND_PREFIX = "loop."
 # Kinds one writer owns: claim_system writes the system claim, set_spec
-# (verbs/spec.py) writes item.spec, and register_entity and set_entity_state
-# (verbs/entity.py) write the entity kinds. Generic appends refuse them.
+# (verbs/spec.py) writes item.spec, the document writers (verbs/doc.py) write
+# doc.attached, register_entity and set_entity_state (verbs/entity.py) write
+# the entity kinds, and the receipt writer (receipts.py) writes the
+# reserved review records. Generic appends refuse them. Each
+# kind is reserved by its exact name: review.recorded stays a generic kind.
 ENTITY_KINDS = (ENTITY_REGISTERED_KIND, ENTITY_STATE_KIND)
-RESERVED_KINDS = (SYSTEM_CLAIM_KIND, SPEC_KIND, *ENTITY_KINDS)
+RESERVED_KINDS = (SYSTEM_CLAIM_KIND, SPEC_KIND, DOC_KIND, *ENTITY_KINDS, *RECEIPT_KINDS)
 RESERVED_NOTE_PREFIXES = ("work:", "loop:")
 
 # Non-Cf members of Unicode's Default_Ignorable_Code_Point property. Cf
@@ -146,6 +164,15 @@ def _opt_str(value: Any, name: str) -> str | None:
     return value
 
 
+def restore_needs_accept_flag(kind: str) -> bool:
+    """Whether an exported event of ``kind`` restores only with
+    ``--accept-loop-events`` (library: ``accept_loop_events``), after the
+    export's stream digest is checked: the loop kinds and the review receipt
+    kinds. ``replay_events`` refuses them outright. The one rule restore,
+    replay and the restore drill read."""
+    return kind.startswith(RESERVED_KIND_PREFIX) or kind in RECEIPT_KINDS
+
+
 def _is_busy(exc: BaseException) -> bool:
     if not isinstance(exc, sqlite3.OperationalError):
         return False
@@ -230,6 +257,39 @@ def _recorded_versions(conn: sqlite3.Connection) -> set[int]:
     return {row[0] for row in conn.execute("SELECT version FROM schema_version")}
 
 
+def is_search_index_tables(tables: Collection[str]) -> bool:
+    """Whether a database with these table names is a search index.
+
+    A search index (``search.db``) has a ``manifest`` table and no ``events``
+    table; a ledger has ``events``. This is the one rule both sides read: the
+    index writer replaces only such a file (``search._replace_verdict``), and
+    every ledger open refuses one (``_search_index_refusal``), so no ledger
+    session commits events into a file the index writer may replace.
+    """
+    return "manifest" in tables and "events" not in tables
+
+
+def _search_index_refusal(conn: sqlite3.Connection, path: Path) -> str | None:
+    """The refusal for opening ``path`` as a ledger when it is a search index.
+
+    Reads only the table names. A file that does not read as SQLite returns
+    ``None``, so it fails later exactly as it did before this check.
+    """
+    try:
+        tables = {
+            row[0]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+    except sqlite3.Error:
+        return None
+    if not is_search_index_tables(tables):
+        return None
+    return (
+        f"refusing to open {path} as a ledger: it is a search index (a manifest "
+        f"table and no events table), not a ledger"
+    )
+
+
 def _refuse_newer_schema_in_transaction(conn: sqlite3.Connection) -> None:
     """Refuse to write into a schema that a newer writer has migrated.
 
@@ -254,15 +314,28 @@ def _refuse_newer_schema_before_connect(path: Path) -> None:
     connection closes (``mode=ro`` would leave both beside a WAL database).
     The one change SQLite itself may still make is its standard recovery of a
     crashed writer's hot journal, which restores the last committed state.
+
+    The same read refuses a search index (``_search_index_refusal``), so a
+    search index at ``path`` keeps its bytes and its journal mode.
     """
-    if not path.exists():
+    if not precheck_files(path):
         return
-    conn = sqlite3.connect(f"{path.as_uri()}?mode=rw", uri=True, isolation_level=None,
-                           timeout=BUSY_TIMEOUT_MS / 1000)
+    conn, _mode, _proof = checked_connect(
+        path,
+        lambda: sqlite3.connect(
+            f"{path.as_uri()}?mode=rw",
+            uri=True,
+            isolation_level=None,
+            timeout=BUSY_TIMEOUT_MS / 1000,
+        ),
+    )
     try:
+        refusal = _search_index_refusal(conn, path)
         versions = _recorded_versions(conn)
     finally:
         conn.close()
+    if refusal is not None:
+        raise LedgerError(refusal)
     _refuse_unknown_versions(versions, load_migrations())
 
 
@@ -351,25 +424,40 @@ def migrate(conn: sqlite3.Connection, migrations: list[Migration] | None = None)
     raise LedgerError("migration retries exhausted") from last_error
 
 
-def connect(path: Path) -> sqlite3.Connection:
+def connect(path: Path) -> tuple[sqlite3.Connection, OpenProof]:
     """Open the database with WAL journaling and a busy timeout.
 
     ``PRAGMA journal_mode = WAL`` runs only when the file is not already WAL.
+    Returns the connection and the ``OpenProof`` of the files it holds, which
+    every write checks again before it is reported (``Ledger._settle_bound``).
+
+    A search index is refused (``_search_index_refusal``) before the
+    connection is returned, so nothing migrates or writes into it. This
+    catches one that appeared at ``path`` after ``open_ledger``'s first check.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     last_error: BaseException | None = None
     for attempt in range(APPEND_RETRIES):
-        conn = sqlite3.connect(str(path), isolation_level=None, timeout=BUSY_TIMEOUT_MS / 1000)
-        conn.row_factory = sqlite3.Row
+        conn: sqlite3.Connection | None = None
         try:
-            mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
-            if str(mode).lower() != "wal":
-                conn.execute("PRAGMA journal_mode = WAL")
+            conn, _mode, proof = checked_connect(
+                path,
+                lambda: sqlite3.connect(
+                    str(path), isolation_level=None, timeout=BUSY_TIMEOUT_MS / 1000
+                ),
+                set_wal=True,
+            )
+            refusal = _search_index_refusal(conn, path)
+            if refusal is not None:
+                conn.close()
+                raise LedgerError(refusal)
+            conn.row_factory = sqlite3.Row
             conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
             conn.execute("PRAGMA foreign_keys = ON")
-            return conn
+            return conn, proof
         except sqlite3.OperationalError as exc:
-            conn.close()
+            if conn is not None:
+                conn.close()
             last_error = exc
             if not _is_busy(exc) or attempt >= APPEND_RETRIES - 1:
                 raise
@@ -579,6 +667,10 @@ def _same_semantic(
     provenance_class: str | None,
     ignore_attribution: bool = False,
 ) -> bool:
+    # ``model`` is taken so every caller passes the same attribution set, but
+    # it is never compared: the model is attribution, not content, so a retry
+    # under the same key after a model switch returns the stored event, which
+    # keeps the first model.
     return (
         existing.kind == kind
         and existing.payload_version == payload_version
@@ -589,7 +681,6 @@ def _same_semantic(
             or (
                 existing.actor == actor
                 and existing.harness == harness
-                and existing.model == model
                 and existing.session == session
                 and existing.channel == channel
                 and existing.provenance_class == provenance_class
@@ -634,13 +725,55 @@ def _check_expected_revision(
     )
 
 
+class UnsettledClaimError(SharedDatabaseError):
+    """A ``Ledger.claim_system`` refusal raised where its transaction may have committed.
+
+    ``claim_system`` raises it for an I/O error during the claim's
+    transaction and for a checkpoint that cannot finish after the commit.
+    ``event`` is the claim event this call wrote inside the transaction, or
+    ``None`` when it wrote none (the system was already on record, or the
+    error came before the write). ``committed`` is ``True`` when the
+    transaction is known to have committed (only the checkpoint after it
+    failed) and ``False`` when the error came inside the transaction, where
+    the commit may or may not have landed. ``data_version`` is the
+    connection's ``PRAGMA data_version`` read inside the transaction, under
+    its write lock, or ``None`` when the error came before that read.
+    ``Ledger.claim_outcome`` re-reads the claim, retries the checkpoint and
+    settles through the open proof to decide.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        event: Event | None,
+        committed: bool,
+        data_version: int | None,
+    ):
+        super().__init__(message)
+        self.event = event
+        self.committed = committed
+        self.data_version = data_version
+
+
 class Ledger:
     """Open database handle: append, query views, verify the hash chain."""
 
-    def __init__(self, conn: sqlite3.Connection, path: Path):
+    def __init__(self, conn: sqlite3.Connection, path: Path, proof: OpenProof):
         self._conn = conn
         self.path = path
+        self._proof = proof
         self._in_batch = False
+
+    def _settle_bound(self) -> None:
+        """Refuse to report a durable write unless the path still names the proved files.
+
+        Called after every ``COMMIT`` a write makes, and after a claim's
+        checkpoint. A failure raises ``UnsafeDatabaseFile`` (``db_swapped`` or
+        ``db_sibling_unsafe``): the write landed in a file the path no longer
+        names, so it is not in the database at that path.
+        """
+        verify_bound(self._proof)
 
     def close(self) -> None:
         self._conn.close()
@@ -735,6 +868,18 @@ class Ledger:
             raise ValidationError(f"reserved-kind:{kwargs.get('kind')}")
         return self._append(internal=True, ignore_retry_attribution=False, **kwargs)
 
+    def _append_doc_event(self, capability: object, **kwargs: Any) -> Event:
+        """Append a ``doc.attached`` event only for the document writer
+        (``attach_document``), which computed its sha256 from the bytes."""
+        from .verbs.doc import _DOC_WRITER_CAPABILITY
+
+        if capability is not _DOC_WRITER_CAPABILITY:
+            raise ValidationError("doc-writer-capability-required")
+        # The document writer owns doc.attached only.
+        if kwargs.get("kind") != DOC_KIND:
+            raise ValidationError(f"reserved-kind:{kwargs.get('kind')}")
+        return self._append(internal=True, ignore_retry_attribution=False, **kwargs)
+
     def _append_entity_event(self, capability: object, **kwargs: Any) -> Event:
         """Append an entity event only for the entity writer (verbs/entity.py)."""
         from .verbs.entity import _ENTITY_WRITER_CAPABILITY
@@ -745,6 +890,34 @@ class Ledger:
         if kwargs.get("kind") not in ENTITY_KINDS:
             raise ValidationError(f"reserved-kind:{kwargs.get('kind')}")
         return self._append(internal=True, ignore_retry_attribution=False, **kwargs)
+
+    def _append_receipt_event(self, capability: object, **kwargs: Any) -> Event:
+        """Append a reserved review record only for the receipt writer
+        (receipts.py), which checked the item and payload in the caller's
+        transaction."""
+        from .receipts import _RECEIPT_WRITER_CAPABILITY
+
+        if capability is not _RECEIPT_WRITER_CAPABILITY:
+            raise ValidationError("receipt-writer-capability-required")
+        # The receipt writer owns the reserved review kinds only.
+        if kwargs.get("kind") not in RECEIPT_KINDS:
+            raise ValidationError(f"reserved-kind:{kwargs.get('kind')}")
+        return self._append(internal=True, ignore_retry_attribution=False, **kwargs)
+
+    def _append_capture_event(self, capability: object, **kwargs: Any) -> Event:
+        """Append a hook capture only for the capture writer (verbs/capture.py).
+
+        Only this path writes a channel that starts with ``hook:``; it writes
+        ``utterance.captured`` on ``hook:prompt`` or ``hook:picker`` and nothing
+        else, with every other check a public append makes.
+        """
+        from .verbs.capture import _CAPTURE_WRITER_CAPABILITY
+
+        if capability is not _CAPTURE_WRITER_CAPABILITY:
+            raise ValidationError("capture-writer-capability-required")
+        return self._append(
+            internal=False, capture=True, ignore_retry_attribution=False, **kwargs
+        )
 
     def append_many(self, events: Sequence[Mapping[str, Any]]) -> list[Event]:
         """Append several events in ONE transaction: all of them or none.
@@ -793,6 +966,7 @@ class Ledger:
             self._in_batch = True
             yield
             conn.execute("COMMIT")
+            self._settle_bound()
         except BaseException:
             if conn.in_transaction:
                 conn.execute("ROLLBACK")
@@ -819,6 +993,7 @@ class Ledger:
         expect_revision: int | str | None = None,
         ignore_retry_attribution: bool,
         internal: bool,
+        capture: bool = False,
     ) -> Event:
         if type(kind) is not str or not kind:
             raise ValidationError("unknown-kind:")
@@ -843,6 +1018,22 @@ class Ledger:
         session = _opt_str(session, "session")
         channel = _opt_str(channel, "channel")
         provenance_class = _opt_str(provenance_class, "provenance_class")
+        # The hook: channel prefix belongs to the capture writer alone, so an
+        # answer on it is the harness's record, never a seat's. Every other
+        # writer (append, append-many, pick, the library, the internal
+        # writers) is refused on any channel under the prefix.
+        if capture:
+            if kind != "utterance.captured" or channel not in CAPTURE_CHANNELS:
+                raise ValidationError(f"capture-channel-required:{channel}")
+        elif channel is not None and channel.startswith(CAPTURE_CHANNEL_PREFIX):
+            raise ValidationError("reserved-capture-channel")
+        # A picker object rides only a picker capture.
+        if (
+            kind == "utterance.captured"
+            and "picker" in payload_obj
+            and channel != PICKER_CHANNEL
+        ):
+            raise ValidationError("picker-needs-picker-channel")
         if recorded_at is None:
             recorded_at = _now()
         elif type(recorded_at) is not str or not _RECORDED_AT.match(recorded_at):
@@ -862,6 +1053,10 @@ class Ledger:
         caller_precondition = precondition
 
         def checked_precondition(conn: sqlite3.Connection) -> None:
+            # Runs for a new append only, after the idempotency lookup: an
+            # exact retry of a keyed ask stored before this rule returns the
+            # stored event; the same text under a new key is refused.
+            refuse_display_control_characters(kind, payload_obj)
             if expect_revision is not None:
                 _check_expected_revision(conn, item, expect_revision)
             if not internal and item is not None:
@@ -973,6 +1168,7 @@ class Ledger:
                     )
                 if owned:
                     conn.execute("COMMIT")
+                    self._settle_bound()
                 return event
             if precondition is not None:
                 precondition(conn)
@@ -1026,6 +1222,7 @@ class Ledger:
             )
             if owned:
                 conn.execute("COMMIT")
+                self._settle_bound()
             return Event(
                 id=next_id,
                 kind=kind,
@@ -1052,14 +1249,27 @@ class Ledger:
         """The system this database is claimed for, or ``None`` if unclaimed."""
         return _claimed_system(self._conn)
 
-    def claim_system(self, system: str) -> None:
+    def claim_system(
+        self,
+        system: str,
+        *,
+        actor: str | None = None,
+        harness: str | None = None,
+        model: str | None = None,
+        session: str | None = None,
+    ) -> bool:
         """Bind this database to ``system``, or refuse another system's.
 
         The claim is a ``ledger.system`` event, so it lives in the database
-        file itself: every path that reaches the file (a link, a hard link,
-        another spelling) sees it, and an export or restore carries it. The
+        file itself: every accepted spelling of the file sees it, and an
+        export or restore carries it. Symbolic and hard links are refused. The
         check and the write share one ``BEGIN IMMEDIATE`` transaction, so an
-        interrupted claim leaves the database unclaimed. An unclaimed
+        interrupted claim leaves the database unclaimed. The keyword-only
+        ``actor``, ``harness``, ``model`` and ``session`` stamp the claim
+        event as ``append`` stamps its own (all default to ``None``).
+        Returns ``True`` when this call wrote the claim and ``False`` when
+        the same system was already on record, decided inside the
+        transaction. An unclaimed
         database, including one from before claims existed, is claimed by
         the first system to install it. Another system's claim is refused by
         the claim guard on the shared write path, as ``SharedDatabaseError``.
@@ -1067,16 +1277,32 @@ class Ledger:
         A database reached through a second path while a connection on the
         first path has unsaved WAL frames can fail with a raw SQLite I/O
         error; that, and a checkpoint that cannot finish, are reported as
-        ``SharedDatabaseError`` too. Any other SQLite failure, such as a
-        read-only file, is refused as a ``LedgerError`` that names it.
+        ``UnsettledClaimError``, a ``SharedDatabaseError`` that carries the
+        claim event this call wrote, if any. A checkpoint runs after the
+        commit, and an I/O error can come at the commit itself, so the claim
+        may be on record when either is raised: ``claim_outcome`` re-reads
+        it, retries the checkpoint, settles through the open proof, and only
+        then reports what the transaction reached. Any other SQLite failure,
+        such as a read-only file, is refused as a ``LedgerError`` that names
+        it.
         """
+        written: Event | None = None
+        version: int | None = None
         try:
             with self.transaction():
+                # Read under the write lock: no other connection can commit
+                # until this transaction ends, so a later read that differs
+                # means another connection committed after it.
+                version = self._conn.execute("PRAGMA data_version").fetchone()[0]
                 if _claimed_system(self._conn) != system:
-                    self._append(
+                    written = self._append(
                         kind=SYSTEM_CLAIM_KIND,
                         payload={"system": system},
                         idempotency_key=f"{SYSTEM_CLAIM_KIND}:{system}",
+                        actor=actor,
+                        harness=harness,
+                        model=model,
+                        session=session,
                         internal=True,
                         ignore_retry_attribution=False,
                     )
@@ -1087,9 +1313,12 @@ class Ledger:
                 raise LedgerError(
                     f"system {system!r}: could not claim {self.path}: {exc}"
                 ) from exc
-            raise SharedDatabaseError(
+            raise UnsettledClaimError(
                 f"system {system!r}: {self.path} could not be read ({exc}); "
-                "another path may share this database"
+                "another path may share this database",
+                event=written,
+                committed=False,
+                data_version=version,
             ) from exc
         # Fold the claim into the main file, whose WAL another path's
         # connection would not read. A checkpoint that cannot finish means
@@ -1099,11 +1328,120 @@ class Ledger:
             "PRAGMA wal_checkpoint(TRUNCATE)"
         ).fetchone()
         if busy:
-            raise SharedDatabaseError(
+            raise UnsettledClaimError(
                 f"system {system!r}: checkpoint of {self.path} is busy "
                 f"({done} of {wal_frames} WAL frames written back): another "
-                "connection, perhaps through another path to this file, holds the database"
+                "connection, perhaps through another path to this file, holds the database",
+                event=written,
+                committed=True,
+                data_version=version,
             )
+        # The claim is settled on disk only now: check the path still names
+        # the files it was written to before reporting it.
+        self._settle_bound()
+        return written is not None
+
+    def claim_outcome(self, system: str, refusal: UnsettledClaimError) -> bool:
+        """Settle the claim after ``claim_system`` raised ``refusal``, or raise it again.
+
+        Returns only on the proof the normal return of ``claim_system``
+        rests on: ``system``'s claim is on record, ``PRAGMA
+        wal_checkpoint(TRUNCATE)`` returns busy 0 (the claim is in the main
+        database file), and then ``_settle_bound`` passes (the path still
+        names the files the open proved). The checkpoint is retried within a
+        bounded budget (``CLAIM_SETTLE_ATTEMPTS`` attempts, none started after
+        ``CLAIM_SETTLE_SECONDS``): two callers racing on a fresh database each
+        checkpoint after their commit, and one can find the other's
+        checkpoint running, which clears in milliseconds. It then returns
+        what the claim's transaction reached: ``True`` when this call's write
+        is the claim on record, ``False`` when another write put it there.
+
+        This call's write is the claim on record when the claim on record is
+        the event it wrote (same id and hash) and that write is known to have
+        committed: the commit finished and only the checkpoint after it
+        failed (``refusal.committed``), or no other connection has committed
+        since this call's transaction took its write lock (``PRAGMA
+        data_version`` is unchanged). Two callers with the same attribution
+        can write byte-identical claim events in the same millisecond, so the
+        event alone cannot say whose commit landed: when another connection
+        has committed since, and this call's commit is not known to have
+        finished, the answer is ``False``.
+
+        Every read and checkpoint runs on this handle's own connection, the
+        one the open proof covers. Otherwise raise ``refusal`` again: no
+        claim on record, another system's claim on record, a read or a
+        checkpoint that raises (the connection may be unusable after an I/O
+        error), a checkpoint still busy when the budget is spent (another
+        connection, perhaps through another path to the file, still holds
+        the database), or a connection still inside a transaction (its reads
+        would see rows that were never committed). A failed binding check
+        raises ``UnsafeDatabaseFile`` (``db_swapped`` or
+        ``db_sibling_unsafe``). It never reports a claim that is not on
+        record, nor one whose checkpoint has not finished, nor one the path
+        no longer names.
+        """
+        conn = self._conn
+        if conn.in_transaction:
+            raise refusal
+        try:
+            row = conn.execute(
+                "SELECT * FROM events WHERE kind = ? ORDER BY id LIMIT 1",
+                (SYSTEM_CLAIM_KIND,),
+            ).fetchone()
+            version = conn.execute("PRAGMA data_version").fetchone()[0]
+        except sqlite3.Error:
+            raise refusal
+        if row is None:
+            raise refusal
+        on_record = _event_from_row(row)
+        if on_record.payload.get("system") != system:
+            raise refusal
+        try:
+            settled = self._checkpoint_within_budget()
+        except sqlite3.Error:
+            raise refusal
+        if not settled:
+            raise refusal
+        written = refusal.event
+        mine = (
+            written is not None
+            and (on_record.id, on_record.hash) == (written.id, written.hash)
+            and (
+                refusal.committed
+                or (refusal.data_version is not None and version == refusal.data_version)
+            )
+        )
+        # The claim is settled on disk only now: the open proof's binding
+        # check is the last step before the outcome is reported.
+        self._settle_bound()
+        return mine
+
+    def _checkpoint_within_budget(self) -> bool:
+        """Retry ``PRAGMA wal_checkpoint(TRUNCATE)`` until it returns busy 0.
+
+        Up to ``CLAIM_SETTLE_ATTEMPTS`` attempts, none started after
+        ``CLAIM_SETTLE_SECONDS``, each waiting at most
+        ``CLAIM_SETTLE_WAIT_MS`` on other connections (the connection's busy
+        timeout, restored afterwards), with ``CLAIM_SETTLE_PAUSE_SECONDS``
+        between attempts. Returns ``True`` on the first busy 0 and ``False``
+        when the budget is spent. A ``sqlite3.Error`` propagates; the caller
+        refuses on it.
+        """
+        conn = self._conn
+        deadline = time.monotonic() + CLAIM_SETTLE_SECONDS
+        conn.execute(f"PRAGMA busy_timeout = {CLAIM_SETTLE_WAIT_MS}")
+        try:
+            for attempt in range(CLAIM_SETTLE_ATTEMPTS):
+                if attempt:
+                    time.sleep(CLAIM_SETTLE_PAUSE_SECONDS)
+                    if time.monotonic() >= deadline:
+                        return False
+                busy = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]
+                if not busy:
+                    return True
+            return False
+        finally:
+            conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
 
     def verify(self, *, system: str | None = None) -> None:
         """Walk events by id and refuse a broken hash chain or a bad payload.
@@ -1230,20 +1568,51 @@ def open_ledger(path: Path | str, *, create: bool = True) -> Ledger:
     if not create and not resolved.exists():
         raise LedgerError(f"database does not exist: {resolved}")
     _refuse_newer_schema_before_connect(resolved)
-    conn = connect(resolved)
+    conn, proof = connect(resolved)
+    lg = Ledger(conn, resolved, proof)
     try:
         _refuse_unknown_versions(_recorded_versions(conn), load_migrations())
         migrate(conn)
+        lg._settle_bound()
     except Exception:
         conn.close()
         raise
-    return Ledger(conn, resolved)
+    return lg
 
 
-def claim_database(db: Path | str, system: str) -> Path:
-    """Open ``db``, claim it for ``system`` (see ``Ledger.claim_system``), close."""
+def claim_database(
+    db: Path | str,
+    system: str,
+    *,
+    actor: str | None = None,
+    harness: str | None = None,
+    model: str | None = None,
+    session: str | None = None,
+) -> Path:
+    """Open ``db``, claim it for ``system`` (see ``Ledger.claim_system``), close.
+
+    The keyword-only ``actor``, ``harness``, ``model`` and ``session`` stamp
+    the claim event as ``Ledger.claim_system`` stamps its own (all default
+    to ``None``).
+
+    An ``UnsettledClaimError`` from ``claim_system`` (an I/O error in the
+    claim's transaction, or a checkpoint after it that cannot finish) can
+    come after the claim committed. It is settled the way the claim-system
+    verb settles it: ``Ledger.claim_outcome`` for the same ``system``, on
+    the handle this call opened, which returns only when that system's
+    claim is on record, a checkpoint finishes within its budget and the
+    path still names the opened files, and raises the refusal again
+    otherwise. Returns the database path only when ``claim_system``
+    returned or ``claim_outcome`` settled; every other exception is raised
+    as it was.
+    """
     with open_ledger(db) as lg:
-        lg.claim_system(system)
+        try:
+            lg.claim_system(
+                system, actor=actor, harness=harness, model=model, session=session
+            )
+        except UnsettledClaimError as refusal:
+            lg.claim_outcome(system, refusal)
         return lg.path
 
 
@@ -1271,6 +1640,12 @@ def _readonly_conn(uri: str) -> sqlite3.Connection:
 
 
 def _connect_readonly(path: Path) -> sqlite3.Connection:
+    """``_connect_readonly_proved`` for a caller that needs no proof."""
+    conn, _proof = _connect_readonly_proved(path)
+    return conn
+
+
+def _connect_readonly_proved(path: Path) -> tuple[sqlite3.Connection, OpenProof]:
     """Connect ``mode=ro``; in a directory we cannot write, fall back to ``immutable=1``.
 
     Opening a WAL database ``mode=ro`` needs the ``-wal`` and ``-shm`` files.
@@ -1294,17 +1669,22 @@ def _connect_readonly(path: Path) -> sqlite3.Connection:
     cannot open the ledger at all.
     """
     uri = path.as_uri()
-    conn = _readonly_conn(f"{uri}?mode=ro")
     try:
-        conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
-        return conn
+        conn, _mode, proof = checked_connect(
+            path, lambda: _readonly_conn(f"{uri}?mode=ro")
+        )
+        return conn, proof
     except BaseException as exc:
-        conn.close()
         refused = (isinstance(exc, sqlite3.OperationalError)
                    and _is_readonly_refusal(exc))
         if not refused or _side_files_present(path):
             raise
-    return _readonly_conn(f"{uri}?immutable=1")
+    conn, _mode, proof = checked_connect(
+        path,
+        lambda: _readonly_conn(f"{uri}?immutable=1"),
+        immutable=True,
+    )
+    return conn, proof
 
 
 def open_ledger_readonly(path: Path | str) -> Ledger:
@@ -1318,8 +1698,11 @@ def open_ledger_readonly(path: Path | str) -> Ledger:
     resolved = resolve_db_path(path)
     if not resolved.exists():
         raise LedgerError(f"database does not exist: {resolved}")
-    conn = _connect_readonly(resolved)
+    conn, proof = _connect_readonly_proved(resolved)
     try:
+        refusal = _search_index_refusal(conn, resolved)
+        if refusal is not None:
+            raise LedgerError(refusal)
         has_versions = conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'"
         ).fetchone()
@@ -1334,7 +1717,7 @@ def open_ledger_readonly(path: Path | str) -> Ledger:
     except BaseException:
         conn.close()
         raise
-    return Ledger(conn, resolved)
+    return Ledger(conn, resolved, proof)
 
 
 __all__ = [
@@ -1360,9 +1743,11 @@ __all__ = [
     "claim_database",
     "connect",
     "event_digest",
+    "is_search_index_tables",
     "item_is_loop_managed",
     "load_migrations",
     "migrate",
     "open_ledger",
     "open_ledger_readonly",
+    "restore_needs_accept_flag",
 ]

@@ -2,15 +2,23 @@
 
 The index is ``search.db`` in the ledger database's own directory. It is a
 disposable projection, never a source: ``home.db`` stays events only (ADR
-0034 decision 1), the index is rebuilt from scratch every time, and nothing
-exports or commits it. The ledger is opened with ``open_ledger_readonly``
+0034 decision 1), the index is rebuilt from scratch whenever anything but the
+event log's tail changed (``refresh_index``), and nothing exports or commits
+it. The ledger is opened with ``open_ledger_readonly``
 (``mode=ro``; ``immutable=1`` only when no WAL sidecar exists), so building
 the index never writes the ledger database.
 
 What is indexed, one FTS5 row per document:
 
 - ``item``: each current item (``v_items``) with its notes and links.
-- ``decision``: each ``decision.asked`` and ``decision.elected`` event.
+- ``decision``: each ``decision.asked``, ``decision.elected`` and
+  ``decision.recorded`` event, and each ``item.note`` whose text, after
+  leading whitespace, starts with the exact lowercase prefix ``decided:``
+  (``DECIDED_PREFIX``). Such a note stays in its item's document too; as a
+  decision it is titled by its first ``DECISION_TITLE_CHARS`` characters,
+  so a ruling on a busy item ranks on its own words.
+- ``spec``: each item's current spec (its newest ``item.spec`` event).
+- ``stop``: each ``item.stopped`` event's ``point``.
 - ``utterance``: each ``utterance.captured`` event whose payload says
   ``origin: person``, and no other.
 - ``standard`` / ``adr``: ``standards/*.md`` and ``decisions/*.md`` under each
@@ -44,6 +52,19 @@ all in UTC. ``search`` filters on these (``status``, ``item``,
 whose ``rel`` is ``item`` and whose target is that initiative. A filter on an
 item field drops every document that has no item, such as a standard.
 
+``mentions`` reads the same index the other way: the documents on other
+items whose text names one item's id. A document mentions an id when its
+title or content holds the id as a whole token (``names_item``: the
+characters on each side are not id characters, so ``child-item`` does not
+match ``child-item-2``), compared exactly as the id is stored. Item
+documents are never mentions: one folds all of its item's notes, so it
+names no single event; a note that is a ruling is its own ``decision``
+document and is found there. Decision documents come first, a ``decided:``
+note before any other decision, then the rest; each group is in rank order. The index match only narrows the candidates; a candidate
+that fails ``names_item`` is dropped. An id that names no item raises
+``UnknownItem``, so a typo never reads as "no mentions". Neither the index
+format nor the event schema changes.
+
 The index stores a manifest: the format, the ranker, the last event id and
 its hash, the roots, and every source file with its mtime and size. ``index_status``
 recomputes it and calls the index stale on any difference, so an edited,
@@ -51,6 +72,69 @@ added, deleted or newly linked source is noticed; ``search`` rebuilds a stale
 index before it reads, filtered or not. The only ranker is BM25 (``RANKER``);
 it is named in the manifest so a second ranker can be added later and an
 index built by another, or by a version that named none, reads as stale.
+
+When the only difference is events appended after the build (``behind``),
+``refresh_index`` brings the index up to date without re-reading any markdown:
+on a copy of the index, it recomputes the ledger's documents from one read
+snapshot, deletes the indexed ledger documents that no longer match, inserts
+the new ones, and swaps the copy in. The markdown side is kept as it is, which
+is correct only because the manifest's sources (paths, mtimes and sizes),
+roots, format, ranker and database all still match. Anything else, or any
+error on the way, takes the full rebuild instead.
+
+A rebuild that does not finish can leave its temp file beside the index,
+named with the same prefix and suffix the writer uses. Every writer holds
+a shared flock on one lock file beside the index (``.search.db.lock``,
+created with mode 0600 when absent, opened without following a symlink,
+and never removed or replaced) from before its temp is created until
+that temp is published or removed. After its own publish, and after it
+has released its shared lock, a refresh asks for an exclusive
+non-blocking flock on the lock file. Only when that is granted, so no
+writer is running, does it list the directory and look at each file
+whose name matches that pattern exactly. A refused lock, a lock file
+that is a symlink, is not a regular file or cannot be opened, a
+platform without fcntl, a listing error, or a name that only contains
+the pattern leaves every file in place and prints nothing. A candidate
+that is the ledger database's own file (same device and inode, so a
+hard link under another name too) or whose name begins with the
+database's file name is skipped without a word, and when the database
+cannot be stat'ed nothing is removed.
+
+Every other candidate is removed only when it is positively identified
+as a disposable index temp: a regular file with no SQLite side file
+(``-journal``, ``-wal``, ``-shm``) beside it that is either empty, or
+starts with the 16-byte SQLite header and has a schema whose tables are
+all ones the writer creates (``_index_table_names``, read from
+``SCHEMA_SQL`` itself; an index or trigger on one of them is allowed, any
+other table, a view or anything else is not). The schema is read through
+a ``mode=ro&immutable=1`` connection, which takes no lock and creates no
+side file. Just before the unlink the candidate is checked again: still
+no side file, and the same device, inode and size. Anything else (a
+ledger, a ledger backup, a file holding an ``events`` table, a symlink, a
+directory, a short or non-SQLite file, a stat, read or SQLite error, a
+side file, a change) is left byte for byte as it was, with one
+``search index cleanup skipped PATH: REASON`` line on stderr on every
+refresh until it is moved. A removal error is one line on stderr too.
+None of these fails the refresh or loses the new index. A side file
+keeps a candidate because a WAL database's tables can sit in its
+``-wal`` file alone: a ledger just created and still open reads as an
+empty schema from its main file. A writer from a version before the
+lock file takes no lock, so a refresh during an upgrade can remove that
+writer's temp when no side file is beside it at that moment; that
+writer's refresh then fails and the next refresh rebuilds.
+
+``index_status`` also gives a ``severity`` a reader can colour by: ``ok`` for
+``current``; ``info`` for ``behind``, ``stale`` or ``missing``, which the next
+search or ``ledger index`` brings up to date on its own; ``warn`` when the
+index cannot be built where it is (inside a git work tree, a directory at the
+index path, an index path that cannot be examined, an unusable configuration),
+with that reason added to ``reasons``. Any other status is ``warn``.
+
+The index is opened only when ``lstat`` shows a regular file at its path. A
+FIFO, socket, device, directory or symlink there is never opened (a read-only
+SQLite open blocks on a FIFO): ``index_status`` calls it ``missing`` and names
+it, and a rebuild renames the new index over it, or refuses by name when the
+rename cannot replace it (a directory).
 """
 from __future__ import annotations
 
@@ -58,7 +142,17 @@ import json
 import os
 import re
 import sqlite3
+import stat
+import sys
 import tempfile
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None  # type: ignore[assignment]
+
+from collections import Counter
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -66,17 +160,25 @@ from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 from .paths import resolve_db_path
 from .schema import ITEM_STATUSES
-from .store import Event, open_ledger_readonly
+from .store import Event, is_search_index_tables, open_ledger_readonly
 
 SEARCH_DB_NAME = "search.db"
 CONFIG_NAME = "config.json"
 # Format 2: doc_type became UNINDEXED, so an index built at format 1 is stale.
 # Format 3: the doc_meta and item_link tables behind the search filters.
-INDEX_FORMAT = 3
+# Format 4: decided: notes, decision.recorded, specs and stop points became
+# documents, so an index built at format 3 lacks them and is rebuilt.
+INDEX_FORMAT = 4
 # The one ranker. The manifest records it, so an index built by any other
 # ranker (or by a version that recorded none) is stale and gets rebuilt.
 RANKER = "bm25"
-DOC_TYPES = ("item", "decision", "utterance", "standard", "adr", "doc")
+DOC_TYPES = ("item", "decision", "spec", "stop", "utterance", "standard", "adr", "doc")
+# The document types built from the event log; the rest come from markdown.
+LEDGER_DOC_TYPES = ("item", "decision", "spec", "stop", "utterance")
+# How a reader colours an index status. ``ok``: current. ``info``: the next
+# search or ``ledger index`` brings it up to date on its own. Any status not
+# named here (``unknown`` included) is ``warn``.
+SEVERITIES = {"current": "ok", "behind": "info", "stale": "info", "missing": "info"}
 UTTERANCE_CAVEAT = "recalled words are evidence, never an origin"
 MAX_LIMIT = 1000
 # One weight per column: doc_type, doc_id, title, content. The two
@@ -102,10 +204,30 @@ SCHEMA_SQL = (
 )
 SNIPPET_TOKENS = 16
 UTTERANCE_TITLE_CHARS = 80
+# An item.note whose text, after leading whitespace, starts with exactly
+# this (lowercase, the colon included) is also a decision document.
+DECIDED_PREFIX = "decided:"
+DECISION_TITLE_CHARS = 80
+STOP_TITLE_CHARS = 80
+# The most mentions a normal item hit prints a line for.
+MENTION_LINES = 2
+# An id is a whole token in a text when the character before it is not a
+# word character or a hyphen (nor a dot after a word character), and the
+# one after it is not a word character or a hyphen (nor a dot before a
+# word character). ``_TERM`` joins a dot between two word characters the
+# same way.
+_ID_LEFT = r"(?<![\w-])(?<!\w\.)"
+_ID_RIGHT = r"(?![\w-])(?!\.\w)"
 _LINK_KIND_PREFIXES = ("item.", "decision.")
 _MD_PATH = re.compile(r"(?:~/|/)?(?:[\w.@+-]+/)*[\w.@+-]+\.md(?![\w-])")
-_FENCE = re.compile(r"^\s{0,3}(`{3,}|~{3,})(.*)$")
-_TERM = re.compile(r"[\w][\w'-]*", re.UNICODE)
+# Up to three literal spaces of indent (CommonMark); a tab or other
+# whitespace before the run is not indent. export.py ``_FENCE`` mirrors it.
+_FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+# A word, with hyphens and apostrophes inside it, and a dot only between two
+# word characters: ``release.notes`` is one term, matched as a phrase of its
+# parts as ``feed-condenser`` is, and a sentence's final dot is not part of
+# the word before it.
+_TERM = re.compile(r"[\w](?:[\w'-]|(?<=\w)\.(?=\w))*", re.UNICODE)
 _BARE_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _DATE_TIME = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})?$"
@@ -119,6 +241,18 @@ _STOPWORDS = frozenset(
 
 class SearchError(Exception):
     """The index cannot be built or read; the message says why."""
+
+
+class IndexNotCurrent(SearchError):
+    """``search(..., refresh=False)`` found an index that is not current. It
+    was left as it is; ``ledger index`` brings it up to date."""
+
+
+class IndexUnavailable(SearchError):
+    """Nothing at the index path can be opened: it is absent, or it is not a
+    regular file and so is never opened. ``index_status`` reads this as
+    ``missing``, so the next search or ``ledger index`` builds a fresh index
+    in its place; the message names what is there."""
 
 
 @dataclass(frozen=True)
@@ -260,6 +394,21 @@ def is_person_utterance(event: Event) -> bool:
     return event.kind == "utterance.captured" and event.payload.get("origin") == "person"
 
 
+def decided_note_text(event: Event) -> str | None:
+    """The text of an ``item.note`` that records a decision, else None.
+
+    A note is a decision when its ``text`` is a string that, after leading
+    whitespace, starts with ``DECIDED_PREFIX`` exactly: ``Decided:``,
+    ``decided :`` or a note with no text field is not one.
+    """
+    if event.kind != "item.note" or event.item_id is None:
+        return None
+    text = event.payload.get("text")
+    if not isinstance(text, str) or not text.lstrip().startswith(DECIDED_PREFIX):
+        return None
+    return text
+
+
 def _join(parts: Iterable[Any]) -> str:
     return "\n".join(str(part) for part in parts if part not in (None, ""))
 
@@ -359,8 +508,13 @@ def ledger_docs(items: Sequence[Mapping[str, Any]], events: Sequence[Event]) -> 
         )
         for row in items
     ]
+    # Each item's current spec: its newest item.spec event.
+    specs: dict[str, Event] = {}
     for event in events:
         payload = event.payload
+        if event.kind == "item.spec" and event.item_id is not None:
+            specs[event.item_id] = event
+            continue
         meta = {
             "item_id": event.item_id,
             "status": statuses.get(event.item_id) if event.item_id is not None else None,
@@ -396,6 +550,30 @@ def ledger_docs(items: Sequence[Mapping[str, Any]], events: Sequence[Event]) -> 
                 ]),
                 **meta,
             ))
+        elif event.kind == "decision.recorded" and event.item_id is not None:
+            effect = payload.get("effect")
+            if isinstance(effect, str) and effect:
+                raw_tags = payload.get("tags")
+                tags = [tag.get("id") for tag in raw_tags
+                        if isinstance(tag, Mapping)] if isinstance(raw_tags, list) else []
+                corpus.append(Doc(
+                    "decision",
+                    f"{event.item_id}:{event.id}",
+                    effect,
+                    _join([payload.get("verbatim"), payload.get("who"),
+                           payload.get("relayed_by"), *tags]),
+                    **meta,
+                ))
+        elif event.kind == "item.stopped" and event.item_id is not None:
+            point = payload.get("point")
+            if isinstance(point, str) and point.strip():
+                corpus.append(Doc(
+                    "stop",
+                    f"{event.item_id}:{event.id}",
+                    point.strip()[:STOP_TITLE_CHARS],
+                    point,
+                    **meta,
+                ))
         elif is_person_utterance(event):
             text = payload.get("text", "")
             first = text.strip().splitlines()[0] if text.strip() else ""
@@ -406,6 +584,31 @@ def ledger_docs(items: Sequence[Mapping[str, Any]], events: Sequence[Event]) -> 
                 text,
                 **meta,
             ))
+        else:
+            decided = decided_note_text(event)
+            if decided is not None:
+                corpus.append(Doc(
+                    "decision",
+                    f"{event.item_id}:{event.id}",
+                    decided.lstrip()[:DECISION_TITLE_CHARS],
+                    decided,
+                    **meta,
+                ))
+    for item_id, event in specs.items():
+        body = event.payload.get("body_md")
+        if not isinstance(body, str) or not body:
+            continue
+        title = event.payload.get("title")
+        corpus.append(Doc(
+            "spec",
+            f"{item_id}:{event.id}",
+            title if isinstance(title, str) and title else item_id,
+            _join([body, event.payload.get("acceptance")]),
+            item_id=item_id,
+            status=statuses.get(item_id),
+            date=event.recorded_at,
+            ts=_event_micros(event.recorded_at),
+        ))
     return corpus
 
 
@@ -582,8 +785,175 @@ def current_manifest(db: Path | str, fallback_root: FallbackRoot | None = None) 
     return _manifest(resolved, last, events, roots, collect_sources(roots, linked_refs(events)))
 
 
+# lstat file kinds other than a regular file, in the words the refusals use.
+_NOT_REGULAR_KINDS = (
+    (stat.S_ISLNK, "symbolic link"),
+    (stat.S_ISDIR, "directory"),
+    (stat.S_ISFIFO, "FIFO"),
+    (stat.S_ISSOCK, "socket"),
+    (stat.S_ISCHR, "character device"),
+    (stat.S_ISBLK, "block device"),
+)
+
+
+def _not_regular_kind(mode: int) -> str | None:
+    """``None`` for a regular file, else the kind of file ``mode`` describes."""
+    if stat.S_ISREG(mode):
+        return None
+    for test, kind in _NOT_REGULAR_KINDS:
+        if test(mode):
+            return kind
+    return "non-regular file"
+
+
+def _lstat_index(index: Path) -> os.stat_result | None:
+    """The index path's own ``lstat`` (a symlink is not followed), or ``None``
+    when nothing is there. Any other ``lstat`` failure refuses by name."""
+    try:
+        return os.lstat(index)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise SearchError(f"cannot stat the search index {index}: {exc}") from exc
+
+
+def _open_index(index: Path) -> sqlite3.Connection:
+    """Open the index read-only, and only when its path is a regular file.
+
+    A ``mode=ro`` open blocks on a FIFO instead of failing, so the path is
+    checked with ``lstat`` first and anything but a regular file (a FIFO,
+    socket, device, directory, or a symlink, which is not followed) is never
+    opened. The index is derived and decides nothing, so a name check is
+    enough; there is no descriptor identity check.
+    """
+    found = _lstat_index(index)
+    if found is None:
+        raise IndexUnavailable(f"no {SEARCH_DB_NAME}")
+    kind = _not_regular_kind(found.st_mode)
+    if kind is not None:
+        raise IndexUnavailable(f"{SEARCH_DB_NAME} is a {kind}, not a regular file: {index}")
+    return sqlite3.connect(index.as_uri() + "?mode=ro", uri=True)
+
+
+def _replace_refusal(index: Path, ledger: Path) -> str | None:
+    """Why the index writer must not replace what is at ``index``, or ``None``.
+
+    The writer replaces only: nothing (the path is absent); a path that is not
+    a regular file (a FIFO, socket or symlink is replaced, the link itself and
+    never its target; a directory makes the rename fail and is refused by
+    name); or a regular file that opens read-only as SQLite with a
+    ``manifest`` table and no ``events`` table. Every index format has the
+    manifest, so an older index still upgrades; a ledger database has
+    ``events`` and no ``manifest``, so neither the ledger itself (a ledger
+    named ``search.db``) nor another ledger at the index path is replaced.
+    Anything else, and any error while checking, refuses, naming the index
+    path and the ledger.
+    """
+    return _replace_verdict(index, ledger)[1]
+
+
+def _replace_verdict(index: Path, ledger: Path) -> tuple[bool, str | None]:
+    """``(absent, refusal)`` for the index path, from one ``lstat``: whether
+    nothing is there, and ``_replace_refusal``'s answer for what is."""
+    try:
+        found = os.lstat(index)
+    except FileNotFoundError:
+        return True, None
+    except OSError as exc:
+        return False, f"cannot stat the search index {index}: {exc} (ledger {ledger})"
+    if not stat.S_ISREG(found.st_mode):
+        return False, None
+    try:
+        conn = sqlite3.connect(index.as_uri() + "?mode=ro", uri=True)
+        try:
+            tables = {
+                row[0]
+                for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+            }
+        finally:
+            conn.close()
+    except (sqlite3.Error, OSError, ValueError) as exc:
+        detail = f"it does not read as SQLite: {exc}"
+    else:
+        if is_search_index_tables(tables):
+            return False, None
+        detail = "it has an events table" if "events" in tables else "it has no manifest table"
+    return False, (
+        f"refusing to replace {index}, which is not a search index, "
+        f"with the index of the ledger {ledger}: {detail}"
+    )
+
+
+def _replace_index(tmp: Path, index: Path, ledger: Path) -> None:
+    """Publish the finished index at ``tmp`` at ``index``: the only writer of
+    the index path. ``_replace_verdict`` decides first; a refusal raises
+    ``SearchError`` and leaves ``index`` as it was (the caller removes ``tmp``).
+
+    Another session can create a ledger at the index path after the check,
+    so a path the check saw absent is published with a hard link, which
+    never replaces an existing file. When the link finds something there,
+    the check runs again on what is there now: a search index (or a path
+    that is not a regular file) is replaced as below, and anything else
+    refuses. A path the check confirmed is replaced with a rename. No
+    failure falls back to a rename over an unchecked path.
+    """
+    absent, refusal = _replace_verdict(index, ledger)
+    if refusal is not None:
+        raise SearchError(refusal)
+    if absent:
+        if _link_new_index(tmp, index, ledger):
+            return
+        # Something appeared at the index path after the check.
+        absent, refusal = _replace_verdict(index, ledger)
+        if refusal is not None:
+            raise SearchError(refusal)
+        if absent:
+            # The link found a file that is gone again: the path is changing
+            # under the writer, so it decides nothing and replaces nothing.
+            raise SearchError(
+                f"refusing to publish the search index at {index}: the path "
+                f"changed while it was published (ledger {ledger})"
+            )
+    _rename_over_index(tmp, index)
+
+
+def _link_new_index(tmp: Path, index: Path, ledger: Path) -> bool:
+    """Publish ``tmp`` at ``index`` only when nothing is there: ``True`` when
+    it is published (``tmp`` is then removed), ``False`` when a file exists
+    at ``index``. Any other failure refuses; it never falls back to a
+    rename, which would replace whatever is there."""
+    try:
+        os.link(tmp, index)
+    except FileExistsError:
+        return False
+    except OSError as exc:
+        raise SearchError(
+            f"cannot publish the search index at {index} without replacing "
+            f"what may be there: {exc} (ledger {ledger})"
+        ) from exc
+    tmp.unlink(missing_ok=True)
+    return True
+
+
+def _rename_over_index(tmp: Path, index: Path) -> None:
+    """Rename ``tmp`` over a path ``_replace_verdict`` confirmed."""
+    try:
+        # A rename replaces a FIFO, socket or symlink at the index path
+        # (the link itself, never its target); it cannot replace a
+        # directory, which is refused by name.
+        os.replace(tmp, index)
+    except OSError as exc:
+        found = _lstat_index(index)
+        kind = None if found is None else _not_regular_kind(found.st_mode)
+        if kind is None:
+            raise
+        raise SearchError(
+            f"cannot replace the {kind} at the search index path {index}: {exc}"
+        ) from exc
+
+
 def stored_manifest(index: Path) -> dict:
-    conn = sqlite3.connect(index.as_uri() + "?mode=ro", uri=True)
+    conn = _open_index(index)
     try:
         row = conn.execute("SELECT value FROM manifest WHERE key = 'manifest'").fetchone()
     finally:
@@ -637,19 +1007,70 @@ def manifest_differences(stored: Mapping[str, Any], current: Mapping[str, Any]) 
     return reasons
 
 
+def severity_for(status: str) -> str:
+    """``ok``, ``info`` or ``warn`` for an index status; an unnamed status is ``warn``."""
+    return SEVERITIES.get(status, "warn")
+
+
+def _build_blocker(
+    resolved: Path, index: Path, fallback_root: FallbackRoot | None
+) -> str | None:
+    """Why building the index at ``index`` would refuse, or ``None``."""
+    if _inside_git(index.parent):
+        return f"refusing to use {SEARCH_DB_NAME} inside a git work tree: {index.parent}"
+    try:
+        found = _lstat_index(index)
+        if found is not None and stat.S_ISDIR(found.st_mode):
+            # A rename cannot replace a directory. Worded as the missing
+            # reason is, so ``index_status`` names it once.
+            return f"{SEARCH_DB_NAME} is a directory, not a regular file: {index}"
+        # A file the index writer will not replace (a ledger, or anything
+        # that is not a search index): a rebuild refuses, so this is a warn.
+        refusal = _replace_refusal(index, resolved)
+        if refusal is not None:
+            return refusal
+        resolve_roots(load_config(resolved), fallback_root)
+    except SearchError as exc:
+        return str(exc)
+    return None
+
+
 def index_status(db: Path | str, fallback_root: FallbackRoot | None = None) -> dict[str, Any]:
-    """``missing``, ``stale`` (with reasons), ``behind`` or ``current``. Writes nothing.
+    """``missing``, ``stale`` (with reasons), ``behind`` or ``current``, and a
+    ``severity``. Writes nothing.
 
     ``behind`` means the index matches everything it recorded and only newer
     events exist; ``stale`` is a real mismatch (format, ranker, database, roots,
     source files, or an event log that no longer matches what was indexed).
+    ``severity`` is ``severity_for(status)``, or ``warn`` when a rebuild would
+    refuse, with that reason in ``reasons`` (added unless already there). An
+    index whose state cannot be computed because the configuration is unusable
+    reads ``unknown`` (so ``warn``) with the reason, instead of raising.
     """
     resolved = resolve_db_path(db)
     index = search_db_path(resolved)
-    if not index.exists():
-        return {"path": str(index), "status": "missing", "reasons": ["no search.db"]}
+    try:
+        result = _index_state(resolved, index, fallback_root)
+    except SearchError as exc:
+        result = {"path": str(index), "status": "unknown", "reasons": [str(exc)]}
+    blocker = _build_blocker(resolved, index, fallback_root)
+    if blocker is None:
+        result["severity"] = severity_for(result["status"])
+    else:
+        if blocker not in result["reasons"]:
+            result["reasons"] = [*result["reasons"], blocker]
+        result["severity"] = "warn"
+    return result
+
+
+def _index_state(
+    resolved: Path, index: Path, fallback_root: FallbackRoot | None
+) -> dict[str, Any]:
     try:
         stored = stored_manifest(index)
+    except IndexUnavailable as exc:
+        # Absent, or not a regular file (never opened): a rebuild replaces it.
+        return {"path": str(index), "status": "missing", "reasons": [str(exc)]}
     except (sqlite3.Error, ValueError, SearchError) as exc:
         return {"path": str(index), "status": "stale", "reasons": [f"unreadable index: {exc}"]}
     roots, _note = resolve_roots(load_config(resolved), fallback_root)
@@ -677,6 +1098,334 @@ def index_status(db: Path | str, fallback_root: FallbackRoot | None = None) -> d
 # --- build ------------------------------------------------------------------
 
 
+def _insert_doc(conn: sqlite3.Connection, rowid: int, doc: Doc) -> None:
+    conn.execute(
+        "INSERT INTO fts_corpus (rowid, doc_type, doc_id, title, content) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (rowid, doc.doc_type, doc.doc_id, doc.title, doc.content),
+    )
+    if doc.path is not None:
+        conn.execute("INSERT INTO doc_path (rowid, path) VALUES (?, ?)", (rowid, doc.path))
+    conn.execute(
+        "INSERT INTO doc_meta (rowid, item_id, status, date, ts) VALUES (?, ?, ?, ?, ?)",
+        (rowid, doc.item_id, doc.status, doc.date, doc.ts),
+    )
+
+
+def _delete_doc(conn: sqlite3.Connection, rowid: int) -> None:
+    for table in ("fts_corpus", "doc_path", "doc_meta"):
+        conn.execute(f"DELETE FROM {table} WHERE rowid = ?", (rowid,))
+
+
+def _index_partial_parts() -> tuple[str, str]:
+    """The prefix and suffix ``tempfile.mkstemp`` uses for this index's temp file.
+
+    A leftover matches only when its name starts with the prefix, ends with
+    the suffix, and has a non-empty middle: the same shape the writer creates.
+    """
+    return f".{SEARCH_DB_NAME}.", ".partial"
+
+
+def _index_lock_path(index: Path) -> Path:
+    """The one lock file beside ``index`` that every index writer shares.
+
+    Its name never matches the partial pattern. It is never removed or
+    replaced, so every writer and every cleanup lock the same inode.
+    """
+    return index.parent / f".{SEARCH_DB_NAME}.lock"
+
+
+def _close_quietly(fd: int) -> None:
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+def _open_index_lock(index: Path) -> int | None:
+    """A new descriptor on the index lock file, created with mode 0600 if absent.
+
+    ``None`` when fcntl or ``O_NOFOLLOW`` is missing, the open fails (a
+    symlink at the lock path fails it), or what is there is not a regular
+    file. ``O_NONBLOCK`` keeps a FIFO at the lock path from blocking the
+    open. Each call opens its own descriptor: flock belongs to the open
+    file, so a descriptor this process still holds conflicts with a new one.
+    """
+    if fcntl is None:
+        return None
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if not nofollow:
+        return None
+    flags = (
+        os.O_RDONLY
+        | os.O_CREAT
+        | nofollow
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        fd = os.open(_index_lock_path(index), flags, 0o600)
+    except OSError:
+        return None
+    try:
+        regular = stat.S_ISREG(os.fstat(fd).st_mode)
+    except OSError:
+        regular = False
+    if not regular:
+        _close_quietly(fd)
+        return None
+    return fd
+
+
+@contextmanager
+def _index_writer_lock(index: Path) -> Iterator[None]:
+    """Hold a blocking ``LOCK_SH`` on the index lock file for the block.
+
+    A writer creates, builds and publishes (or removes) its temp inside the
+    block, so the cleanup's ``LOCK_EX`` is refused while any writer's temp
+    exists. The descriptor is closed, which releases the lock, when the
+    block ends. When the lock file cannot be opened or locked the writer
+    runs without the lock, as on a platform without fcntl.
+    """
+    fd = _open_index_lock(index)
+    if fd is not None:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH)
+        except OSError:
+            _close_quietly(fd)
+            fd = None
+    try:
+        yield
+    finally:
+        if fd is not None:
+            _close_quietly(fd)
+
+
+def _create_index_partial(directory: Path) -> Path:
+    """Create the writer's temp with ``mkstemp`` and the partial prefix and suffix.
+
+    Called only inside ``_index_writer_lock``. ``mkstemp`` creates the file
+    with mode 0600 and SQLite opens that file, so the published index keeps
+    the mode.
+    """
+    prefix, suffix = _index_partial_parts()
+    fd, tmp_name = tempfile.mkstemp(prefix=prefix, suffix=suffix, dir=directory)
+    os.close(fd)
+    return Path(tmp_name)
+
+
+def _is_index_partial_name(name: str) -> bool:
+    prefix, suffix = _index_partial_parts()
+    if not name.startswith(prefix) or not name.endswith(suffix):
+        return False
+    return bool(name[len(prefix) : len(name) - len(suffix)])
+
+
+# The first 16 bytes of every SQLite database file.
+_SQLITE_HEADER = b"SQLite format 3\x00"
+# Files SQLite keeps beside a database while a connection is open, or after
+# a crash. A WAL database's tables can sit in its -wal file alone, so the
+# database's own bytes do not show what it holds.
+_SQLITE_SIDE_SUFFIXES = ("-journal", "-wal", "-shm")
+
+
+def _index_table_names() -> frozenset[str]:
+    """The table names the index writer creates, read from ``SCHEMA_SQL`` itself.
+
+    The writer's own statements run in a private in-memory database, so the
+    fts5 shadow tables are named as SQLite names them and the list is never
+    typed a second time.
+    """
+    conn = sqlite3.connect(":memory:")
+    try:
+        for statement in SCHEMA_SQL:
+            conn.execute(statement)
+        rows = conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        return frozenset(row[0] for row in rows)
+    finally:
+        conn.close()
+
+
+def _side_file_reason(path: Path) -> str | None:
+    """Why a SQLite side file beside ``path`` keeps it, or ``None`` when there is none.
+
+    A side file that cannot be checked for keeps it too.
+    """
+    for suffix in _SQLITE_SIDE_SUFFIXES:
+        side = path.with_name(path.name + suffix)
+        try:
+            os.lstat(side)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            return f"cannot check for {side.name} beside it: {exc}"
+        return f"{side.name} is beside it, so a connection is open or was cut off"
+    return None
+
+
+def _why_not_index_temp(path: Path, found: os.stat_result) -> str | None:
+    """Why ``path`` is not a disposable index temp, or ``None`` when it is one.
+
+    ``found`` is the candidate's ``lstat``, a regular file. It is one only
+    when no SQLite side file is beside it and either it is empty (``mkstemp``
+    made it and the writer stopped before SQLite wrote a page), or its first
+    16 bytes are the SQLite header and every row of its schema is a table
+    the writer creates, or an index or trigger on one. The schema is read
+    through a ``mode=ro&immutable=1`` connection, which takes no lock and
+    creates no side file. Any other answer, and any error on the way, is
+    the reason returned.
+    """
+    side = _side_file_reason(path)
+    if side is not None:
+        return side
+    if found.st_size == 0:
+        return None
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        return f"cannot open it: {exc}"
+    try:
+        opened = os.fstat(fd)
+        if (opened.st_dev, opened.st_ino) != (found.st_dev, found.st_ino):
+            return "it changed while it was being read"
+        head = b""
+        while len(head) < len(_SQLITE_HEADER):
+            chunk = os.read(fd, len(_SQLITE_HEADER) - len(head))
+            if not chunk:
+                break
+            head += chunk
+    except OSError as exc:
+        return f"cannot read it: {exc}"
+    finally:
+        _close_quietly(fd)
+    if len(head) < len(_SQLITE_HEADER):
+        return f"short read: {len(head)} of {len(_SQLITE_HEADER)} header bytes"
+    if head != _SQLITE_HEADER:
+        return "not a SQLite file"
+    uri = Path(os.path.abspath(path)).as_uri() + "?mode=ro&immutable=1"
+    try:
+        allowed = _index_table_names()
+        conn = sqlite3.connect(uri, uri=True, isolation_level=None)
+        try:
+            rows = conn.execute("SELECT type, name, tbl_name FROM sqlite_master").fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        return f"cannot read its SQLite schema: {exc}"
+    for kind, name, table in rows:
+        if kind == "table":
+            if name not in allowed:
+                return f"it holds table {name}, which the index writer never creates"
+        elif kind in ("index", "trigger"):
+            if table not in allowed:
+                return f"it holds {kind} {name} on {table}, which the index writer never creates"
+        else:
+            return f"it holds {kind} {name}, which the index writer never creates"
+    return None
+
+
+def _changed_before_unlink(path: Path, found: os.stat_result) -> str | None:
+    """Why ``path`` must stay after all, checked just before the unlink.
+
+    A SQLite side file beside it, or a device, inode or size that differs
+    from the ``lstat`` the identification read, keeps it.
+    """
+    side = _side_file_reason(path)
+    if side is not None:
+        return side
+    try:
+        now = os.lstat(path)
+    except OSError as exc:
+        return f"cannot stat it again before removal: {exc}"
+    if (now.st_dev, now.st_ino, now.st_size) != (found.st_dev, found.st_ino, found.st_size):
+        return "it changed after it was identified"
+    return None
+
+
+def _one_stderr_line(line: str) -> None:
+    print(" ".join(line.splitlines()), file=sys.stderr)
+
+
+def _remove_stale_index_partials(index: Path, database: Path) -> None:
+    """Remove leftover writer temps beside ``index`` when no writer is running.
+
+    Called after this writer's own publish and after its ``LOCK_SH``
+    descriptor is closed. It opens a new descriptor on the index lock file
+    and asks for ``LOCK_EX | LOCK_NB``. Only when that is granted does it
+    list the directory and look at each name that matches
+    ``_is_index_partial_name``, then close the descriptor. A refused lock,
+    a lock file it cannot open, no fcntl or a listing error removes nothing
+    and prints nothing.
+
+    ``database`` is the resolved ledger database, which lives in the same
+    directory and may itself carry a name that matches the pattern. A
+    candidate whose name begins with the database's file name (its side
+    files and copies named after it), or that is the database's own file
+    (same device and inode, so a hard link under any other name too), is
+    skipped without a word. When the database cannot be stat'ed, no
+    candidate can be compared with it, so nothing is removed.
+
+    Every other candidate is unlinked only when ``_why_not_index_temp``
+    positively identifies it as a disposable index temp and
+    ``_changed_before_unlink`` finds it unchanged. A stat error, a file that
+    is not regular, and every reason either returns leave the file as it
+    was and print one ``search index cleanup skipped PATH: REASON`` line on
+    stderr. A removal error is one line on stderr. Nothing here is raised.
+    """
+    fd = _open_index_lock(index)
+    if fd is None:
+        return
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return
+        directory = index.parent
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            return
+        try:
+            ledger_file = os.lstat(database)
+        except OSError:
+            return
+        ledger_identity = (ledger_file.st_dev, ledger_file.st_ino)
+        for name in names:
+            if not _is_index_partial_name(name):
+                continue
+            if name.startswith(database.name):
+                continue
+            path = directory / name
+            try:
+                found = os.lstat(path)
+            except OSError as exc:
+                _one_stderr_line(f"search index cleanup skipped {path}: cannot stat it: {exc}")
+                continue
+            if not stat.S_ISREG(found.st_mode):
+                _one_stderr_line(f"search index cleanup skipped {path}: not a regular file")
+                continue
+            if (found.st_dev, found.st_ino) == ledger_identity:
+                continue
+            reason = _why_not_index_temp(path, found)
+            if reason is None:
+                reason = _changed_before_unlink(path, found)
+            if reason is not None:
+                _one_stderr_line(f"search index cleanup skipped {path}: {reason}")
+                continue
+            try:
+                os.unlink(path)
+            except OSError as exc:
+                _one_stderr_line(f"cannot remove leftover search index partial {path}: {exc}")
+    finally:
+        _close_quietly(fd)
+
+
 def build_index(db: Path | str, fallback_root: FallbackRoot | None = None) -> dict[str, Any]:
     """Rebuild ``search.db`` from scratch and swap it in atomically."""
     resolved = resolve_db_path(db)
@@ -696,41 +1445,32 @@ def build_index(db: Path | str, fallback_root: FallbackRoot | None = None) -> di
                 path, doc_type, roots, mtime_ns=stat[0] if stat else None))
         except OSError:
             manifest["sources"].pop(str(path), None)
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{SEARCH_DB_NAME}.", suffix=".partial", dir=index.parent)
-    os.close(fd)
-    tmp = Path(tmp_name)
-    try:
-        conn = sqlite3.connect(tmp)
+    with _index_writer_lock(index):
+        tmp = _create_index_partial(index.parent)
         try:
-            for statement in SCHEMA_SQL:
-                conn.execute(statement)
-            for rowid, doc in enumerate(corpus, start=1):
-                conn.execute(
-                    "INSERT INTO fts_corpus (rowid, doc_type, doc_id, title, content) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (rowid, doc.doc_type, doc.doc_id, doc.title, doc.content),
+            conn = sqlite3.connect(tmp)
+            try:
+                for statement in SCHEMA_SQL:
+                    conn.execute(statement)
+                for rowid, doc in enumerate(corpus, start=1):
+                    _insert_doc(conn, rowid, doc)
+                conn.executemany(
+                    "INSERT INTO item_link (item_id, initiative) VALUES (?, ?)", sorted(links)
                 )
-                if doc.path is not None:
-                    conn.execute("INSERT INTO doc_path (rowid, path) VALUES (?, ?)", (rowid, doc.path))
                 conn.execute(
-                    "INSERT INTO doc_meta (rowid, item_id, status, date, ts) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (rowid, doc.item_id, doc.status, doc.date, doc.ts),
+                    "INSERT INTO manifest (key, value) VALUES ('manifest', ?)",
+                    (json.dumps(manifest, sort_keys=True),),
                 )
-            conn.executemany(
-                "INSERT INTO item_link (item_id, initiative) VALUES (?, ?)", sorted(links)
-            )
-            conn.execute(
-                "INSERT INTO manifest (key, value) VALUES ('manifest', ?)",
-                (json.dumps(manifest, sort_keys=True),),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-        os.replace(tmp, index)
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
+                conn.commit()
+            finally:
+                conn.close()
+            _replace_index(tmp, index, resolved)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
+    # The shared lock is released: a cleanup that ran inside it would refuse
+    # its own exclusive lock and never remove anything.
+    _remove_stale_index_partials(index, resolved)
     counts: dict[str, int] = {}
     for doc in corpus:
         counts[doc.doc_type] = counts.get(doc.doc_type, 0) + 1
@@ -745,6 +1485,141 @@ def build_index(db: Path | str, fallback_root: FallbackRoot | None = None) -> di
     }
 
 
+# --- refresh ----------------------------------------------------------------
+
+
+def _indexed_ledger_docs(conn: sqlite3.Connection) -> list[tuple[int, Doc]]:
+    """Every ledger document in the index, with its rowid."""
+    rows = conn.execute(
+        "SELECT fts_corpus.rowid, fts_corpus.doc_type, fts_corpus.doc_id, "
+        "fts_corpus.title, fts_corpus.content, doc_path.path, doc_meta.item_id, "
+        "doc_meta.status, doc_meta.date, doc_meta.ts FROM fts_corpus "
+        "LEFT JOIN doc_path ON doc_path.rowid = fts_corpus.rowid "
+        "LEFT JOIN doc_meta ON doc_meta.rowid = fts_corpus.rowid "
+        f"WHERE fts_corpus.doc_type IN ({', '.join('?' for _ in LEDGER_DOC_TYPES)})",
+        LEDGER_DOC_TYPES,
+    ).fetchall()
+    return [(row[0], Doc(*row[1:])) for row in rows]
+
+
+def _append_into(
+    conn: sqlite3.Connection, resolved: Path, fallback_root: FallbackRoot | None
+) -> dict[str, Any] | None:
+    """Bring the index open on ``conn`` (a private copy) up to the ledger's
+    tail. ``None`` when the copy is anything but behind: the caller rebuilds.
+
+    The stored manifest is read from the copy itself, so the check and the
+    write see the same index.
+    """
+    row = conn.execute("SELECT value FROM manifest WHERE key = 'manifest'").fetchone()
+    if row is None:
+        return None
+    stored = json.loads(row[0])
+    if not isinstance(stored, dict):
+        return None
+    roots, note = resolve_roots(load_config(resolved), fallback_root)
+    last, items, events = _read_ledger(resolved)
+    sources = collect_sources(roots, linked_refs(events))
+    current = _manifest(resolved, last, events, roots, sources)
+    new_events, _reason = trailing_events(stored, events)
+    # Only the clean-prefix case with something new; any other difference
+    # (format, ranker, database, roots, a source, a rewritten log) rebuilds.
+    if manifest_differences(stored, current) or not new_events:
+        return None
+    # The ledger side is recomputed exactly as a full build would, and the
+    # index is made to hold that multiset: documents the tail changed (an
+    # item's notes, status or date; the status on its questions) are deleted
+    # and re-inserted, new ones are inserted, the rest stay.
+    wanted = Counter(ledger_docs(items, events))
+    for rowid, doc in _indexed_ledger_docs(conn):
+        if wanted[doc] > 0:
+            wanted[doc] -= 1
+        else:
+            _delete_doc(conn, rowid)
+    rowid = conn.execute("SELECT COALESCE(MAX(rowid), 0) FROM fts_corpus").fetchone()[0]
+    for doc in wanted.elements():
+        rowid += 1
+        _insert_doc(conn, rowid, doc)
+    conn.execute("DELETE FROM item_link")
+    conn.executemany(
+        "INSERT INTO item_link (item_id, initiative) VALUES (?, ?)",
+        sorted(initiative_links(events)),
+    )
+    conn.execute(
+        "UPDATE manifest SET value = ? WHERE key = 'manifest'",
+        (json.dumps(current, sort_keys=True),),
+    )
+    counts = dict(conn.execute(
+        "SELECT doc_type, COUNT(*) FROM fts_corpus GROUP BY doc_type ORDER BY doc_type"
+    ).fetchall())
+    return {
+        "docs": sum(counts.values()),
+        "by_type": counts,
+        "last_event_id": last,
+        "roots": current["roots"],
+        "sources": len(current["sources"]),
+        "note": note,
+        "refresh": "append",
+        "new_events": new_events,
+    }
+
+
+def _append_trailing(
+    resolved: Path, index: Path, fallback_root: FallbackRoot | None
+) -> dict[str, Any] | None:
+    """Append the ledger's tail to a behind index on a copy and swap the copy
+    in, as ``build_index`` swaps a new index in. ``None`` when there is no
+    index to start from or it is not behind."""
+    try:
+        source = _open_index(index)
+    except SearchError:
+        return None
+    tmp: Path | None = None
+    try:
+        with _index_writer_lock(index):
+            try:
+                tmp = _create_index_partial(index.parent)
+                conn = sqlite3.connect(tmp)
+                try:
+                    source.backup(conn)
+                    source.close()
+                    summary = _append_into(conn, resolved, fallback_root)
+                    if summary is None:
+                        return None
+                    conn.commit()
+                finally:
+                    conn.close()
+                _replace_index(tmp, index, resolved)
+                tmp = None
+            finally:
+                if tmp is not None:
+                    tmp.unlink(missing_ok=True)
+    finally:
+        source.close()
+    _remove_stale_index_partials(index, resolved)
+    return {"path": str(index), **summary}
+
+
+def refresh_index(db: Path | str, fallback_root: FallbackRoot | None = None) -> dict[str, Any]:
+    """Bring ``search.db`` up to date: append the ledger's tail to a behind
+    index, otherwise rebuild it from scratch.
+
+    The summary is ``build_index``'s plus ``refresh`` (``append`` or
+    ``rebuild``); an append also gives ``new_events``. Any doubt or error in
+    the append takes the full rebuild, which reports its own errors, so a
+    partial index is never swapped in as current.
+    """
+    resolved = resolve_db_path(db)
+    refuse_inside_git(resolved)
+    try:
+        summary = _append_trailing(resolved, search_db_path(resolved), fallback_root)
+    except Exception:  # fail closed: the full rebuild decides
+        summary = None
+    if summary is not None:
+        return summary
+    return {**build_index(resolved, fallback_root), "refresh": "rebuild"}
+
+
 # --- query ------------------------------------------------------------------
 
 
@@ -753,7 +1628,8 @@ def match_expression(query: str) -> str:
 
     Common English words are dropped unless nothing else is left. A
     hyphenated word stays one quoted phrase, so ``feed-condenser`` matches
-    the two words in order.
+    the two words in order; so does a dotted word, a dot between two word
+    characters (``release.notes``).
     """
     terms = _TERM.findall(query)
     kept = [term for term in terms if term.lower() not in _STOPWORDS] or terms
@@ -792,27 +1668,9 @@ def _iso(moment: datetime) -> str:
     return moment.isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
-def search(
-    db: Path | str,
-    query: str,
-    *,
-    limit: int,
-    doc_type: str | None = None,
-    status: str | None = None,
-    item: str | None = None,
-    initiative: str | None = None,
-    since: datetime | None = None,
-    until: datetime | None = None,
-    fallback_root: FallbackRoot | None = None,
-) -> dict[str, Any]:
-    """Refresh the index when it is missing or stale, then rank hits.
-
-    The filters narrow the text match in the same query; ``since`` and
-    ``until`` are inclusive and must be timezone-aware.
-    """
-    expression = match_expression(query)
-    if not expression:
-        raise SearchError("the query has no searchable words")
+def _check_options(
+    limit: Any, status: str | None, since: datetime | None, until: datetime | None
+) -> None:
     if type(limit) is not int or not 1 <= limit <= MAX_LIMIT:
         raise SearchError(f"limit must be an integer from 1 to {MAX_LIMIT}")
     if status is not None and status not in ITEM_STATUSES:
@@ -822,30 +1680,58 @@ def search(
             raise SearchError(f"{name} must be a timezone-aware datetime")
     if since is not None and until is not None and since > until:
         raise SearchError("since is after until")
+
+
+def _current_index(
+    db: Path | str, fallback_root: FallbackRoot | None, refresh: bool
+) -> tuple[Path, bool]:
+    """The index path, brought up to date when it is not current, and whether
+    it was. With ``refresh`` false a stale index raises ``IndexNotCurrent``."""
     resolved = resolve_db_path(db)
     refuse_inside_git(resolved)
     # Named apart from the status filter, which it would otherwise replace.
     index_state = index_status(resolved, fallback_root)
     refreshed = index_state["status"] != "current"
+    if refreshed and not refresh:
+        raise IndexNotCurrent(
+            f"the search index is {index_state['status']}, not current, and was not refreshed"
+        )
     if refreshed:
         try:
-            build_index(resolved, fallback_root)
+            refresh_index(resolved, fallback_root)
         except (OSError, sqlite3.Error) as exc:
             # Never answer from the out-of-date index it could not replace.
             raise SearchError(
                 f"cannot rebuild the search index {search_db_path(resolved)}: {exc}"
             ) from exc
-    index = search_db_path(resolved)
-    sql = (
+    return search_db_path(resolved), refreshed
+
+
+def _select_sql(extra_columns: str = "") -> str:
+    return (
         "SELECT fts_corpus.doc_type, fts_corpus.doc_id, fts_corpus.title, "
         f"snippet(fts_corpus, 3, '[', ']', '…', {SNIPPET_TOKENS}), "
         f"{RANK_SQL} AS rank, doc_path.path, "
-        "doc_meta.item_id, doc_meta.status, doc_meta.date "
+        f"doc_meta.item_id, doc_meta.status, doc_meta.date{extra_columns} "
         "FROM fts_corpus LEFT JOIN doc_path ON doc_path.rowid = fts_corpus.rowid "
         "LEFT JOIN doc_meta ON doc_meta.rowid = fts_corpus.rowid "
         "WHERE fts_corpus MATCH ?"
     )
-    params: list[Any] = [expression]
+
+
+def _filter_sql(
+    *,
+    doc_type: str | None,
+    status: str | None,
+    item: str | None,
+    initiative: str | None,
+    since: datetime | None,
+    until: datetime | None,
+) -> tuple[str, list[Any], dict[str, str]]:
+    """The ``AND ...`` clauses for the filters, their parameters, and the
+    ``filters`` a result reports."""
+    sql = ""
+    params: list[Any] = []
     filters: dict[str, str] = {}
     if doc_type is not None:
         sql += " AND fts_corpus.doc_type = ?"
@@ -871,34 +1757,69 @@ def search(
         sql += " AND doc_meta.ts <= ?"
         params.append(_micros(until))
         filters["until"] = _iso(until.astimezone(UTC))
-    sql += " ORDER BY rank LIMIT ?"
-    params.append(limit + 1)
-    conn = sqlite3.connect(index.as_uri() + "?mode=ro", uri=True)
+    return sql, params, filters
+
+
+def _card(row: Sequence[Any]) -> dict[str, Any]:
+    kind, doc_id, title, snippet, rank, path, item_id, item_status, when = row[:9]
+    card: dict[str, Any] = {
+        "score": round(-rank, 4),
+        "doc_type": kind,
+        "id": doc_id,
+        "title": title,
+        "snippet": " ".join(snippet.split()),
+    }
+    if path is not None:
+        card["path"] = path
+    for key, value in (("item_id", item_id), ("status", item_status), ("date", when)):
+        if value is not None:
+            card[key] = value
+    if kind == "utterance":
+        card["caveat"] = UTTERANCE_CAVEAT
+    return card
+
+
+def search(
+    db: Path | str,
+    query: str,
+    *,
+    limit: int,
+    doc_type: str | None = None,
+    status: str | None = None,
+    item: str | None = None,
+    initiative: str | None = None,
+    since: datetime | None = None,
+    until: datetime | None = None,
+    fallback_root: FallbackRoot | None = None,
+    refresh: bool = True,
+) -> dict[str, Any]:
+    """Refresh the index when it is not current, then rank hits.
+
+    The filters narrow the text match in the same query; ``since`` and
+    ``until`` are inclusive and must be timezone-aware. With ``refresh=False``
+    the index is never rewritten: one that is not current raises
+    ``IndexNotCurrent`` instead (the search-miss replay reads this way).
+    """
+    expression = match_expression(query)
+    if not expression:
+        raise SearchError("the query has no searchable words")
+    _check_options(limit, status, since, until)
+    index, refreshed = _current_index(db, fallback_root, refresh)
+    filter_sql, filter_params, filters = _filter_sql(
+        doc_type=doc_type, status=status, item=item, initiative=initiative,
+        since=since, until=until,
+    )
+    sql = _select_sql() + filter_sql + " ORDER BY rank LIMIT ?"
+    params: list[Any] = [expression, *filter_params, limit + 1]
+    conn = _open_index(index)
     try:
         rows = conn.execute(sql, params).fetchall()
     except sqlite3.OperationalError as exc:
         raise SearchError(f"search failed: {exc}") from exc
     finally:
         conn.close()
-    cards = []
-    for kind, doc_id, title, snippet, rank, path, item_id, item_status, when in rows[:limit]:
-        card: dict[str, Any] = {
-            "score": round(-rank, 4),
-            "doc_type": kind,
-            "id": doc_id,
-            "title": title,
-            "snippet": " ".join(snippet.split()),
-        }
-        if path is not None:
-            card["path"] = path
-        for key, value in (("item_id", item_id), ("status", item_status), ("date", when)):
-            if value is not None:
-                card[key] = value
-        if kind == "utterance":
-            card["caveat"] = UTTERANCE_CAVEAT
-        cards.append(card)
     return {
-        "cards": cards,
+        "cards": [_card(row) for row in rows[:limit]],
         "filters": filters,
         "limit": limit,
         "query": query,
@@ -906,3 +1827,212 @@ def search(
         "refreshed": refreshed,
         "truncated": len(rows) > limit,
     }
+
+
+# --- mentions ---------------------------------------------------------------
+
+
+class UnknownItem(SearchError):
+    """``mentions`` was given an id that names no item in the ledger."""
+
+
+@dataclass(frozen=True)
+class Mention:
+    """One document on another item that names an item: where to read it."""
+
+    item_id: str
+    event: int
+    text: str
+    doc_type: str
+
+
+def names_item(text: str | None, item_id: str) -> bool:
+    """True when ``text`` holds ``item_id`` as a whole token, exactly as
+    stored (case and all): ``child-item`` is not in ``child-item-2``,
+    ``xchild-item`` or ``Child-Item``, and is in ``see child-item.``."""
+    if not text or not item_id:
+        return False
+    return re.search(_ID_LEFT + re.escape(item_id) + _ID_RIGHT, text) is not None
+
+
+def _event_number(doc_id: str) -> int | None:
+    """The event id a ledger document's id ends in (``<item>:<N>`` or
+    ``event:<N>``), or ``None`` for any other shape."""
+    # No colon leaves ``head`` empty, as a leading colon does.
+    head, _sep, tail = doc_id.rpartition(":")
+    if not head or not tail.isascii() or not tail.isdigit():
+        return None
+    return int(tail)
+
+
+def _decided_note_docs(db: Path) -> frozenset[str]:
+    """The document ids of the ``decided:`` notes: the ``item.note`` events
+    ``decided_note_text`` accepts, as ``ledger_docs`` ids them.
+
+    The index does not say which event a decision document came from, and a
+    ``decision.recorded`` whose effect and verbatim words both start with
+    ``decided:`` looks exactly like a note, so the source event decides.
+    """
+    _last, _items, events = _read_ledger(db)
+    return frozenset(
+        f"{event.item_id}:{event.id}" for event in events if decided_note_text(event) is not None
+    )
+
+
+def _decided_loader(db: Path) -> Callable[[], frozenset[str]]:
+    """``_decided_note_docs`` of ``db``, read on first use and kept for the
+    one call that made the loader, so a search with no decision candidate
+    never reads the events."""
+    cache: list[frozenset[str]] = []
+
+    def load() -> frozenset[str]:
+        if not cache:
+            cache.append(_decided_note_docs(db))
+        return cache[0]
+
+    return load
+
+
+def _mention_tier(row: Sequence[Any], decided: frozenset[str]) -> int:
+    """0 for a ``decided:`` note, 1 for any other decision document, 2 for
+    the rest. A ``decided:`` note is a decision document whose id is in
+    ``decided``, the ids of the ``item.note`` events (never a recorded
+    decision whose text happens to start the same way)."""
+    if row[0] != "decision":
+        return 2
+    return 0 if row[1] in decided else 1
+
+
+def _mention_rows(
+    conn: sqlite3.Connection,
+    item_id: str,
+    expression: str,
+    filter_sql: str,
+    filter_params: Sequence[Any],
+    decided: Callable[[], frozenset[str]],
+) -> list[tuple]:
+    """Every document on another item that names ``item_id``: decision
+    documents first, ``decided:`` notes before the other decisions, then the
+    rest, each group in rank order.
+
+    The index match only narrows the candidates: one whose title and content
+    both lack the whole token is dropped. Every candidate is read before any
+    cut, so a dropped one never costs a result its place.
+    """
+    sql = (
+        _select_sql(", fts_corpus.content")
+        + " AND fts_corpus.doc_type <> 'item'"
+        # ``<>`` is unknown for a document with no item (a standard), which
+        # drops it: it is not on another item.
+        + " AND doc_meta.item_id <> ?"
+        + filter_sql
+        + " ORDER BY rank, fts_corpus.rowid"
+    )
+    rows = conn.execute(sql, [expression, item_id, *filter_params]).fetchall()
+    kept = [row for row in rows if names_item(row[2], item_id) or names_item(row[9], item_id)]
+    # Only a decision candidate needs the events: the index does not say
+    # which event kind a decision document came from.
+    notes = decided() if any(row[0] == "decision" for row in kept) else frozenset()
+    # A stable sort: within each group the rank order stays.
+    kept.sort(key=lambda row: _mention_tier(row, notes))
+    return kept
+
+
+def mentions(
+    db: Path | str,
+    item_id: str,
+    *,
+    limit: int,
+    doc_type: str | None = None,
+    status: str | None = None,
+    item: str | None = None,
+    initiative: str | None = None,
+    since: datetime | None = None,
+    until: datetime | None = None,
+    fallback_root: FallbackRoot | None = None,
+    refresh: bool = True,
+) -> dict[str, Any]:
+    """The documents on other items that name ``item_id``, as ``search``
+    returns its cards: decision documents first (``decided:`` notes before
+    the others), then the rest, each group by rank.
+
+    Takes ``search``'s filters and limit. An id that names no item raises
+    ``UnknownItem``. The result is ``search``'s shape; ``query`` is the id and
+    ``filters`` carries it as ``mentions``.
+    """
+    if type(item_id) is not str:
+        raise SearchError("the item id must be a string")
+    _check_options(limit, status, since, until)
+    index, refreshed = _current_index(db, fallback_root, refresh)
+    filter_sql, filter_params, filters = _filter_sql(
+        doc_type=doc_type, status=status, item=item, initiative=initiative,
+        since=since, until=until,
+    )
+    conn = _open_index(index)
+    try:
+        known = conn.execute(
+            "SELECT 1 FROM fts_corpus WHERE doc_type = 'item' AND doc_id = ? LIMIT 1",
+            (item_id,),
+        ).fetchone()
+        if known is None:
+            raise UnknownItem(f"no item named {item_id!r} in the ledger")
+        expression = match_expression(item_id)
+        if not expression:
+            raise SearchError(f"the item id has no searchable words: {item_id!r}")
+        rows = _mention_rows(
+            conn, item_id, expression, filter_sql, filter_params,
+            _decided_loader(resolve_db_path(db)),
+        )
+    except sqlite3.OperationalError as exc:
+        raise SearchError(f"search failed: {exc}") from exc
+    finally:
+        conn.close()
+    return {
+        "cards": [_card(row) for row in rows[:limit]],
+        "filters": {"mentions": item_id, **filters},
+        "limit": limit,
+        "query": item_id,
+        "ranker": RANKER,
+        "refreshed": refreshed,
+        "truncated": len(rows) > limit,
+    }
+
+
+def item_mentions(
+    db: Path | str,
+    item_ids: Iterable[str],
+    *,
+    per_item: int = MENTION_LINES,
+    fallback_root: FallbackRoot | None = None,
+) -> dict[str, list[Mention]]:
+    """For each item id, up to ``per_item`` of the documents that name it,
+    decision documents first, as ``Mention`` records a text line can print.
+
+    Reads the index once. A mention whose document id carries no event number
+    is left out, never printed without one.
+    """
+    ids = list(dict.fromkeys(item_ids))
+    if not ids:
+        return {}
+    index, _refreshed = _current_index(db, fallback_root, True)
+    found: dict[str, list[Mention]] = {}
+    decided = _decided_loader(resolve_db_path(db))
+    conn = _open_index(index)
+    try:
+        for item_id in ids:
+            expression = match_expression(item_id)
+            found[item_id] = []
+            if not expression:
+                continue
+            for row in _mention_rows(conn, item_id, expression, "", (), decided):
+                event = _event_number(row[1])
+                if event is None:
+                    continue
+                found[item_id].append(Mention(row[6], event, row[2], row[0]))
+                if len(found[item_id]) >= per_item:
+                    break
+    except sqlite3.OperationalError as exc:
+        raise SearchError(f"search failed: {exc}") from exc
+    finally:
+        conn.close()
+    return found
