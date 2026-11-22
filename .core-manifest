@@ -99,6 +99,8 @@ skills/_lib/ledger/tests/test_item_text_escape.py
 skills/_lib/ledger/tests/test_ledger.py
 skills/_lib/ledger/tests/test_link_duplicate_of.py
 skills/_lib/ledger/tests/test_links_verb.py
+skills/_lib/ledger/tests/test_loop_hand_off.py
+skills/_lib/ledger/tests/test_loop_pr_link.py
 skills/_lib/ledger/tests/test_loop_writer_identity.py
 skills/_lib/ledger/tests/test_newer_schema_refused.py
 skills/_lib/ledger/tests/test_open_proof.py

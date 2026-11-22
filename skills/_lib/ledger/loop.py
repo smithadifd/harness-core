@@ -10,11 +10,19 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping
 
 from . import lease
-from .schema import LOOP_OPERATIONS, ValidationError
-from .store import Event, Ledger, canonical_dumps
+from .receipts import _pull_request, pr_url
+from .schema import (
+    _EVENT_ID,
+    _RECEIPT_REPO,
+    LOOP_HAND_OFF_VERSION,
+    LOOP_OPERATIONS,
+    ValidationError,
+    _check_field,
+)
+from .store import Event, Ledger, _event_from_row, canonical_dumps
 
 _LOOP_WRITER_CAPABILITY = object()
 
@@ -28,6 +36,14 @@ class OperationState:
 
 @dataclass(frozen=True)
 class OperationClaim:
+    event: Event
+    created: bool
+
+
+@dataclass(frozen=True)
+class PullRequestLink:
+    """The item's pull request link, and whether this call wrote it."""
+
     event: Event
     created: bool
 
@@ -69,6 +85,54 @@ def operation_state(
     intent = next((e for e in matching if e.kind == "loop.intent"), None)
     done = next((e for e in matching if e.kind == "loop.done"), None)
     return OperationState("finished" if done else "started", intent, done)
+
+
+# The reader rule for a hand-off: the item's loop.intent events of payload
+# version 2 that no loop.done on the item names by the same operation and
+# operation id. Never the item's child-of links.
+_OPEN_HAND_OFFS_SQL = (
+    "SELECT intent.* FROM events AS intent "
+    "WHERE intent.item_id = ? AND intent.kind = 'loop.intent' "
+    "AND intent.payload_version = ? "
+    "AND NOT EXISTS (SELECT 1 FROM events AS done "
+    "WHERE done.item_id = intent.item_id AND done.kind = 'loop.done' "
+    "AND json_extract(done.payload, '$.operation') = "
+    "json_extract(intent.payload, '$.operation') "
+    "AND json_extract(done.payload, '$.operation_id') = "
+    "json_extract(intent.payload, '$.operation_id')) "
+    "ORDER BY intent.id"
+)
+
+
+def _open_hand_off(conn: sqlite3.Connection, item_id: str) -> sqlite3.Row | None:
+    """The item's one open hand-off row on ``conn``, else None.
+
+    The one read behind ``open_hand_off`` and ``claim_operation``'s
+    refusal of a second hand-off, so the reader and the refusal cannot
+    disagree. Two open hand-offs (only a restored chain can hold them: the
+    writer refuses a second one) raise ``loop-hand-off-ambiguous:<item>``;
+    neither is picked.
+    """
+    cursor = conn.execute(_OPEN_HAND_OFFS_SQL, (item_id, LOOP_HAND_OFF_VERSION))
+    cursor.row_factory = sqlite3.Row
+    rows = cursor.fetchall()
+    if len(rows) > 1:
+        raise ValidationError(f"loop-hand-off-ambiguous:{item_id}")
+    return rows[0] if rows else None
+
+
+def open_hand_off(ledger: Ledger, item_id: str) -> Event | None:
+    """The item's open hand-off, else None.
+
+    DESIGN (the reader rule): an item's hand-off is its one ``loop.intent``
+    of payload version 2 with no ``loop.done`` naming the same operation
+    and operation id. With none the item is not handed off: the person
+    controls it and the seams are the defaults. A version 1 intent is
+    never a hand-off. Two open ones raise ``ValidationError``
+    (``loop-hand-off-ambiguous:<item>``) rather than one being picked.
+    """
+    row = _open_hand_off(ledger._conn, item_id)
+    return None if row is None else _event_from_row(row)
 
 
 def held_by_needs_you(conn: sqlite3.Connection, item_id: str) -> bool:
@@ -233,6 +297,23 @@ def restamp_claim(ledger: Ledger, item_id: str, holder: str, *, idempotency_key:
         return _restamp_handed_off(ledger, item_id, holder, idempotency_key)
 
 
+def _has_pr_link(conn: sqlite3.Connection, item_id: str) -> bool:
+    """True when the item has any ``item.linked`` with rel ``pr``, whatever
+    its target, form or key.
+
+    The one read behind ``manage_item``'s refusal of an item that already
+    has a pull request link and ``link_pull_request``'s refusal of a second
+    one, so the two cannot disagree.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM events "
+        "WHERE item_id = ? AND kind = 'item.linked' "
+        "AND json_extract(payload, '$.rel') = 'pr' LIMIT 1",
+        (item_id,),
+    ).fetchone()
+    return row is not None
+
+
 def manage_item(
     ledger: Ledger,
     item_id: str,
@@ -261,13 +342,7 @@ def manage_item(
             raise ValidationError(f"missing-item:{item_id}")
         if held_by_needs_you(conn, item_id):
             raise ValidationError(f"held-needs-you-item:{item_id}")
-        pr_link = conn.execute(
-            "SELECT 1 FROM events "
-            "WHERE item_id = ? AND kind = 'item.linked' "
-            "AND json_extract(payload, '$.rel') = 'pr' LIMIT 1",
-            (item_id,),
-        ).fetchone()
-        if pr_link is not None:
+        if _has_pr_link(conn, item_id):
             raise ValidationError(f"loop-pr-link-already-exists:{item_id}")
 
     return ledger._append_loop_event(
@@ -426,6 +501,8 @@ def claim_operation(
     source: str | None = None,
     holder: str | None = None,
     hand_off: bool = False,
+    controller: str | None = None,
+    seams: Mapping[str, str] | None = None,
     actor: str | None = None,
     harness: str | None = None,
     model: str | None = None,
@@ -439,10 +516,29 @@ def claim_operation(
     (a session-mode step), the same transaction rewrites the holder's own
     claim unstamped, so it does not expire while the session works (see
     ``take_item``). A retried intent writes nothing.
+
+    DESIGN (the hand-off): ``controller`` and ``seams`` make the intent a
+    hand-off, a ``loop.intent`` of payload version 2 that names who
+    controls the build and the implementation of each of the seams
+    ``build``, ``review`` and ``outward``. Either field writes version 2,
+    whose schema requires both and allows only the ``build`` operation;
+    without them the intent is version 1, exactly as before. They are
+    refused without ``hand_off`` (``hand-off-fields-need-hand-off``), so a
+    hand-off is always written by the holder of the item's live claim. In
+    the intent's transaction a hand-off is also refused while another one
+    on the item is open (``loop-hand-off-open:<its operation id>``), by the
+    same read as ``open_hand_off``. The idempotency key is the same for
+    both versions, so a retry under the operation id with another
+    controller, other seams or the other version is a key conflict, and
+    the stored intent never changes. Any refusal writes nothing: no
+    intent and no unstamped claim.
     """
     _require_operation(operation)
     if hand_off and holder is None:
         raise ValidationError("hand-off-needs-holder")
+    handing_off = controller is not None or seams is not None
+    if handing_off and not hand_off:
+        raise ValidationError("hand-off-fields-need-hand-off")
     payload: dict[str, Any] = {"operation": operation, "operation_id": operation_id}
     for key, value in (
         ("target", target),
@@ -452,6 +548,12 @@ def claim_operation(
     ):
         if value is not None:
             payload[key] = value
+    if controller is not None:
+        payload["controller"] = controller
+    if seams is not None:
+        # A copy, so the caller's dict never aliases the stored payload.
+        payload["seams"] = dict(seams) if type(seams) is dict else seams
+    payload_version = LOOP_HAND_OFF_VERSION if handing_off else 1
     created = False
 
     def managed(conn: sqlite3.Connection) -> None:
@@ -464,6 +566,12 @@ def claim_operation(
             raise ValidationError(f"loop-item-not-managed:{item_id}")
         if holder is not None:
             check_holder(conn, item_id, holder, f"{operation} intent not written", live=True)
+        if handing_off:
+            other = _open_hand_off(conn, item_id)
+            if other is not None:
+                raise ValidationError(
+                    f"loop-hand-off-open:{json.loads(other['payload'])['operation_id']}"
+                )
         created = True
 
     with ledger.transaction():
@@ -472,6 +580,7 @@ def claim_operation(
             ignore_retry_attribution=True,
             kind="loop.intent",
             payload=payload,
+            payload_version=payload_version,
             item_id=item_id,
             idempotency_key=f"loop:{item_id}:{operation}:{operation_id}:intent",
             precondition=managed,
@@ -600,6 +709,98 @@ def finish_operation(
     return event
 
 
+def link_pull_request(
+    ledger: Ledger,
+    item_id: str,
+    holder: str,
+    repo: str,
+    pr: int,
+    *,
+    actor: str | None = None,
+    harness: str | None = None,
+    model: str | None = None,
+    session: str | None = None,
+) -> PullRequestLink:
+    """Record the pull request of a loop-managed item, as the holder of its live claim.
+
+    DESIGN: on a loop-managed item an ``item.linked`` with rel ``pr`` exists
+    only when this writer wrote it, as the holder of the item's live claim,
+    naming one pull request in the one stored form, while the item had no
+    other ``pr`` link and no other item linked that pull request. The
+    generic writers stay refused (``reserved-transition:loop-pr``); this
+    writer goes through the store's one door for it
+    (``Ledger._append_loop_pr_link``).
+
+    The event is an ordinary ``item.linked``, payload version 1, exactly
+    ``{"rel": "pr", "target": pr_url(repo, pr)}``: the lowercase URL that
+    ``ledger.receipts.pr_item`` and the merge records look up. The key is
+    ``loop:<item>:pr-link:<target>``.
+
+    Grammar, checked before the transaction: ``holder`` a non-empty string
+    (else ``loop-pr-link-needs-holder``); ``repo`` under the receipt repo
+    rule, a lowercase ``owner/repo`` of at most 200 characters, refused and
+    never folded (``bad-type:repo``, ``too-long:repo``); ``pr`` under the
+    receipt number rule, an integer from 1 to 2^63-1 (``bad-type:pr``,
+    ``too-large:pr``).
+
+    An exact retry (the same item and pull request) returns the stored
+    event with ``created`` false and writes nothing; it re-reads no claim,
+    so ``created`` false is not proof of holding it. Retry stamps (actor,
+    harness, model, session) are ignored, as for the other loop writes.
+
+    Otherwise, inside the write's transaction, in this order: the item must
+    be loop-managed (``loop-item-not-managed:<item>``); ``holder`` must
+    hold its live claim (``check_holder``, live: ``claim_lost``); the item
+    must have no ``pr`` link at all (``loop-pr-link-already-exists:<item>``);
+    and no other item may link the pull request, compared as ``pr_item``
+    compares (``loop-pr-linked-elsewhere:<that item>``). A key already
+    holding another event is the store's ``IdempotencyConflict``. Every
+    refusal writes nothing. The hand-off is not read and not required.
+    """
+    if type(holder) is not str or not holder:
+        raise ValidationError("loop-pr-link-needs-holder")
+    _check_field(repo, _RECEIPT_REPO, "repo")
+    _check_field(pr, _EVENT_ID, "pr")
+    target = pr_url(repo, pr)
+    wanted = _pull_request(target)
+    created = False
+
+    def linkable(conn: sqlite3.Connection) -> None:
+        nonlocal created
+        managed = conn.execute(
+            "SELECT 1 FROM events WHERE item_id = ? AND kind = 'loop.managed' LIMIT 1",
+            (item_id,),
+        ).fetchone()
+        if managed is None:
+            raise ValidationError(f"loop-item-not-managed:{item_id}")
+        check_holder(conn, item_id, holder, "pull request link not written", live=True)
+        if _has_pr_link(conn, item_id):
+            raise ValidationError(f"loop-pr-link-already-exists:{item_id}")
+        # The reader's comparison (receipts.pr_item): the URL or the
+        # owner/repo#N form, owner and repo casefolded, the number an integer.
+        for row in conn.execute(
+            "SELECT item_id, payload FROM events "
+            "WHERE kind = 'item.linked' AND item_id != ? ORDER BY id",
+            (item_id,),
+        ):
+            payload = json.loads(row["payload"])
+            if payload.get("rel") == "pr" and _pull_request(payload.get("target")) == wanted:
+                raise ValidationError(f"loop-pr-linked-elsewhere:{row['item_id']}")
+        created = True
+
+    event = ledger._append_loop_pr_link(
+        _LOOP_WRITER_CAPABILITY,
+        ignore_retry_attribution=True,
+        kind="item.linked",
+        payload={"rel": "pr", "target": target},
+        item_id=item_id,
+        idempotency_key=f"loop:{item_id}:pr-link:{target}",
+        precondition=linkable,
+        **_metadata(actor, harness, model, session),
+    )
+    return PullRequestLink(event, created)
+
+
 def close_item(
     ledger: Ledger,
     item_id: str,
@@ -651,10 +852,13 @@ def close_item(
 
 __all__ = [
     "OperationState",
+    "PullRequestLink",
     "check_holder",
     "close_item",
     "finish_operation",
+    "link_pull_request",
     "manage_item",
+    "open_hand_off",
     "operation_state",
     "record_progress",
     "restamp_claim",

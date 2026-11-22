@@ -3,6 +3,51 @@
 Each tag of this repository gets an entry: what changed in the vendored files,
 and any pin move of the vendored ledger.
 
+## v0.3.2
+
+Everything merged since v0.3.1. Neither plugin moves, so a machine that
+installed v0.3.1 keeps the same plugin builds when it moves to this tag:
+`harness` and `rails` stay at 0.2.0. The marketplace's `ledger-hooks` pin
+moves from ledger `v0.6.3` to `v0.7.0`, and `ledger-vendor.pin` and the
+vendored `skills/_lib/ledger` copy move from `v0.6.3` to `v0.7.0`. The
+marketplace's `sdlc` pin stays at skills `v1.5.0`.
+
+The pin and the vendored ledger:
+
+- Installing this tag gets ledger `v0.7.0` for `ledger-hooks` (plugin list
+  version 0.7.0) and for the copy under `skills/_lib/ledger`. The three
+  plugin options are unchanged, and v0.7.0 adds no new hook. No new SQL
+  migration: schema 10 in both v0.6.3 and v0.7.0, verified from the ledger
+  diff `v0.6.3..v0.7.0` (no file under `ledger/migrations` changes).
+- The search index format is 4 in both v0.6.3 and v0.7.0, verified from the
+  same diff (`INDEX_FORMAT` stays 4). An index built at v0.6.3 stays current.
+- The plugin manifest's only change in that diff is its version, 0.6.3 to
+  0.7.0.
+- A hand-off is a `loop.intent` of payload version 2 that names the build's
+  controller and its seams. `claim_operation` takes `controller` and `seams`
+  with `hand_off=True` on a `build` operation, and `open_hand_off` returns
+  the item's one open hand-off. Without the fields `claim_operation` writes
+  version 1 exactly as before. No new verb, flag or hook.
+- A loop-managed item's pull request link has a reserved writer:
+  `link_pull_request` writes an ordinary `item.linked` with rel `pr`, payload
+  version 1, through one capability-checked door in the store. The generic
+  writers are still refused on a managed item. No new kind, payload version,
+  verb or flag.
+
+Upgrade readers before the writer. A copy of the ledger at 0.6.3 or earlier
+that reads a database or export holding a hand-off refuses it with
+`unknown-version:loop.intent:2`: `verify`, `verify_export` and `restore
+--accept-loop-events` stop, and `export --commit` refuses the record, so a
+scheduled `export --commit` fails. Move every copy that reads the database (a
+vendored copy and the `ledger-hooks` plugin included) to v0.7.0 before
+anything writes a hand-off. Nothing changes until one is written. The pull
+request link needs no upgrade first: an older copy reads it as any other `pr`
+link.
+
+No plugin change:
+
+- The README's named current tag moves to `v0.3.2`.
+
 ## v0.3.1
 
 Everything merged since v0.3.0. Neither plugin moves, so a machine that

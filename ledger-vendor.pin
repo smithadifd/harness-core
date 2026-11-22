@@ -28,9 +28,9 @@
 # .pyc file). At least one manifest line, sorted ascending by byte value,
 # no duplicates. The manifest is `git ls-tree -r <sha> ledger/` of the commit.
 repo smithadifd/ledger
-tag v0.6.3
-sha f6021b4796f3a3f1fc931bec7ae70a1162bc9cf1
-a3bbe3265d4c033459ba962b4ce044908cce337d __init__.py
+tag v0.7.0
+sha a8b4290d0af03b9833fa38e83d05cddfd9bcac19
+fdb904374a3c018fa840c26732365edb8df1f09e __init__.py
 3d2c7ebc6f4050ab400c9623bc020c70ca969bb3 __main__.py
 07b2e97ca67db690f26b77095129c449f2cd18df _sqlite_handle.py
 91c6696f4add145db5164a5cb7812d26538ee72a agent_contract.md
@@ -46,7 +46,7 @@ a3bbe3265d4c033459ba962b4ce044908cce337d __init__.py
 cd82656852e4d2365a1e8eab6b21f64907815174 gen_verb_registry.py
 fa95c38973803d98093c69e1d689c557654d3bf2 guidance.py
 4fb5c100b2b9c1b1d4d8c15abf33636845011bd1 lease.py
-3be24a887ecf0d2de4031d83bb37178a8845ccc8 loop.py
+62d3f4af4851b0dafb1d2413e242080e417edcab loop.py
 821ff56dde950c950ef4ffb32f132240efdfb4ed migrations/0001_initial.sql
 93f656e1bac96c75d36f261929f40f4781f3e384 migrations/0002_open_decisions_ask_link.sql
 bdf769b6118df1f35d71e810b4412d3227a592cd migrations/0003_loop_writer_identity.sql
@@ -61,11 +61,11 @@ db0b9e7e46ade4d730780dbeb7f8ed87d960db4e migrations/0004_open_decisions_held.sql
 6e7fa99d5f41fce2f2ae90883c44996bfefa7a19 pointers.py
 517698140bdbbc15abaf9c538bc5886b0649df72 receipts.py
 a08baf2f68639c8b35fca301066827e7a7b3a13d restore.py
-371fc4ab6d8f20ba74db740d0c6c225625e9f809 schema.py
+ec7d76ae085f62ab357c2eb39d50ea68f5a2c04f schema.py
 8a2f46ab4a7a0197c3264b7467bb51cca74e465e search.py
 f224d75a610b0f74c16d0697885f23f66c0a57cc search_misses.py
 8230da165d7e8f7fd07c9b1c5b6cc4b729ef54a6 session_model.py
-6f92ed0ff3837781b7238e52937cc5249cbaaba8 store.py
+75caa685812cb2346355cf54e5871c680340a9f7 store.py
 cc4972c11f70fb4fb6662320a678fd8a8b237798 tests/_child.py
 1509dcbc7cd3c6852198c5ae95ccc8acc1f0e2a7 tests/conftest.py
 1edda3b5a69a01fdba7cc4c28131b81b1394af3c tests/fixtures/decisions/ticket.json
@@ -120,6 +120,8 @@ fccc297ea6bab2f80dc540f3ee44e40b3c8b0820 tests/test_item_text_escape.py
 65a78dc077e365db7abcc72d3db9c2a9075f098f tests/test_ledger.py
 3a6424b163007996e36a660f2dc1157be123d072 tests/test_link_duplicate_of.py
 24c5844d94bc3598a78d1b4b7ac35038fa726537 tests/test_links_verb.py
+c4345a5cc0a50b8531a1545d92037120bc5af397 tests/test_loop_hand_off.py
+c689f4e4e18c4543978ca7fe8a2dce1d07c41af5 tests/test_loop_pr_link.py
 42b8dfaa3e2ffd5988a9443ac161e82ad18890a2 tests/test_loop_writer_identity.py
 6d3ddd6460e5df7080cd70e6e263323619706978 tests/test_newer_schema_refused.py
 dae12abb2a72ece3409f46704529e7e569200812 tests/test_open_proof.py

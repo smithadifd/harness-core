@@ -1051,6 +1051,30 @@ def test_the_v0_3_1_entry_names_the_pin_move_and_neither_plugin_moves():
         assert claim in entry, claim
 
 
+# ---------------------------------------------------------------------------
+# The v0.3.2 release: the entry names the pin move, and neither plugin moves.
+
+
+def test_the_v0_3_2_entry_names_the_pin_move_and_neither_plugin_moves():
+    headings = changelog_headings()
+    assert headings[headings.index("v0.3.2"):][:2] == ["v0.3.2", "v0.3.1"]
+    entry = one_line(changelog_entry("v0.3.2"))
+    stays = re.search(r"`harness` and `rails` stay at (\d+\.\d+\.\d+)", entry)
+    assert stays, "the entry does not say the plugin versions stay"
+    assert stays.group(1) == "0.2.0"
+    if headings[0] == "v0.3.2":
+        assert plugin_version("harness") == plugin_version("rails") == "0.2.0"
+        sources = {e["name"]: e["source"] for e in marketplace_manifest()["plugins"]
+                   if isinstance(e["source"], dict)}
+        assert sources["sdlc"]["ref"] == "v1.5.0" and sources["ledger-hooks"]["ref"] == "v0.7.0"
+    for claim in ("`v0.6.3` to `v0.7.0`", "The search index format is 4",
+                  "No plugin change", "No new SQL migration", "schema 10",
+                  "`loop.intent` of payload version 2", "`link_pull_request`",
+                  "Upgrade readers before the writer",
+                  "`unknown-version:loop.intent:2`"):
+        assert claim in entry, claim
+
+
 def test_the_readme_and_changelog_do_not_use_the_word_builder():
     for path in (README, CHANGELOG):
         assert "builder" not in path.read_text(encoding="utf-8").lower(), path.name
