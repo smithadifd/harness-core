@@ -262,6 +262,34 @@ def test_j3_an_undecodable_byte_gives_the_ledger_doc_no_allowance(tmp_path):
     assert f"{LEDGER_DOC}:1: no-person shape: private-network hostname" in lines(result)
 
 
+def test_j3_a_multiline_token_window_cannot_allow_a_first_line_hostname(tmp_path):
+    # The second line's attribute columns coincide with the first line's
+    # string literal. Explicit continuation leaves the token run contiguous.
+    source = "'root" + ".home'; os.open(\\\n root" + ".home(0))\n"
+    repo = build(tmp_path, {LEDGER_DOC: source})
+    result = run(repo, NO_PERSON_DENY=DENY)
+    assert result.returncode == 1, result.stdout
+    assert lines(result) == [
+        f"{LEDGER_DOC}:1: no-person shape: private-network hostname",
+        "no-person: FAIL: 1 finding(s)",
+    ]
+
+
+def test_j3_a_latin_1_column_shift_cannot_hide_a_hostname_from_the_cli(tmp_path):
+    # Latin-1 tokenization counts each UTF-8 byte separately. The extra
+    # columns move the call's span onto the hostname in a UTF-8 scan.
+    multibyte = "é".encode("utf-8") * 15
+    source = (b"# coding: latin-1\n\"" + multibyte +
+              b"\"; os.open(root." + b"home(0)); host." + b"home\n")
+    repo = build(tmp_path, {LEDGER_DOC: source})
+    result = run(repo, NO_PERSON_DENY=DENY)
+    assert result.returncode == 1, result.stdout
+    assert lines(result) == [
+        f"{LEDGER_DOC}:2: no-person shape: private-network hostname",
+        "no-person: FAIL: 1 finding(s)",
+    ]
+
+
 def test_j3_a_latin_1_column_shift_cannot_move_the_ledger_doc_allowance(tmp_path):
     multibyte = "é".encode("utf-8") * 15
     source = (b"# coding: latin-1\n\"" + multibyte +
