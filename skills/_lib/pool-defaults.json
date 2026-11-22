@@ -52,6 +52,11 @@
       "pool": "claude",
       "note": "Judgment tier. Draws on the pool's Fable-scoped window as well as the shared ones."
     },
+    {
+      "id": "claude-fable-5-2",
+      "pool": "claude",
+      "note": "Judgment tier. Draws on the pool's Fable-scoped window as well as the shared ones."
+    },
     {"id": "openai-codex/gpt-6.1-sol", "pool": "openai-codex"},
     {
       "id": "openai-codex/gpt-5.6-sol",

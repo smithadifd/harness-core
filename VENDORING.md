@@ -131,6 +131,7 @@ the text itself.
 | `scripts/tests/test_check_ledger_vendor.py` | tests of the ledger drift check |
 | `scripts/tests/test_check_no_person.py` | tests of the no-person check |
 | `scripts/tests/test_ci_workflow.py` | tests of the CI workflows' runners, triggers and gates, and that every gate script runs under an isolated python3 |
+| `scripts/tests/test_core_model_registry.py` | pins the shipped pool and window tables: Fable 5.2 in the claude pool, its 1000000 window, and a window row for every claude-pool model |
 | `scripts/tests/harness_fixtures.py` | the fixture home, the stub claude and ledger commands and the write trace the harness tests share |
 | `scripts/tests/test_harness_doctor.py` | tests of the doctor and ledger-init verbs |
 | `scripts/tests/test_harness_install.py` | the CI parts of the four install tests, and the README and the skill held to the script |
