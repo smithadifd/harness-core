@@ -998,9 +998,35 @@ def test_the_v0_2_0_entry_names_each_plugin_move_and_the_manifests_carry_it():
     for number in ("#21", "#22", "#23", "#24", "#25", "#26", "#27"):
         assert number in entry, number
     assert "No pin move" in entry
-    sources = {e["name"]: e["source"] for e in marketplace_manifest()["plugins"]
-               if isinstance(e["source"], dict)}
-    assert sources["sdlc"]["ref"] == "v1.5.0" and sources["ledger-hooks"]["ref"] == "v0.6.1"
+    if headings[0] == "v0.2.0":
+        # While this is the newest entry, the pins are the ones it names.
+        sources = {e["name"]: e["source"] for e in marketplace_manifest()["plugins"]
+                   if isinstance(e["source"], dict)}
+        assert sources["sdlc"]["ref"] == "v1.5.0" and sources["ledger-hooks"]["ref"] == "v0.6.1"
+
+
+# ---------------------------------------------------------------------------
+# The v0.3.0 release: the entry names the pin move, and neither plugin moves.
+
+
+def test_the_v0_3_0_entry_names_the_pin_move_and_neither_plugin_moves():
+    headings = changelog_headings()
+    assert headings[headings.index("v0.3.0"):][:2] == ["v0.3.0", "v0.2.0"]
+    entry = one_line(changelog_entry("v0.3.0"))
+    stays = re.search(r"`harness` and `rails` stay at (\d+\.\d+\.\d+)", entry)
+    assert stays, "the entry does not say the plugin versions stay"
+    assert stays.group(1) == "0.2.0"
+    if headings[0] == "v0.3.0":
+        assert plugin_version("harness") == plugin_version("rails") == "0.2.0"
+        sources = {e["name"]: e["source"] for e in marketplace_manifest()["plugins"]
+                   if isinstance(e["source"], dict)}
+        assert sources["sdlc"]["ref"] == "v1.5.0" and sources["ledger-hooks"]["ref"] == "v0.6.1"
+    for claim in ("`v0.4.0` to `v0.6.1`", "`v0.1.13` to `v0.6.1`",
+                  "The search index format is 4", "Fable 5.2",
+                  "No plugin change"):
+        assert claim in entry, claim
+    for number in ("#29", "#30"):
+        assert number in entry, number
 
 
 def test_the_readme_and_changelog_do_not_use_the_word_builder():
