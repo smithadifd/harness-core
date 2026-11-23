@@ -3,6 +3,13 @@
 Each tag of this repository gets an entry: what changed in the vendored files,
 and any pin move of the vendored ledger.
 
+## Unreleased
+
+- The `rails` git guard asks before pipelines into shells, including wrapped,
+  grouped and computed stages and unreadable pipeline text, with reason
+  `pipeline_to_shell`. This fixed floor rule denies unattended and is silent
+  in the stored-options hook, so it asks only once. No plugin version change.
+
 ## v0.3.2
 
 Everything merged since v0.3.1. Neither plugin moves, so a machine that

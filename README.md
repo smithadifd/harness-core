@@ -683,6 +683,13 @@ to do. It never carries the command or a path from it. Known limits are in
   Configuration that can define a git alias or re-point a push
   (`git -c alias.…`, `--config-env`, `GIT_CONFIG_*`) asks even with no push
   word.
+- **Pipelines into shells.** A fixed ask (`pipeline_to_shell`), even with no
+  push word: `curl … | bash`, `cat x | sh`, wrapped or grouped shells,
+  computed stage commands and piped `env -S` / `--split-string`. Text the
+  reader cannot classify also asks. This is a mistake catcher, not a sandbox
+  against deliberate obfuscation. The floor hook alone judges this class;
+  stored options cannot disable it or produce a second prompt. Unattended,
+  it denies with the same code. Data pipelines and command lookups stay silent.
 - **Options.** Three. A bare install works with the defaults, but store all
   three: `push_to_main` and `force_push` take `ask` (the default, and the
   floor) or `deny`, and `commit_style` takes `off` (the default), `ask` or
@@ -734,9 +741,7 @@ to do. It never carries the command or a path from it. Known limits are in
   even if configuration written earlier re-points it. Only main and master
   are protected. `gh pr merge`, a web merge and pushes from other machines are
   not local pushes. Changes between its check and the push are not seen.
-  Commit style judges only the first message of a top-level commit. The
-  source's review of pipelines into a shell with no push in them is not
-  carried.
+  Commit style judges only the first message of a top-level commit.
 
 A reason reads `Git guard asks before this command (reason=CODE): HINT.` or
 `Git guard denied the command (reason=CODE): HINT.`, and a deny then ends

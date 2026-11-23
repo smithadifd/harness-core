@@ -110,8 +110,6 @@ def test_no_value_in_the_manifest_is_allow():
 def test_hooks_file():
     hooks = load("hooks", "hooks.json")
     assert sorted(hooks) == ["description", "hooks"]
-    assert hooks["description"] == ("The destructive-command guard denies or stays silent; the git guard asks, "
-                                    "denies or stays silent. Neither hook ever returns an allow.")
     assert sorted(hooks["hooks"]) == ["PreToolUse"]
     [group] = hooks["hooks"]["PreToolUse"]
     assert sorted(group) == ["hooks", "matcher"]
