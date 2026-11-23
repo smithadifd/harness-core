@@ -14,8 +14,10 @@ reports: it writes nothing and takes no lock.
 Plan, apply and ledger-init take --db, the ledger database's absolute path,
 for an account that already keeps its ledger somewhere else. Without it the
 database is at the default path below the home. Apply stores the path as the
-ledger_db option, and a database already at the path is used as it is: it is
-never re-created and never written to.
+ledger_db option and in the setup record, and a database already at the path
+is used as it is: it is never re-created and never written to. Remove names
+the recorded path. ledger-init without --db uses it; --db that disagrees is
+refused.
 
 Instance-plan and instance-create are the optional instance folder: a new
 folder of the person's choosing, made a local git repository, holding the
@@ -288,6 +290,15 @@ def chosen_database(home: Path, raw: str | None) -> Path:
         return database_path(home)
     if not os.path.isabs(raw):
         raise SetupError("--db must be an absolute path")
+    return Path(raw)
+
+
+def recorded_database(home: Path, body: dict[str, Any]) -> Path:
+    """The ledger database path apply stored in the record, or the default
+    path when an older record does not name one."""
+    raw = body.get("database")
+    if raw is None:
+        return database_path(home)
     return Path(raw)
 
 
@@ -790,8 +801,13 @@ def valid_item(item: Any) -> bool:
 
 
 def valid_body(body: dict[str, Any] | None, head: dict[str, Any]) -> bool:
-    if body is None or set(body) != {"complete", "files", "settings", "dirs", "backup_sha256"}:
+    keys = {"complete", "files", "settings", "dirs", "backup_sha256"}
+    if body is None or (set(body) != keys and set(body) != keys | {"database"}):
         return False
+    if "database" in body:
+        raw = body["database"]
+        if not isinstance(raw, str) or not os.path.isabs(raw):
+            return False
     if body["complete"] is not True:
         return False
     files = body["files"]
@@ -1118,7 +1134,8 @@ def apply_locked(tree: Tree, lock: int, database: Path, operator: str, harness: 
     changes = Changes()
     notes: list[str] = []
     try:
-        apply_changes(tree, changes, base, ids, rules_bytes, override_bytes, notes)
+        apply_changes(tree, changes, base, ids, rules_bytes, override_bytes, notes,
+                      database)
     except Exception as exc:
         raise rollback(tree, changes, exc) from exc
 
@@ -1144,7 +1161,7 @@ CONFIGURE_STAYS = "the ledger options claude plugin configure set stay set"
 
 def apply_changes(tree: Tree, changes: Changes, base: tuple[bytes, int, dict[str, Any]] | None,
                   ids: set[str], rules_bytes: bytes, override_bytes: bytes,
-                  notes: list[str]) -> None:
+                  notes: list[str], database: Path) -> None:
     def made(rel: str) -> None:
         changes.dirs.append(rel)
 
@@ -1206,7 +1223,8 @@ def apply_changes(tree: Tree, changes: Changes, base: tuple[bytes, int, dict[str
     # Finish: line 2.
     body = {"complete": True, "files": files, "settings": info,
             "dirs": list(changes.dirs),
-            "backup_sha256": changes.backup}
+            "backup_sha256": changes.backup,
+            "database": str(database)}
     line2 = json_line(body)
     changes.record["line2"] = line2
     parent, name = tree.parent_of(RECORD_REL)
@@ -1434,7 +1452,8 @@ def remove_locked(tree: Tree) -> tuple[str, list[str]]:
 
     lines = [f"kept for a manual check: {item}" for item in kept]
     lines += [f"already gone: {item}" for item in gone]
-    lines.append(f"kept: ledger database at {database_path(tree.root)} (person's data)")
+    lines.append(f"kept: ledger database at {recorded_database(tree.root, body)} "
+                 "(person's data)")
     lines.append(f"removed: {tree.show(RECORD_REL)}")
     return "".join(line + "\n" for line in lines), warnings
 
@@ -1443,7 +1462,7 @@ def remove_locked(tree: Tree) -> tuple[str, list[str]]:
 # Ledger-init: the first ledger write
 
 
-def ledger_init_verb(home: Path, database: Path, operator: str,
+def ledger_init_verb(home: Path, database: Path | None, operator: str,
                      harness: str | None) -> tuple[str, list[str], int]:
     tree = Tree(home)
     try:
@@ -1510,16 +1529,23 @@ def drop_temp_database(parent: int, temp: str) -> list[str]:
     return left
 
 
-def ledger_init_locked(tree: Tree, database: Path, operator: str,
+def ledger_init_locked(tree: Tree, database: Path | None, operator: str,
                        harness: str | None) -> str:
     """Make the first ledger write when the database file is absent. Setup
     must have completed: the write is part of it. A database that already
-    exists at the path is never written to."""
+    exists at the path is never written to. Without --db the path is the one
+    apply recorded; --db that names a different recorded path is refused."""
     raw, head, body = read_record(tree)
     if raw is None:
         raise SetupError(f"no record at {tree.show(RECORD_REL)}; run apply first")
     if body is None:
         raise hard_stop_refusal(tree, head)
+    stored = recorded_database(tree.root, body)
+    if database is None:
+        database = stored
+    elif "database" in body and database != stored:
+        raise SetupError(
+            f"--db {database} does not match the stored ledger database {stored}")
     if os.path.lexists(database):
         return (f"kept: ledger database already exists at {database}; "
                 "no first write was made\n")
@@ -2114,9 +2140,10 @@ def run(argv: list[str]) -> tuple[str, list[str], int]:
             raise SetupError("--operator is required for ledger-init")
         raise SetupError("--operator is required for plan and apply")
     harness = args.harness or None
-    database = chosen_database(home, args.db)
     if args.verb == "ledger-init":
-        return ledger_init_verb(home, database, args.operator, harness)
+        given = None if args.db is None else chosen_database(home, args.db)
+        return ledger_init_verb(home, given, args.operator, harness)
+    database = chosen_database(home, args.db)
     if args.verb == "plan":
         return format_plan(home, database, args.operator, harness), [], 0
     out, warnings = apply_verb(home, database, args.operator, harness, args.approve,

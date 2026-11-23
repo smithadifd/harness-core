@@ -492,6 +492,55 @@ def test_the_skill_passes_the_same_db_path_to_plan_apply_and_ledger_init():
     assert "to the `plan`, `apply` and `ledger-init` commands" in text
 
 
+# I5: --db (the path main added in #24) through this follow-up's rules:
+# remove names the stored path, and a bare ledger-init does not create a
+# second database at the default path.
+
+
+def test_db_remove_names_the_given_path(tmp_path):
+    home, bin_dir = fixture(tmp_path)
+    chosen = tmp_path / "other" / "ledger.db"
+    given = ("--db", str(chosen))
+    assert do("apply", home, bin_dir, *given).rc == 0
+    show_stored(bin_dir)
+    init = do("ledger-init", home, bin_dir, *given)
+    assert init.rc == 0, init.err
+    removed = do("remove", home, bin_dir)
+    assert removed.rc == 0, removed.err
+    assert f"kept: ledger database at {chosen} (person's data)" in removed.out.splitlines()
+    assert f"kept: ledger database at {at(home, DB)} (person's data)" not in removed.out.splitlines()
+
+
+def test_db_bare_ledger_init_after_apply_db_creates_no_default_database(tmp_path):
+    home, bin_dir = fixture(tmp_path)
+    chosen = tmp_path / "other" / "nested" / "ledger.db"
+    given = ("--db", str(chosen))
+    assert do("apply", home, bin_dir, *given).rc == 0
+    init = do("ledger-init", home, bin_dir)
+    assert init.rc == 0, init.err
+    assert init.out == f"created: ledger database at {chosen}\n"
+    assert chosen.read_bytes()[:15] == b"SQLite format 3"
+    assert database_files(tmp_path) == {chosen}
+    assert not at(home, DB).exists()
+
+
+def test_db_ledger_init_refuses_when_db_does_not_match_the_stored_path(tmp_path):
+    home, bin_dir = fixture(tmp_path)
+    chosen = tmp_path / "kept" / "ledger.db"
+    other = tmp_path / "other" / "ledger.db"
+    assert do("apply", home, bin_dir, "--db", str(chosen)).rc == 0
+    before = snap(home)
+    done = do("ledger-init", home, bin_dir, "--db", str(other))
+    assert done.rc == 1
+    assert done.err == (
+        f"setup: --db {other} does not match the stored ledger database {chosen}\n")
+    assert done.out == ""
+    assert snap(home) == before
+    assert not other.exists()
+    assert not at(home, DB).exists()
+    assert database_files(tmp_path) == set()
+
+
 # ---------------------------------------------------------------------------
 # The README and the setup skill match the script
 
