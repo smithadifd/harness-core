@@ -60,8 +60,10 @@ Rules that hold in every mode:
    leading `~` replaced with their home folder), to the `plan`, `apply` and
    `ledger-init` commands below, the same path in all three. Never choose or
    suggest a path for them. Setup then lists that path in the plan, stores it
-   as the ledger's database option and uses a database already there as it
-   is: it never makes a second one.
+   as the ledger's database option and in the setup record, and uses a
+   database already there as it is: it never makes a second one. A later
+   ledger-init without `--db` uses that recorded path; `--db` that names a
+   different path is refused.
 
 2. **Print the plan.** Nothing is written by this step:
 
