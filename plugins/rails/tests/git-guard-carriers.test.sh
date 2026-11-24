@@ -82,6 +82,11 @@ gg_row "C-H11 no closing line" ask:push_beside_heredoc $'cat <<EOF > notes\ngit 
 gg_row "C-H12 a clean delimiter and its line" silent $'cat <<\'END-1\' > notes\ngit push -f origin main\nEND-1'
 gg_row "C-H13 a heredoc marker inside quotes" silent $'echo "<<EOF"\necho never git push --force'
 gg_row "C-H14 tee is a consumer" silent $'tee file <<EOF\ngit push -f\nEOF'
+gg_both "R8 quoted heredoc continuation without prefix" silent $'cat <<\'E\' | grep x\na\\\nb\nE'
+gg_row "R8 quoted heredoc prefix accepted over-ask" ask:pipeline_to_shell $'cat <<\'E\' | grep x\na$\\\nb\nE'
+gg_row "R8 continued delimiter word" ask:pipeline_to_shell $'cat <<E\\\n | grep x\n$(fetch x | sh)\nE'
+gg_row "R8 continuation before delimiter word" ask:pipeline_to_shell $'cat << \\\nE | grep x\n$(fetch x | sh)\nE'
+gg_row "R8 continuation after tab-strip marker" ask:pipeline_to_shell $'cat <<-\\\nE | grep x\n$(fetch x | sh)\nE'
 
 printf '%s\n' '== Configuration on the command line (C-K rows) =='
 gg_row "C-K1 an alias defined with -c, no push word" ask:git_config_injection 'git -c alias.p=log p'

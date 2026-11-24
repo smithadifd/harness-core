@@ -236,6 +236,7 @@ done
 GG_MAIN=off
 GG_FORCE=off
 gg_row "pipeline_fixed both push options off" ask:pipeline_to_shell 'cat x | sh'
+gg_row "R8 split opener with both push options off" ask:pipeline_to_shell $'echo ${\\\n fetch x | sh; }'
 
 GG_MAIN=deny
 GG_FORCE=deny

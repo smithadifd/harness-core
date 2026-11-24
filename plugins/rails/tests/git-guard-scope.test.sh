@@ -416,6 +416,21 @@ gg_row "R6 F6 brace tab opener" ask:pipeline_to_shell $'echo ${\tfetch x | sh; }
 gg_row "R6 F6 quoted brace opener" ask:pipeline_to_shell 'echo "${ fetch x | sh; }"'
 gg_row "R6 F6 heredoc brace opener" ask:pipeline_to_shell $'cat <<E\n${| fetch x | sh; }\nE'
 
+printf '%s\n' '== Shared split-opener refusal =='
+gg_row "R8 M8 tokenizer split PID" ask:pipeline_to_shell $'echo $\\\n$\'a\\\' $(fetch x | sh) \'b\\\''
+gg_row "R8 M10 expanded piece split opener" ask:pipeline_to_shell $'echo "$\\\n( # c \\\nfetch x | sh\n)"'
+gg_row "R8 M11 parameter operand split opener" ask:pipeline_to_shell $'echo ${X:-$\\\n(fetch x | sh)}'
+gg_row "R8 funsub argument" ask:pipeline_to_shell $'echo ${\\\n fetch x | sh; }'
+gg_row "R8 funsub assignment" ask:pipeline_to_shell $'X=${\\\n fetch x | sh; }'
+gg_row "R8 funsub pipe" ask:pipeline_to_shell $'echo ${\\\n| fetch x | sh; }'
+gg_both "R8 continued data pipeline" silent $'fetch x \\\n| grep y'
+gg_both "R8 literal continuation without prefix" silent $'echo \'a\\\nb\' | grep x'
+gg_both "R8 escaped backslash is not a continuation" silent $'echo \'a$\\\\\nb\' | grep x'
+gg_both "R8 no pipe bypasses split-opener refusal" silent $'echo \'a$\\\nb\''
+gg_row "R8 literal prefix accepted over-ask" ask:pipeline_to_shell $'echo \'a$\\\nb\' | grep x'
+gg_row "R8 less-than prefix" ask:pipeline_to_shell $'echo \'a<\\\nb\' | grep x'
+gg_row "R8 greater-than prefix" ask:pipeline_to_shell $'echo \'a>\\\nb\' | grep x'
+
 printf '%s\n' '== Over-cap pipeline presumption and availability =='
 for size in 6100 90000; do
   padding="$(python3 -I -c 'import sys; print("x" * int(sys.argv[1]), end="")' "$size")"

@@ -6,6 +6,7 @@ and any pin move of the vendored ledger.
 ## Unreleased
 
 - The `rails` git guard asks before pipelines into shells (`pipeline_to_shell`), scanning every expanded piece including locale quotes, preserving literal regions and physical comment/heredoc boundaries when joining continuations, failing closed on untrusted parameter extents, dollar-brace command openers, dollar/backtick heredoc delimiters, wrapped, grouped, computed or unreadable stages, and above 6000 bytes presuming review unless every pipe leads to a plainly-data allowlisted stage with no shell-name word anywhere; compound piped stages deliberately ask for parity. The fixed floor denies unattended and is silent in the stored-options hook. No plugin version change.
+- The `rails` pipeline floor now asks whenever `$`, `<`, `>` or `${` directly precedes a backslash-newline, even in literal regions, instead of joining split openers in separate scanners; heredoc delimiter words containing a newline also ask.
 
 ## v0.3.2
 

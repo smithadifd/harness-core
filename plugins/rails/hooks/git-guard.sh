@@ -2048,12 +2048,6 @@ pipeline_expanded_continuations() { # CONTENT
   case "$s" in *$'\\\n'*) ;; *) PIPELINE_JOINED="$s"; return 0 ;; esac
   while [ "$i" -lt "$n" ]; do
     if [ "${s:i:2}" = $'\\\n' ]; then i=$((i + 2)); continue; fi
-    case "${s:i:1}" in
-      '$'|'<'|'>')
-        while [ "${s:i+1:2}" = $'\\\n' ]; do
-          s="${s:0:i+1}${s:i+3}"; n=${#s}
-        done ;;
-    esac
     case "${s:i:1}:${s:i+1:1}" in
       "\\:"*) out="$out${s:i:2}"; i=$((i + 2)); continue ;;
       '$:('|'<:('|'>:(')
@@ -2074,8 +2068,6 @@ pipeline_expanded_continuations() { # CONTENT
 # operators hide substitutions, and a heredoc's literal braces need no match.
 pipeline_quoted_substitutions() { # CONTENT
   local s="$1" i=0 n=${#1} end
-  pipeline_expanded_continuations "$s" || return 0
-  s="$PIPELINE_JOINED"; n=${#s}
   while [ "$i" -lt "$n" ]; do
     case "${s:i:1}:${s:i+1:1}" in
       "\\:"*) i=$((i + 2)); continue ;;
@@ -2109,14 +2101,6 @@ pipeline_tokens() { # TEXT
   while [ "$i" -lt "$n" ]; do
     c="${s:i:1}"; next="${s:i+1:1}"
     case "$c" in
-      '$'|'<'|'>')
-        # These bytes may become an opener across a removed continuation.
-        while [ "${s:i+1:2}" = $'\\\n' ]; do
-          s="${s:0:i+1}${s:i+3}"; n=${#s}
-        done
-        next="${s:i+1:1}" ;;
-    esac
-    case "$c" in
       "'"|'"'|'`'|'$'|'<'|'>')
         case "$c:$next" in
           '$:$')
@@ -2135,7 +2119,7 @@ pipeline_tokens() { # TEXT
             end="$SKIP_END"
             [ "$end" -gt "$start" ] || return 1
             piece="${s:start:end-start}"
-            case "$piece" in *'$'*|*'`'*) return 1 ;; esac
+            case "$piece" in *'$'*|*'`'*|*$'\n'*) return 1 ;; esac
             case "$piece" in *"'"*|*'"'*|*\\*) expands+=(0) ;; *) expands+=(1) ;; esac
             word="$word${s:i:end-i}"; header="$header${s:i:end-i}"
             i="$end"; continue ;;
@@ -2359,6 +2343,8 @@ pipeline_to_shell() { # TEXT
   local -a PL_TOKENS PL_RAW inherited
   local PL_FALLBACK=0
   case "$text" in *'|'*) ;; *) return 1 ;; esac
+  # A split opener asks before any scanner can give its bytes another meaning.
+  case "$text" in *$'$\\\n'*|*$'<\\\n'*|*$'>\\\n'*|*$'${\\\n'*) return 0 ;; esac
   pipeline_tokens "$text" || rc=$?
   [ "$rc" -ne 2 ] || return 0
   # Unclassifiable text holding a pipe byte must not become silence.
