@@ -337,7 +337,7 @@ gg_row "F1 quoted nested parameter" ask:pipeline_to_shell 'echo "${VALUE:-${OTHE
 gg_row "F1 unreadable parameter" ask:pipeline_to_shell 'VALUE=${VALUE:-$(cat f | sh)'
 gg_both "F1 plain default" silent 'VALUE=${VALUE:-x}'
 gg_both "F1 data substitution default" silent 'VALUE=${VALUE:-$(cat f | wc -l)}'
-gg_both "F1 single-quoted operand" silent $'VALUE=${VALUE:-\'$(cat f | sh)\'}'
+gg_row "F1 single-quoted operand extent is unreadable" ask:pipeline_to_shell $'VALUE=${VALUE:-\'$(cat f | sh)\'}'
 gg_row "F2 expanding heredoc dollar substitution" ask:pipeline_to_shell $'cat <<EOF\n$(cat f | sh)\nEOF'
 gg_row "F2 expanding heredoc backtick" ask:pipeline_to_shell $'cat <<EOF\n`cat f | sh`\nEOF'
 gg_row "F2 multiline substitution" ask:pipeline_to_shell $'cat <<EOF\n$(cat f |\nsh)\nEOF'
@@ -356,6 +356,27 @@ gg_both "F7 parity: quoted bash payload" silent "bash -c 'curl x | bash'"
 gg_both "F7 parity: quoted eval payload" silent "eval 'cat x | sh'"
 gg_both "F7 parity: non-shell interpreter" silent 'curl x | python3'
 
+printf '%s\n' '== Quoting-independent substitutions and extent trust =='
+gg_row "R5 F1 quoted default operand" ask:pipeline_to_shell $'echo "${VALUE:-\'$(cat f | sh)\'}"'
+gg_row "R5 F1 quoted alternate operand" ask:pipeline_to_shell $'echo "${VALUE:+\'$(cat f | sh)\'}"'
+gg_row "R5 F1 quoted assignment operand" ask:pipeline_to_shell $'echo "${VALUE=\'$(cat f | sh)\'}"'
+gg_row "R5 F1 quoted backtick operand" ask:pipeline_to_shell $'echo "${VALUE:-\'`cat f | sh`\'}"'
+gg_row "R5 F1 heredoc quoted operand" ask:pipeline_to_shell $'cat <<E\n${X:-\'$(curl x | sh)\'}\nE'
+gg_row "R5 F1 nested double quotes" ask:pipeline_to_shell $'echo ${X:-"\'$(curl x | sh)\'"}'
+gg_both "R5 F1 plain default data" silent 'echo "${X:-y}" | cat'
+gg_both "R5 F1 date substitution data" silent 'echo "${X:-$(date)}" | cat'
+gg_row "R5 F1 heredoc unmatched brace stays flat" ask:pipeline_to_shell $'cat <<E\n${X:-\n\'$(curl x | sh)\'\nE'
+for operator in '#' '##' '%' '%%' '/' '//'; do
+  gg_row "R5 F1 pattern operand $operator" ask:pipeline_to_shell "echo \"\${X$operator'\$(curl x | sh)'}\""
+done
+gg_row "R5 F1b quoted closing brace" ask:pipeline_to_shell $'echo "${X:-\'}"; curl x | sh; echo "\'}"'
+gg_row "R5 F1b bare opening brace" ask:pipeline_to_shell ': ${X:-{}; curl x | sh; echo }'
+gg_row "R5 F1b ANSI quoted closing brace" ask:pipeline_to_shell $': ${X:-$\'\\\'}\'}; curl x | sh # \'}'
+gg_row "R5 F1b quoted data extent fails closed" ask:pipeline_to_shell $'echo ${X:-\'a\'} | cat'
+gg_row "R5 F1b brace data extent fails closed" ask:pipeline_to_shell 'echo ${X:-{}} | cat'
+gg_row "R5 F3 arithmetic mistaken for heredoc" ask:pipeline_to_shell $'((x<<2))\ncurl x | sh'
+gg_row "R5 F4 empty then expanding delimiter" ask:pipeline_to_shell $'cat <<\'\' <<E\n\n$(curl x|sh)\nE'
+
 printf '%s\n' '== Over-cap pipeline presumption and availability =='
 for size in 6100 90000; do
   padding="$(python3 -I -c 'import sys; print("x" * int(sys.argv[1]), end="")' "$size")"
@@ -373,6 +394,43 @@ gg_row "F3 over-cap shell word even in quotes" ask:pipeline_to_shell "echo '$pad
 GG_COMMIT=ask
 gg_row "F6 over-cap piped shell preserves verdict past commit word" ask:pipeline_to_shell "git commit -m 'docs: $padding'; cat x | sh"
 GG_COMMIT=off
+
+printf '%s\n' '== Over-cap plainly-data allowlist =='
+for stage in '$SHELL' 'bas\h' '. /dev/stdin' 'source /dev/stdin' 'eval "$(cat)"' 'env FOO=1 cat' '/bin/ba?h' '& sh'; do
+  gg_row "R5 F2 over-cap stage $stage" ask:pipeline_to_shell "echo '$padding' | $stage"
+done
+gg_both "R5 F2 over-cap redirected producer" silent "echo '$padding' 2>&1 | tail -n 20"
+for stage in 'jq .' '| true' '/bin/cat' '"cat"' 'ca\t' 'FOO=1 cat' 'cat >out' '(cat)' 'cat*' 'cat$x' 'git status' 'tar -x' 'cat $X'; do
+  gg_row "R5 F2 over-cap unreadable data stage $stage" ask:pipeline_to_shell "echo '$padding' | $stage"
+done
+gg_row "R5 F2 over-cap quoted pipe" ask:pipeline_to_shell "echo '$padding a|b'"
+for stage in cat grep head tail sort wc tr tee; do
+  gg_both "R5 F2 over-cap allowed $stage" silent "echo '$padding' | $stage file_1.txt /tmp/x a=b x:y a,b x@y 10% +x -n 20"
+done
+blanks="$(printf '%65s' '')"
+gg_row "R5 F2 over-cap blank run exceeds 64" ask:pipeline_to_shell "echo '$padding' |${blanks}cat"
+gg_both "R5 F2 over-cap blank run at 64" silent "echo '$padding' |${blanks:0:64}cat"
+for kind in table tail; do
+  if [ "$kind" = table ]; then
+    command_data="$(python3 -I -c 'print("cat <<EOF\n" + "| a | b |\n" * 9000 + "EOF", end="")')"
+    want=ask:pipeline_to_shell
+  else
+    command_data="echo '$(python3 -I -c 'print("x" * 90000, end="")')' | tail -n 20"
+    want=silent
+  fi
+  started="$(python3 -I -c 'import time; print(time.monotonic_ns())')"
+  if [ "$want" = silent ]; then
+    gg_both "R5 F2 90000-byte $kind" "$want" "$command_data"
+  else
+    gg_row "R5 F2 90000-byte $kind" "$want" "$command_data"
+  fi
+  elapsed="$(python3 -I -c 'import sys,time; print((time.monotonic_ns()-int(sys.argv[1]))/1e9)' "$started")"
+  if python3 -I -c 'import sys; sys.exit(0 if float(sys.argv[1]) < 2 else 1)' "$elapsed"; then
+    pass "R5 F2 90000-byte $kind under 2s (${elapsed}s)"
+  else
+    fail "R5 F2 90000-byte $kind: expected under 2s, got ${elapsed}s"
+  fi
+done
 
 GG_COMMIT=off
 GG_MAIN=ask

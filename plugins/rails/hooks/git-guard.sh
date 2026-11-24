@@ -2009,23 +2009,43 @@ command_word_is_pattern() { # RAW
 PL_TOKENS=()
 PL_RAW=()
 PL_FALLBACK=0
-# Expanded text is not shell source: quotes in a heredoc are literal. Only
-# parameter operands give single quotes their own data spans.
-pipeline_quoted_substitutions() { # CONTENT [parameter]
-  local s="$1" mode="${2:-expanded}" i=0 n=${#1} end
+# The pinned brace reader is deliberately not a shell-specific expansion
+# parser. Do not trust an extent whose quotes or bare braces can move its end.
+pipeline_parameter_end() { # TEXT INDEX_AFTER_OPEN
+  local s="$1" start="$2" i="$2" end
+  skip_brace "$s" "$start" || return 1
+  end="$SKIP_END"
+  case "${s:start:end-start}" in *"'"*) return 1 ;; esac
+  while [ "$i" -lt "$end" ]; do
+    if [ "${s:i:1}" = '{' ]; then
+      case "${s:i-1:1}" in '$'|"\\") ;; *) return 1 ;; esac
+    fi
+    i=$((i + 1))
+  done
+  SKIP_END="$end"
+}
+
+pipeline_parameter_extents() { # DOUBLE_QUOTED_CONTENT
+  local s="$1" i=0 n=${#1}
   while [ "$i" -lt "$n" ]; do
     case "${s:i:1}:${s:i+1:1}" in
       "\\:"*) i=$((i + 2)); continue ;;
-      "'":*)
-        if [ "$mode" = parameter ]; then
-          redirect_skip_token "$s" "$i" || return 0
-          i="$SKIP_END"; continue
-        fi ;;
       '$:{')
-        skip_brace "$s" $((i + 2)) || return 0
-        end="$SKIP_END"
-        if pipeline_quoted_substitutions "${s:i+2:end-i-3}" parameter; then return 0; fi
-        i="$end"; continue ;;
+        pipeline_parameter_end "$s" $((i + 2)) || return 1
+        i="$SKIP_END"; continue ;;
+    esac
+    i=$((i + 1))
+  done
+  return 0
+}
+
+# Expanded text is not shell source. Scan flat: neither quotes nor parameter
+# operators hide substitutions, and a heredoc's literal braces need no match.
+pipeline_quoted_substitutions() { # CONTENT
+  local s="$1" i=0 n=${#1} end
+  while [ "$i" -lt "$n" ]; do
+    case "${s:i:1}:${s:i+1:1}" in
+      "\\:"*) i=$((i + 2)); continue ;;
       '$:(')
         PL_FALLBACK=1
         skip_paren "$s" $((i + 2)) || return 0
@@ -2074,9 +2094,9 @@ pipeline_tokens() { # TEXT
             word="$word${s:i:end-i}"; header="$header${s:i:end-i}"
             i="$end"; continue ;;
           '$:{')
-            skip_brace "$s" $((i + 2)) || return 1
+            pipeline_parameter_end "$s" $((i + 2)) || return 1
             end="$SKIP_END"
-            if pipeline_quoted_substitutions "${s:i+2:end-i-3}" parameter; then return 2; fi
+            if pipeline_quoted_substitutions "${s:i+2:end-i-3}"; then return 2; fi
             SKIP_END="$end" ;;
           '$:('|'<:('|'>:(')
             PL_FALLBACK=1
@@ -2106,6 +2126,7 @@ pipeline_tokens() { # TEXT
         piece="${s:i:SKIP_END-i}"
         if [ "$c" = '"' ]; then
           end="$SKIP_END"
+          pipeline_parameter_extents "${piece:1:${#piece}-2}" || return 1
           if pipeline_quoted_substitutions "${piece:1:${#piece}-2}"; then return 2; fi
           SKIP_END="$end"
         fi
@@ -2314,19 +2335,22 @@ pipeline_to_shell() { # TEXT
   return 1
 }
 
-# Above the cap, do not enter the superlinear shell reader. A single byte
-# tokenization ignores quoting deliberately; is_shell_name remains the list.
+# Above the cap, every pipe byte is an operator. Only bare, plainly data
+# stages can stay silent; keep the existing text-wide shell-name presumption.
 pipeline_over_cap() { # TEXT
-  local words word IFS=$'\n'
+  local review
   case "$1" in *'|'*) ;; *) return 1 ;; esac
-  words="$(printf '%s\n' "$1" | HOME=/dev/null "$JQ_BIN" -Rr 'splits("[^A-Za-z0-9_/.-]+") | split("/")[-1] | select(length <= 8)')" || policy_deny extraction_failure
-  # Basenames and the longest accepted name (parallel, eight bytes) are
-  # bounded in jq: Bash 3.2's ##*/ glob is quadratic on a long non-path word.
-  # The alphabet excludes glob metacharacters, so splitting cannot glob.
-  for word in $words; do
-    is_shell_name "$word" && return 0
-  done
-  return 1
+  # One search per rule, not a global match or a Bash word loop. The bounded
+  # prefix and disjoint argument/blank alphabets keep the stage search linear.
+  review="$(printf '%s' "$1" | HOME=/dev/null "$JQ_BIN" -Rrs '
+    test("(^|[^A-Za-z0-9_.-])(?i:sh|bash|zsh|dash|ksh|mksh|ash|yash|fish|csh|tcsh|busybox|su|script|watch|parallel)(?=[^A-Za-z0-9_./-]|$)")
+    or test("\\|(?![|& \\t\\n]{0,64}(?:cat|grep|head|tail|sort|wc|tr|tee)(?:[ \\t]+[A-Za-z0-9_./=:,@%+\\-]+)*[ \\t]*(?=[\\n;|&)]|$))")
+  ')" || policy_deny extraction_failure
+  case "$review" in
+    true) return 0 ;;
+    false) return 1 ;;
+    *) policy_deny extraction_failure ;;
+  esac
 }
 
 # ---------------------------------------------------------------------------
