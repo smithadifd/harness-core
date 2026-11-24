@@ -819,7 +819,7 @@ def test_the_skill_offers_the_instance_folder_once_and_never_without_a_yes():
     text = SKILL.read_text(encoding="utf-8")
     assert "disable-model-invocation: true" in text
     front = text.split("---", 2)[1]
-    assert 'argument-hint: "[doctor | uninstall | instance]"' in front
+    assert 'argument-hint: "[doctor | uninstall | instance | update]"' in front
     steps = {int(match.group(1)): match.group(0) for match in
              re.finditer(r"^(\d+)\. \*\*[^*]+\*\*", text.split("## Instance folder")[0],
                          re.MULTILINE)}

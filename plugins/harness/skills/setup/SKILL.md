@@ -1,15 +1,17 @@
 ---
 name: setup
 description: >
-  Set up the default tier of the harness on this account, check it, or take it
-  off. Run with no argument to set up (print every file and setting to be
-  written, take a yes, apply, make the first ledger write, check the result),
-  with "doctor" to check an existing setup, with "uninstall" to remove what
-  setup placed, or with "instance" to make the optional instance folder of
-  plans and decisions. Use when the person says "set up the harness", "check my
-  harness setup", "uninstall the harness" or "make an instance folder". Run by
-  the person only.
-argument-hint: "[doctor | uninstall | instance]"
+  Set up the default tier of the harness on this account, check it, replace
+  the rules default after a tag move, or take it off. Run with no argument to
+  set up (print every file and setting to be written, take a yes, apply, make
+  the first ledger write, check the result), with "doctor" to check an
+  existing setup, with "update" to replace the rules default when it is
+  unchanged since setup, with "uninstall" to remove what setup placed, or
+  with "instance" to make the optional instance folder of plans and
+  decisions. Use when the person says "set up the harness", "check my harness
+  setup", "update the harness rules", "uninstall the harness" or "make an
+  instance folder". Run by the person only.
+argument-hint: "[doctor | uninstall | instance | update]"
 disable-model-invocation: true
 ---
 
@@ -18,11 +20,11 @@ disable-model-invocation: true
 This skill drives one script, `setup.py`, which sits two folders above this
 file. The script does every write; this skill shows what it will do, asks, runs
 it and reports what it printed. Its verbs are `plan`, `apply`, `ledger-init`,
-`doctor`, `remove`, `instance-plan` and `instance-create`.
+`doctor`, `update`, `remove`, `instance-plan` and `instance-create`.
 
 Read the argument. No argument means **Set up**; `doctor` means **Doctor**;
-`uninstall` means **Uninstall**; `instance` means **Instance folder**. Any
-other argument: say which four are accepted and stop.
+`update` means **Update**; `uninstall` means **Uninstall**; `instance` means
+**Instance folder**. Any other argument: say which five are accepted and stop.
 
 Rules that hold in every mode:
 
@@ -191,6 +193,26 @@ Run the `doctor` command from step 6 above and report it as there: the placed
 files, the stored options, the database file and the tools. It reads and
 writes nothing. A `note` line is information, a `FAIL` line is a problem to
 show. If the first lines say setup has not run, say to run `/harness:setup`.
+
+
+## Update
+
+After the plugin is at a newer tag, replace the installed rules default with
+the plugin's current file when the installed file is still the bytes setup
+recorded. The override file and every settings item are left alone.
+
+1. Run `doctor` as above. A `note files: newer default available` line means
+   the installed rules file differs from the plugin's default.
+2. Run:
+
+   ```text
+   python3 "${CLAUDE_SKILL_DIR}/../../setup.py" update --home "$HOME"
+   ```
+
+   Show the output. If it refuses (the file was changed since setup, there is
+   no record, the installed file is missing, or its hash cannot be read), show
+   that line, say nothing was changed, and stop. Do not overwrite the file by
+   hand.
 
 ## Uninstall
 

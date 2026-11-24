@@ -486,6 +486,23 @@ hooks declare no option at this tag. `claude plugin configure` takes the full
 plugin id, for example `ledger-hooks@harness-core`. Start a new session, or run
 `/reload-plugins`, to load the new set.
 
+The installed rules default is a file setup placed, not a plugin file, so
+moving the marketplace does not change `.claude/rules/harness.md`. After the
+plugins are at the newer tag, replace that file without touching the override
+or the settings items:
+
+```text
+/harness:setup update
+```
+
+`update` replaces `harness.md` with the installed plugin's default only when
+the installed file's hash still equals the hash in the setup record, then
+writes the new hash to the record. If you have edited the file since setup, it
+refuses by name and writes nothing. A missing record, a missing installed
+file, or a hash it cannot read also refuses by name. `/harness:setup doctor`
+prints `newer default available` when the installed file differs from the
+plugin's default.
+
 ### Uninstall
 
 Three steps, in this order:

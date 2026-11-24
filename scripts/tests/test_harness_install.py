@@ -601,12 +601,21 @@ def test_the_readme_carries_the_install_and_the_three_uninstall_steps():
     assert order == sorted(order)
 
 
+
+def test_the_readme_update_section_names_the_setup_update_verb():
+    text = "\n".join(section(README.read_text(encoding="utf-8"), "### Update to a newer tag"))
+    assert "/harness:setup update" in text
+    assert "harness.md" in text
+    assert "newer default available" in text
+    assert "harness-local.md" in text or "override" in text
+
+
 def test_the_skill_names_every_verb_and_never_approves_everything_at_once():
     text = SKILL.read_text(encoding="utf-8")
     front = text.split("---", 2)[1]
     assert re.search(r"^name: setup$", front, re.MULTILINE)
-    for verb in ("plan", "apply", "doctor", "ledger-init", "remove", "instance-plan",
-                 "instance-create"):
+    for verb in ("plan", "apply", "doctor", "ledger-init", "remove", "update",
+                 "instance-plan", "instance-create"):
         assert f"setup.py\" {verb} " in text or f"setup.py {verb} " in text, verb
     # The one mention is the rule against it; no command in the skill uses it.
     assert [line for line in text.splitlines()
@@ -658,7 +667,7 @@ def test_the_skill_single_quotes_every_value_the_model_substitutes():
     text = SKILL.read_text(encoding="utf-8")
     seen = {"--operator": 0, "--harness": 0, "--approve": 0, "--path": 0}
     commands = skill_commands(text)
-    assert len(commands) == 7
+    assert len(commands) == 8
     for command in commands:
         for flag, value in re.findall(r"(--operator|--harness|--approve|--path) (\S+)", command):
             assert re.fullmatch(r"'<[a-z]+>'", value), f"unquoted {flag} value {value}: {command}"
