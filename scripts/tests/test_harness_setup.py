@@ -2353,3 +2353,76 @@ def test_a_stop_after_the_rules_replace_leaves_the_old_record_and_a_rerun_refuse
     assert one_refusal(done) == (
         f"setup: rules default changed since setup: {at(home, mod.RULES_REL)}")
     assert snap(home) == before
+
+
+def record_write_point(tmp_path, bin_dir) -> int:
+    """The trace point of the record replace in an update that succeeds."""
+    template = make_home(tmp_path, name="template")
+    assert apply_all(template, bin_dir).rc == 0
+    plant_old_rules(template)
+    traced = run("update", template, bin_dir=bin_dir)
+    assert traced.rc == 0, traced.err
+    return first_point(traced.events, "replace", mod.RECORD_REL)
+
+
+def test_a_failed_record_write_restores_the_rules_file_and_a_rerun_updates(tmp_path):
+    bin_dir = install(tmp_path)
+    record_n = record_write_point(tmp_path, bin_dir)
+    home = make_home(tmp_path)
+    assert apply_all(home, bin_dir).rc == 0
+    old_sha = plant_old_rules(home)
+    record = record_bytes(home)
+    before = snap(home)
+    done = run("update", home, bin_dir=bin_dir, hooks={"raise_at": [record_n]})
+    assert one_refusal(done) == "setup: unexpected error: OSError: [Errno 5] injected"
+    assert at(home, mod.RULES_REL).read_bytes() == OLD_RULES
+    assert record_bytes(home) == record
+    assert recorded_rules_sha(home) == old_sha
+    assert snap(home) == before
+    again = run("update", home, bin_dir=bin_dir)
+    assert again.rc == 0, again.err
+    assert again.out == f"updated: {at(home, mod.RULES_REL)}\n"
+    assert recorded_rules_sha(home) == sha(RULES_SOURCE.read_bytes())
+
+
+def test_a_failed_record_write_and_a_failed_restore_refuse_and_name_the_manual_fix(tmp_path):
+    bin_dir = install(tmp_path)
+    record_n = record_write_point(tmp_path, bin_dir)
+    probe = make_home(tmp_path, name="probe")
+    assert apply_all(probe, bin_dir).rc == 0
+    plant_old_rules(probe)
+    rolled = run("update", probe, bin_dir=bin_dir, hooks={"raise_at": [record_n]})
+    restore_n = [n for n in points(rolled.events, "replace", mod.RULES_REL) if n > record_n][0]
+    home = make_home(tmp_path)
+    assert apply_all(home, bin_dir).rc == 0
+    old_sha = plant_old_rules(home)
+    record = record_bytes(home)
+    rules = at(home, mod.RULES_REL)
+    done = run("update", home, bin_dir=bin_dir, hooks={"raise_at": [record_n, restore_n]})
+    line = one_refusal(done)
+    assert line == (
+        f"setup: update could not put {rules} back after the record write failed "
+        "([Errno 5] injected; restore failed: [Errno 5] injected); "
+        f"the file now holds the plugin's new default and {at(home, mod.RECORD_REL)} "
+        f"still holds the hash {old_sha}; to fix it by hand, restore the file to the "
+        f"bytes with that hash, or set the hash of {mod.RULES_REL} in the record to "
+        f"{sha(RULES_SOURCE.read_bytes())}")
+    assert rules.read_bytes() == RULES_SOURCE.read_bytes()
+    assert record_bytes(home) == record
+    assert no_temps(home) == []
+
+
+def test_a_failure_after_the_record_landed_keeps_the_new_file_and_the_new_record(tmp_path):
+    bin_dir = install(tmp_path)
+    record_n = record_write_point(tmp_path, bin_dir)
+    home = make_home(tmp_path)
+    assert apply_all(home, bin_dir).rc == 0
+    plant_old_rules(home)
+    sync_n = record_n + 1
+    done = run("update", home, bin_dir=bin_dir, hooks={"raise_at": [sync_n]})
+    assert one_refusal(done) == "setup: unexpected error: OSError: [Errno 5] injected"
+    assert at(home, mod.RULES_REL).read_bytes() == RULES_SOURCE.read_bytes()
+    assert recorded_rules_sha(home) == sha(RULES_SOURCE.read_bytes())
+    again = run("update", home, bin_dir=bin_dir)
+    assert again.rc == 0, again.err
+    assert again.out == f"already current: {at(home, mod.RULES_REL)}\n"

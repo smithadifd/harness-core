@@ -242,6 +242,25 @@ def test_doctor_notes_newer_default_available_when_the_installed_file_differs(tm
     assert at(home, OVERRIDE).read_bytes() != b""
 
 
+def test_doctor_gives_no_newer_default_note_for_a_file_changed_since_setup(tmp_path):
+    home, bin_dir = fixture(tmp_path)
+    finish_setup(home, bin_dir)
+    rules = at(home, RULES)
+    rules.write_bytes(b"# edited by the person\n")
+    raw = at(home, RECORD).read_bytes()
+    first, newline, rest = raw.partition(b"\n")
+    second, _, tail = rest.partition(b"\n")
+    body = json.loads(second)
+    for item in body["files"]:
+        if item["path"] == RULES:
+            item["sha256"] = setup.digest(b"# old rules default\n")
+    at(home, RECORD).write_bytes(first + newline + json.dumps(body).encode() + newline + tail)
+    rc, lines = doctor(home, bin_dir)
+    assert rc == 0, lines
+    assert f"note files: changed since setup: {rules}; uninstall keeps it" in lines
+    assert "note files: newer default available" not in lines
+
+
 def test_doctor_notes_a_settings_item_that_is_gone_moved_or_changed(tmp_path):
     home, bin_dir = fixture(tmp_path)
     finish_setup(home, bin_dir)

@@ -10,11 +10,14 @@ takes out exactly what a complete setup record lists, and keeps and names
 anything the person has changed since. Update replaces the installed rules
 default with the plugin's current file only when the installed file's hash
 still equals the hash in the setup record, writes the new hash to the record,
-and never touches the override or the settings items. Ledger-init makes the
+and never touches the override or the settings items. If the record write
+fails after the file was replaced, update puts the previous file back, so a
+failed update leaves the file and the record as they were; if it cannot, it
+refuses and names the manual fix. Ledger-init makes the
 first ledger write, which creates the database file when it is absent. Doctor
 reads and reports: it writes nothing and takes no lock. It prints
-"newer default available" when the installed rules file differs from the
-plugin's default.
+"newer default available" only when the installed rules file still matches
+the record and differs from the plugin's default.
 
 Plan, apply and ledger-init take --db, the ledger database's absolute path,
 for an account that already keeps its ledger somewhere else. Without it the
@@ -1555,9 +1558,36 @@ def update_locked(tree: Tree) -> tuple[str, list[str]]:
     record_mode = tree.read(RECORD_REL)
     tree.replace(RULES_REL, default, found[0], "update", lambda: None,
                  mode=found[1])
-    tree.replace(RECORD_REL, new_record, raw, "update", lambda: None,
-                 mode=None if record_mode is None else record_mode[1])
+    record_landed: list[bool] = []
+    try:
+        tree.replace(RECORD_REL, new_record, raw, "update",
+                     lambda: record_landed.append(True),
+                     mode=None if record_mode is None else record_mode[1])
+    except Exception as exc:
+        if record_landed:
+            # The record already holds the new hash, so the new file is right.
+            raise
+        restore_rules(tree, found, default, recorded, new_sha, exc)
+        raise
     return f"updated: {shown}\n", []
+
+
+def restore_rules(tree: Tree, previous: tuple[bytes, int], default: bytes,
+                  recorded: str, new_sha: str, cause: Exception) -> None:
+    """The record write failed after the rules file was replaced: put the
+    previous file back, but only while the file still holds the bytes update
+    wrote. When that cannot be done, refuse and name the manual fix."""
+    try:
+        tree.replace(RULES_REL, previous[0], default, "update", lambda: None,
+                     mode=previous[1])
+    except Exception as exc:
+        raise SetupError(
+            f"update could not put {tree.show(RULES_REL)} back after the record "
+            f"write failed ({one_line(cause)}; restore failed: {one_line(exc)}); "
+            f"the file now holds the plugin's new default and "
+            f"{tree.show(RECORD_REL)} still holds the hash {recorded}; to fix it "
+            f"by hand, restore the file to the bytes with that hash, or set the "
+            f"hash of {RULES_REL} in the record to {new_sha}") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -1784,7 +1814,8 @@ def doctor_files(tree: Tree, body: dict[str, Any] | None, report: Report) -> Non
         except SetupError as exc:
             report.add("FAIL", "files", str(exc))
         else:
-            if digest(installed_rules[0]) != digest(default):
+            installed = digest(installed_rules[0])
+            if installed == listed.get(RULES_REL) and installed != digest(default):
                 report.add("note", "files", "newer default available")
 
 
