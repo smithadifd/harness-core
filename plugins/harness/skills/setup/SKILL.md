@@ -202,7 +202,8 @@ the plugin's current file when the installed file is still the bytes setup
 recorded. The override file and every settings item are left alone.
 
 1. Run `doctor` as above. A `note files: newer default available` line means
-   the installed rules file differs from the plugin's default.
+   the installed rules file still matches the setup record and differs from
+   the plugin's default. A file you changed since setup never gets that line.
 2. Run:
 
    ```text
