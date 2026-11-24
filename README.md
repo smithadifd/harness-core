@@ -316,7 +316,7 @@ after `/reload-plugins`; installing them does not make `/harness:setup`
 available in that same session automatically.
 
 After `claude plugin install harness@harness-core`, the script is at
-`~/.claude/plugins/cache/harness-core/harness/<version>/setup.py`, where
+`$HOME/.claude/plugins/cache/harness-core/harness/<version>/setup.py`, where
 `<version>` is the installed plugin's cache version, not the repository tag.
 Find the available copies:
 
