@@ -2013,6 +2013,7 @@ PL_FALLBACK=0
 # parser. Do not trust an extent whose quotes or bare braces can move its end.
 pipeline_parameter_end() { # TEXT INDEX_AFTER_OPEN
   local s="$1" start="$2" i="$2" end
+  case "${s:start:1}" in ' '|$'\t'|$'\n'|'|') return 1 ;; esac
   skip_brace "$s" "$start" || return 1
   end="$SKIP_END"
   case "${s:start:end-start}" in *"'"*) return 1 ;; esac
@@ -2025,7 +2026,7 @@ pipeline_parameter_end() { # TEXT INDEX_AFTER_OPEN
   SKIP_END="$end"
 }
 
-pipeline_parameter_extents() { # DOUBLE_QUOTED_CONTENT
+pipeline_parameter_extents() { # EXPANDED_CONTENT
   local s="$1" i=0 n=${#1}
   while [ "$i" -lt "$n" ]; do
     case "${s:i:1}:${s:i+1:1}" in
@@ -2039,13 +2040,47 @@ pipeline_parameter_extents() { # DOUBLE_QUOTED_CONTENT
   return 0
 }
 
+# Join only expanded text here. Substitution bodies retain their physical
+# bytes: their recursive source scan owns quotes, comments and heredocs.
+PIPELINE_JOINED=""
+pipeline_expanded_continuations() { # CONTENT
+  local s="$1" i=0 n=${#1} out="" end
+  case "$s" in *$'\\\n'*) ;; *) PIPELINE_JOINED="$s"; return 0 ;; esac
+  while [ "$i" -lt "$n" ]; do
+    if [ "${s:i:2}" = $'\\\n' ]; then i=$((i + 2)); continue; fi
+    case "${s:i:1}" in
+      '$'|'<'|'>')
+        while [ "${s:i+1:2}" = $'\\\n' ]; do
+          s="${s:0:i+1}${s:i+3}"; n=${#s}
+        done ;;
+    esac
+    case "${s:i:1}:${s:i+1:1}" in
+      "\\:"*) out="$out${s:i:2}"; i=$((i + 2)); continue ;;
+      '$:('|'<:('|'>:(')
+        skip_paren "$s" $((i + 2)) || return 1
+        end="$SKIP_END"
+        out="$out${s:i:end-i}"; i="$end"; continue ;;
+      '`:'*)
+        skip_backtick "$s" $((i + 1)) || return 1
+        end="$SKIP_END"
+        out="$out${s:i:end-i}"; i="$end"; continue ;;
+    esac
+    out="$out${s:i:1}"; i=$((i + 1))
+  done
+  PIPELINE_JOINED="$out"
+}
+
 # Expanded text is not shell source. Scan flat: neither quotes nor parameter
 # operators hide substitutions, and a heredoc's literal braces need no match.
 pipeline_quoted_substitutions() { # CONTENT
   local s="$1" i=0 n=${#1} end
+  pipeline_expanded_continuations "$s" || return 0
+  s="$PIPELINE_JOINED"; n=${#s}
   while [ "$i" -lt "$n" ]; do
     case "${s:i:1}:${s:i+1:1}" in
       "\\:"*) i=$((i + 2)); continue ;;
+      '$:{')
+        case "${s:i+2:1}" in ' '|$'\t'|$'\n'|'|') return 0 ;; esac ;;
       '$:(')
         PL_FALLBACK=1
         skip_paren "$s" $((i + 2)) || return 0
@@ -2065,18 +2100,28 @@ pipeline_quoted_substitutions() { # CONTENT
 }
 
 pipeline_tokens() { # TEXT
-  local s="$1" i=0 n=${#1} word="" c next end header="" line d k piece start body closed
+  local s="$1" i=0 n=${#1} word="" c next end header="" line d k piece start body closed run
   local -a expands delims strips
   expands=()
   PL_TOKENS=()
   PL_RAW=()
   PL_FALLBACK=0
-  r1_join_continuations "$s"; s="$R1_JOINED"; n=${#s}
   while [ "$i" -lt "$n" ]; do
     c="${s:i:1}"; next="${s:i+1:1}"
     case "$c" in
+      '$'|'<'|'>')
+        # These bytes may become an opener across a removed continuation.
+        while [ "${s:i+1:2}" = $'\\\n' ]; do
+          s="${s:0:i+1}${s:i+3}"; n=${#s}
+        done
+        next="${s:i+1:1}" ;;
+    esac
+    case "$c" in
       "'"|'"'|'`'|'$'|'<'|'>')
         case "$c:$next" in
+          '$:$')
+            # The PID consumes both dollars; a following quote is plain.
+            word="$word\$\$"; header="$header\$\$"; i=$((i + 2)); continue ;;
           '<:<')
             # Delimiter words never expand. Keep their raw quoting separately
             # from the pinned collector's dequoted delimiter and tab flag.
@@ -2090,6 +2135,7 @@ pipeline_tokens() { # TEXT
             end="$SKIP_END"
             [ "$end" -gt "$start" ] || return 1
             piece="${s:start:end-start}"
+            case "$piece" in *'$'*|*'`'*) return 1 ;; esac
             case "$piece" in *"'"*|*'"'*|*\\*) expands+=(0) ;; *) expands+=(1) ;; esac
             word="$word${s:i:end-i}"; header="$header${s:i:end-i}"
             i="$end"; continue ;;
@@ -2124,21 +2170,30 @@ pipeline_tokens() { # TEXT
             ;;
         esac
         piece="${s:i:SKIP_END-i}"
-        if [ "$c" = '"' ]; then
-          end="$SKIP_END"
-          pipeline_parameter_extents "${piece:1:${#piece}-2}" || return 1
-          if pipeline_quoted_substitutions "${piece:1:${#piece}-2}"; then return 2; fi
-          SKIP_END="$end"
-        fi
-        word="$word${s:i:SKIP_END-i}"
+        case "$c:$next" in
+          "'":*|'$:'"'") ;; # Proven literal single-quoted/ANSI-C pieces.
+          '$:('|'$:{'|'<:('|'>:('|'`:'*) ;; # Already scanned recursively.
+          *)
+            if [ "${#piece}" -gt 1 ]; then
+              end="$SKIP_END"
+              pipeline_expanded_continuations "$piece" || return 1
+              piece="$PIPELINE_JOINED"
+              pipeline_parameter_extents "$piece" || return 1
+              if pipeline_quoted_substitutions "$piece"; then return 2; fi
+              SKIP_END="$end"
+            fi ;;
+        esac
+        word="$word$piece"
         case "$c:$next" in
           '$:('|'<:('|'>:('|'`:'*) header="${header}x" ;;
-          *) header="$header${s:i:SKIP_END-i}" ;;
+          *) header="$header$piece" ;;
         esac
         i="$SKIP_END"; continue
         ;;
       "\\")
         [ -n "$next" ] || return 1
+        # At source level an escaped newline contributes no word bytes.
+        if [ "$next" = $'\n' ]; then i=$((i + 2)); continue; fi
         word="$word$c$next"; header="$header$c$next"; i=$((i + 2)); continue ;;
       '#')
         if [ -z "$word" ]; then
@@ -2183,11 +2238,20 @@ pipeline_tokens() { # TEXT
           while [ "$k" -lt "${#delims[@]}" ]; do
             d="${delims[$k]}"; body=""; closed=0
             while [ "$i" -lt "$n" ]; do
-              end="$i"
-              while [ "$end" -lt "$n" ] && [ "${s:end:1}" != $'\n' ]; do end=$((end + 1)); done
-              line="${s:i:end-i}"
+              line=""
+              while :; do
+                end="$i"
+                while [ "$end" -lt "$n" ] && [ "${s:end:1}" != $'\n' ]; do end=$((end + 1)); done
+                line="$line${s:i:end-i}"
+                i=$((end + 1))
+                # Only expanding bodies join physical lines, before matching
+                # the delimiter. An escaped backslash keeps its newline.
+                [ "${expands[$k]}" -eq 1 ] || break
+                run="${line##*[!\\]}"
+                [ $((${#run} % 2)) -eq 1 ] && [ "$end" -lt "$n" ] || break
+                line="${line%\\}"
+              done
               [ "${strips[$k]}" -eq 0 ] || while [ "${line#$'\t'}" != "$line" ]; do line="${line#$'\t'}"; done
-              i=$((end + 1))
               if [ "$line" = "$d" ]; then closed=1; break; fi
               body="$body$line"$'\n'
             done
