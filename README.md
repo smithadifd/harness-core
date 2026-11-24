@@ -500,8 +500,8 @@ the installed file's hash still equals the hash in the setup record, then
 writes the new hash to the record. If you have edited the file since setup, it
 refuses by name and writes nothing. A missing record, a missing installed
 file, or a hash it cannot read also refuses by name. `/harness:setup doctor`
-prints `newer default available` when the installed file differs from the
-plugin's default.
+prints `newer default available` only when the installed file still matches
+the setup record and differs from the plugin's default.
 
 ### Uninstall
 

@@ -2412,6 +2412,68 @@ def test_a_failed_record_write_and_a_failed_restore_refuse_and_name_the_manual_f
     assert no_temps(home) == []
 
 
+def test_a_failed_folder_sync_after_the_restore_landed_reports_the_restored_file(tmp_path):
+    bin_dir = install(tmp_path)
+    record_n = record_write_point(tmp_path, bin_dir)
+    probe = make_home(tmp_path, name="probe")
+    assert apply_all(probe, bin_dir).rc == 0
+    plant_old_rules(probe)
+    rolled = run("update", probe, bin_dir=bin_dir, hooks={"raise_at": [record_n]})
+    restore_n = [n for n in points(rolled.events, "replace", mod.RULES_REL) if n > record_n][0]
+    sync_n = restore_n + 1
+    assert [e["op"] for e in rolled.events if e["n"] == sync_n] == ["fsync"]
+    home = make_home(tmp_path)
+    assert apply_all(home, bin_dir).rc == 0
+    old_sha = plant_old_rules(home)
+    record = record_bytes(home)
+    rules = at(home, mod.RULES_REL)
+    done = run("update", home, bin_dir=bin_dir, hooks={"raise_at": [record_n, sync_n]})
+    line = one_refusal(done)
+    assert line == (
+        f"setup: update put {rules} back after the record write failed "
+        "([Errno 5] injected), but the folder sync after the restore failed "
+        "([Errno 5] injected); the file holds its previous bytes, which match the "
+        f"hash in {at(home, mod.RECORD_REL)}")
+    assert "set the hash" not in line and "new default" not in line
+    assert rules.read_bytes() == OLD_RULES
+    assert record_bytes(home) == record
+    assert recorded_rules_sha(home) == old_sha
+    assert no_temps(home) == []
+    again = run("update", home, bin_dir=bin_dir)
+    assert again.rc == 0, again.err
+    assert again.out == f"updated: {rules}\n"
+
+
+def test_a_failed_restore_that_leaves_the_file_unconfirmed_names_both_states(tmp_path):
+    bin_dir = install(tmp_path)
+    record_n = record_write_point(tmp_path, bin_dir)
+    probe = make_home(tmp_path, name="probe")
+    assert apply_all(probe, bin_dir).rc == 0
+    plant_old_rules(probe)
+    rolled = run("update", probe, bin_dir=bin_dir, hooks={"raise_at": [record_n]})
+    restore_temp = [n for n in temp_points(rolled.events, "harness.md") if n > record_n][0]
+    home = make_home(tmp_path)
+    assert apply_all(home, bin_dir).rc == 0
+    old_sha = plant_old_rules(home)
+    record = record_bytes(home)
+    rules = at(home, mod.RULES_REL)
+    action = f"Path({str(rules)!r}).write_bytes(b'# raced\\n')"
+    done = run("update", home, bin_dir=bin_dir, hooks={
+        "raise_at": [record_n], "act_after": {str(restore_temp): action}})
+    line = one_refusal(done)
+    assert line == (
+        f"setup: update could not put {rules} back after the record write failed "
+        f"([Errno 5] injected; restore failed: {rules} changed while update was "
+        "running; it was not written); the state of the file could not be "
+        "confirmed; if it holds the plugin's new default, restore it to the bytes "
+        f"with the hash {old_sha} that {at(home, mod.RECORD_REL)} holds, or set the "
+        f"hash of {mod.RULES_REL} in the record to {sha(RULES_SOURCE.read_bytes())}; "
+        "if it holds its previous bytes, nothing needs to change")
+    assert rules.read_bytes() == b"# raced\n"
+    assert record_bytes(home) == record
+    assert no_temps(home) == []
+
+
 def test_a_failure_after_the_record_landed_keeps_the_new_file_and_the_new_record(tmp_path):
     bin_dir = install(tmp_path)
     record_n = record_write_point(tmp_path, bin_dir)
