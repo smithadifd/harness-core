@@ -73,8 +73,8 @@ the text itself.
 | `plugins/harness/files/instance/decisions/README.md` | the instance folder template: what belongs in decisions/ |
 | `plugins/harness/files/instance/roadmaps/README.md` | the instance folder template: what belongs in roadmaps/ |
 | `plugins/harness/files/instance/standards/README.md` | the instance folder template: what belongs in standards/ |
-| `plugins/harness/setup.py` | plan, apply, remove, doctor and ledger-init for the default-tier files and settings proposals, and instance-plan and instance-create for the optional instance folder |
-| `plugins/harness/skills/setup/SKILL.md` | the setup skill: sets up, checks and uninstalls by driving the script |
+| `plugins/harness/setup.py` | plan, apply, remove, update, doctor and ledger-init for the default-tier files and settings proposals, and instance-plan and instance-create for the optional instance folder |
+| `plugins/harness/skills/setup/SKILL.md` | the setup skill: sets up, checks, updates the rules default and uninstalls by driving the script |
 | `plugins/rails/.claude-plugin/plugin.json` | the rails plugin's manifest: name, version, description, license and the git guard's three options |
 | `plugins/rails/hooks/hooks.json` | the rails plugin's hook registration: the destructive-command guard and the git guard on every Bash call, exec form, onFailure block |
 | `plugins/rails/hooks/destructive-command-guard.sh` | the destructive-command guard: denies an unsafe rm, git worktree remove or symlinked redirect, or stays silent; never allows |
@@ -137,7 +137,7 @@ the text itself.
 | `scripts/tests/test_harness_install.py` | the CI parts of the four install tests, and the README and the skill held to the script |
 | `scripts/tests/test_harness_instance.py` | tests of the instance template and the instance-plan and instance-create verbs, with an injected failure at every point |
 | `scripts/tests/test_harness_rules_files.py` | tests of the rules default and the override starter |
-| `scripts/tests/test_harness_setup.py` | fixture-home tests of the harness plan, apply and remove script, with a hard stop and an injected exception at every step |
+| `scripts/tests/test_harness_setup.py` | fixture-home tests of the harness plan, apply, remove and update script, with a hard stop and an injected exception at every step |
 | `scripts/tests/test_marketplace_manifest.py` | tests of the marketplace check (folders, manifests, expected sources, full-commit pins, tag against pin with a fake API fetch and with urllib's opener over a local transport) and of the plugin validation job |
 | `scripts/tests/test_probe_default_tier_load.py` | tests of the load probe, against a stubbed claude and git |
 

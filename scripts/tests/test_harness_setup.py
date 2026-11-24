@@ -1,4 +1,4 @@
-"""Fixture-home tests of the harness plugin's plan, apply and remove script.
+"""Fixture-home tests of the harness plugin's plan, apply, remove and update script.
 
 Homes are pytest tmp_path folders. A stub `claude` on PATH stands in for
 `claude plugin configure`. Most runs go through a small driver that imports
@@ -1209,11 +1209,11 @@ def hold(home: Path) -> int:
     return fd
 
 
-@pytest.mark.parametrize("verb", ["apply", "remove"])
+@pytest.mark.parametrize("verb", ["apply", "remove", "update"])
 def test_a_held_lock_refuses_and_touches_nothing(tmp_path, verb):
     bin_dir = install(tmp_path)
     home = make_home(tmp_path)
-    if verb == "remove":
+    if verb in ("remove", "update"):
         assert apply_all(home, bin_dir).rc == 0
     fd = hold(home)
     try:
@@ -2163,3 +2163,193 @@ def test_a_wrong_typed_prompt_suggestions_key_is_left_alone_when_it_is_not_appro
     assert done.rc == 0, done.err
     assert json.loads(at(home, mod.SETTINGS_REL).read_bytes()) == {
         "promptSuggestionEnabled": "no", "sandbox": {"enabled": True}}
+
+
+# ---------------------------------------------------------------------------
+# Update: replace the rules default when it still matches the record.
+
+
+OLD_RULES = b"# old rules default\n"
+
+
+def plant_old_rules(home: Path, body: bytes = OLD_RULES) -> str:
+    """Write body as the installed rules default and store its hash in the
+    setup record, so the file looks unchanged since an older apply."""
+    at(home, mod.RULES_REL).write_bytes(body)
+    old_sha = sha(body)
+    raw = record_bytes(home)
+    assert raw is not None
+    head, parsed = mod.parse_record(raw)
+    assert head is not None and parsed is not None
+    files = []
+    for item in parsed["files"]:
+        if item["path"] == mod.RULES_REL:
+            files.append({"path": mod.RULES_REL, "sha256": old_sha})
+        else:
+            files.append(item)
+    rewritten = {key: (files if key == "files" else value) for key, value in parsed.items()}
+    at(home, mod.RECORD_REL).write_bytes(
+        mod.header_line(head["backup"]) + mod.json_line(rewritten))
+    return old_sha
+
+
+def recorded_rules_sha(home: Path) -> str:
+    raw = record_bytes(home)
+    assert raw is not None
+    _head, body = mod.parse_record(raw)
+    assert body is not None
+    found = mod.recorded_rules_hash(body)
+    assert found is not None
+    return found
+
+
+def test_update_replaces_an_old_recorded_default_and_writes_the_new_hash(tmp_path):
+    bin_dir = install(tmp_path)
+    home = make_home(tmp_path)
+    assert apply_all(home, bin_dir).rc == 0
+    override = at(home, mod.OVERRIDE_REL).read_bytes()
+    settings = at(home, mod.SETTINGS_REL).read_bytes()
+    old_sha = plant_old_rules(home)
+    assert old_sha != sha(RULES_SOURCE.read_bytes())
+    done = run("update", home, bin_dir=bin_dir)
+    assert done.rc == 0, done.err
+    assert done.out == f"updated: {at(home, mod.RULES_REL)}\n"
+    assert at(home, mod.RULES_REL).read_bytes() == RULES_SOURCE.read_bytes()
+    assert recorded_rules_sha(home) == sha(RULES_SOURCE.read_bytes())
+    assert at(home, mod.OVERRIDE_REL).read_bytes() == override
+    assert at(home, mod.SETTINGS_REL).read_bytes() == settings
+
+
+def test_update_twice_is_already_current_the_second_time(tmp_path):
+    bin_dir = install(tmp_path)
+    home = make_home(tmp_path)
+    assert apply_all(home, bin_dir).rc == 0
+    plant_old_rules(home)
+    first = run("update", home, bin_dir=bin_dir)
+    assert first.rc == 0, first.err
+    before = snap(home)
+    second = run("update", home, bin_dir=bin_dir)
+    assert second.rc == 0, second.err
+    assert second.out == f"already current: {at(home, mod.RULES_REL)}\n"
+    assert snap(home) == before
+    assert recorded_rules_sha(home) == sha(RULES_SOURCE.read_bytes())
+
+
+def test_update_refuses_when_the_rules_file_changed_since_setup(tmp_path):
+    bin_dir = install(tmp_path)
+    home = make_home(tmp_path)
+    assert apply_all(home, bin_dir).rc == 0
+    rules = at(home, mod.RULES_REL)
+    edited = b"# edited by the person\n"
+    rules.write_bytes(edited)
+    record = record_bytes(home)
+    override = at(home, mod.OVERRIDE_REL).read_bytes()
+    settings = at(home, mod.SETTINGS_REL).read_bytes()
+    before = snap(home)
+    done = run("update", home, bin_dir=bin_dir)
+    assert one_refusal(done) == f"setup: rules default changed since setup: {rules}"
+    assert rules.read_bytes() == edited
+    assert record_bytes(home) == record
+    assert at(home, mod.OVERRIDE_REL).read_bytes() == override
+    assert at(home, mod.SETTINGS_REL).read_bytes() == settings
+    assert snap(home) == before
+
+
+def test_update_refuses_a_missing_record(tmp_path):
+    home = make_home(tmp_path)
+    before = snap(home)
+    done = run("update", home)
+    assert one_refusal(done) == f"setup: no record at {at(home, mod.RECORD_REL)}"
+    assert unchanged(before, snap(home))
+
+
+def test_update_refuses_a_missing_rules_file(tmp_path):
+    bin_dir = install(tmp_path)
+    home = make_home(tmp_path)
+    assert apply_all(home, bin_dir).rc == 0
+    at(home, mod.RULES_REL).unlink()
+    record = record_bytes(home)
+    before = snap(home)
+    done = run("update", home, bin_dir=bin_dir)
+    assert one_refusal(done) == (
+        f"setup: rules default is missing: {at(home, mod.RULES_REL)}")
+    assert record_bytes(home) == record
+    assert snap(home) == before
+
+
+def test_update_refuses_an_unreadable_recorded_hash(tmp_path, monkeypatch):
+    bin_dir = install(tmp_path)
+    home = make_home(tmp_path)
+    assert apply_all(home, bin_dir).rc == 0
+    raw = record_bytes(home)
+    assert raw is not None
+    first, newline, rest = raw.partition(b"\n")
+    second, _, _ = rest.partition(b"\n")
+    body = json.loads(second)
+    for item in body["files"]:
+        if item["path"] == mod.RULES_REL:
+            item["sha256"] = "not-a-hash"
+    at(home, mod.RECORD_REL).write_bytes(first + newline + json.dumps(body).encode() + b"\n")
+    monkeypatch.setattr(mod, "valid_body", lambda body, head: True)
+    before = snap(home)
+    with pytest.raises(mod.SetupError, match=r"^unreadable hash for "):
+        mod.update_verb(home)
+    assert snap(home) == before
+
+
+def test_update_does_not_need_an_operator(tmp_path):
+    bin_dir = install(tmp_path)
+    home = make_home(tmp_path)
+    assert apply_all(home, bin_dir).rc == 0
+    done = run("update", home, bin_dir=bin_dir)
+    assert done.rc == 0, done.err
+    assert done.out == f"already current: {at(home, mod.RULES_REL)}\n"
+
+
+def test_rules_changed_before_the_replace_refuse_unwritten_on_update(tmp_path):
+    bin_dir = install(tmp_path)
+    template = make_home(tmp_path, name="template")
+    assert apply_all(template, bin_dir).rc == 0
+    plant_old_rules(template)
+    traced = run("update", template, bin_dir=bin_dir)
+    assert traced.rc == 0, traced.err
+    temp = temp_points(traced.events, "harness.md")[0]
+    home = make_home(tmp_path)
+    assert apply_all(home, bin_dir).rc == 0
+    plant_old_rules(home)
+    rules = at(home, mod.RULES_REL)
+    record = record_bytes(home)
+    override = at(home, mod.OVERRIDE_REL).read_bytes()
+    settings = at(home, mod.SETTINGS_REL).read_bytes()
+    action = f"Path({str(rules)!r}).write_bytes(b'# raced\\n')"
+    done = run("update", home, bin_dir=bin_dir, hooks={"act_after": {str(temp): action}})
+    assert one_refusal(done) == (
+        f"setup: {rules} changed while update was running; it was not written")
+    assert rules.read_bytes() == b"# raced\n"
+    assert record_bytes(home) == record
+    assert at(home, mod.OVERRIDE_REL).read_bytes() == override
+    assert at(home, mod.SETTINGS_REL).read_bytes() == settings
+    assert no_temps(home) == []
+
+
+def test_a_stop_after_the_rules_replace_leaves_the_old_record_and_a_rerun_refuses(tmp_path):
+    bin_dir = install(tmp_path)
+    template = make_home(tmp_path, name="template")
+    assert apply_all(template, bin_dir).rc == 0
+    plant_old_rules(template)
+    traced = run("update", template, bin_dir=bin_dir)
+    assert traced.rc == 0, traced.err
+    replace_n = first_point(traced.events, "replace", mod.RULES_REL)
+    home = make_home(tmp_path)
+    assert apply_all(home, bin_dir).rc == 0
+    plant_old_rules(home)
+    record = record_bytes(home)
+    killed = run("update", home, bin_dir=bin_dir, hooks={"kill_after": replace_n})
+    assert killed.rc != 0
+    assert at(home, mod.RULES_REL).read_bytes() == RULES_SOURCE.read_bytes()
+    assert record_bytes(home) == record
+    before = snap(home)
+    done = run("update", home, bin_dir=bin_dir)
+    assert one_refusal(done) == (
+        f"setup: rules default changed since setup: {at(home, mod.RULES_REL)}")
+    assert snap(home) == before

@@ -222,6 +222,26 @@ def test_doctor_notes_an_edited_file_and_fails_a_missing_one(tmp_path):
     assert f"FAIL files: placed by setup and now missing: {at(home, RULES)}" in lines
 
 
+def test_doctor_notes_newer_default_available_when_the_installed_file_differs(tmp_path):
+    home, bin_dir = fixture(tmp_path)
+    finish_setup(home, bin_dir)
+    rules = at(home, RULES)
+    rules.write_bytes(b"# old rules default\n")
+    raw = at(home, RECORD).read_bytes()
+    first, newline, rest = raw.partition(b"\n")
+    second, _, tail = rest.partition(b"\n")
+    body = json.loads(second)
+    for item in body["files"]:
+        if item["path"] == RULES:
+            item["sha256"] = setup.digest(b"# old rules default\n")
+    at(home, RECORD).write_bytes(first + newline + json.dumps(body).encode() + newline + tail)
+    rc, lines = doctor(home, bin_dir)
+    assert rc == 0, lines
+    assert f"ok files: placed by setup and unchanged: {rules}" in lines
+    assert "note files: newer default available" in lines
+    assert at(home, OVERRIDE).read_bytes() != b""
+
+
 def test_doctor_notes_a_settings_item_that_is_gone_moved_or_changed(tmp_path):
     home, bin_dir = fixture(tmp_path)
     finish_setup(home, bin_dir)

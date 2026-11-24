@@ -52,14 +52,16 @@ pull request that raised them.
 
 ## Harness setup (plugins/harness/setup.py)
 
-What `setup.py apply` and `setup.py remove` promise, and what they leave to
-you. Paths are under your home folder (`<home>`).
+What `setup.py apply`, `setup.py remove` and `setup.py update` promise, and
+what they leave to you. Paths are under your home folder (`<home>`).
 
 ### The promise
 
 This is the whole contract.
 
 - **A run that completes** leaves exactly the documented result: apply adds the rules file, the override if it was absent, and the approved settings items, and records them; remove takes out exactly what a complete record lists (I3).
+- **An update that completes** replaces the rules default with the plugin's current file and writes the new hash into the complete record. The override and the settings items are not read for writing and are not changed.
+- **An update that fails in-process** before it replaces the rules file writes nothing. After that replace and before the record is rewritten, a failure (or a hard stop) leaves the new file and the old record; the next update refuses `rules default changed since setup`. Recovery is by hand.
 - **An apply that fails in-process** (any `Exception`, including OSError, a short write and a full disk) rolls back all of setup's own changes from memory, all-or-nothing, under I2. Rollback never needs to read or write the record, so a failing record write cannot stop it.
 - **A remove that fails in-process** stops where it failed, refuses by name, and leaves the complete record in place. Running remove again finishes the job (I3). Remove does not roll back.
 - **An apply that hard-stops** (Ctrl-C, a closed terminal, SIGTERM, SIGKILL, a crash, power loss) after it has changed anything outside its own folder (`.claude/plugins/harness-core/harness`), and before line 2 of the record is written, guarantees exactly three things, and nothing more:
@@ -74,7 +76,7 @@ This is the whole contract.
 
 I2 and I3, as the promise uses them:
 
-- **I2. Never knowingly overwrite or delete bytes setup did not write.** Before rollback or remove deletes a file setup created, it compares the file's sha256 with the one setup wrote; on a difference it keeps the file and names it. Before apply or remove replaces settings.json, it compares the current bytes with the bytes it based its change on, and refuses unwritten on a difference. Rollback restores the pre-apply settings bytes only if the current bytes equal the bytes apply wrote; otherwise it takes apply's items out one by one, as remove does, and names the file.
+- **I2. Never knowingly overwrite or delete bytes setup did not write.** Before rollback or remove deletes a file setup created, it compares the file's sha256 with the one setup wrote; on a difference it keeps the file and names it. Before apply or remove replaces settings.json, it compares the current bytes with the bytes it based its change on, and refuses unwritten on a difference. Rollback restores the pre-apply settings bytes only if the current bytes equal the bytes apply wrote; otherwise it takes apply's items out one by one, as remove does, and names the file. Before update replaces the rules default, it compares the file's sha256 with the hash in the complete record; on a difference it refuses by name and writes nothing. Before it replaces the file or the record it compares the current bytes with the bytes it read, and refuses unwritten on a difference.
 - **I3. Exact, re-runnable remove.** Remove acts only on a complete record. Settings items come out one by one: an item comes out only if it is still at its recorded place with its recorded neighbours. Items the person moved or duplicated are kept and named, and nothing else in settings.json is touched. A listed file that is already gone is skipped and named. Remove writes nothing to the record and deletes it last, and each of its steps is decided from the current files, so a remove stopped at any point before the record is deleted can be run again and finishes.
 
 ### After a hard stop

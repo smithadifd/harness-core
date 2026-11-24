@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plan, apply, remove, doctor and ledger-init: the default-tier setup.
+"""Plan, apply, remove, update, doctor and ledger-init: the default-tier setup.
 
 The setup skill drives this script. Plan writes nothing and takes no lock.
 Apply places the rules default, places the override starter when the person
@@ -7,9 +7,14 @@ has none, and adds each approved settings item that is absent: a missing key,
 or a deny rule appended after the existing ones. It never changes, removes or
 reorders an existing entry, and nothing it proposes grants anything. Remove
 takes out exactly what a complete setup record lists, and keeps and names
-anything the person has changed since. Ledger-init makes the first ledger
-write, which creates the database file when it is absent. Doctor reads and
-reports: it writes nothing and takes no lock.
+anything the person has changed since. Update replaces the installed rules
+default with the plugin's current file only when the installed file's hash
+still equals the hash in the setup record, writes the new hash to the record,
+and never touches the override or the settings items. Ledger-init makes the
+first ledger write, which creates the database file when it is absent. Doctor
+reads and reports: it writes nothing and takes no lock. It prints
+"newer default available" when the installed rules file differs from the
+plugin's default.
 
 Plan, apply and ledger-init take --db, the ledger database's absolute path,
 for an account that already keeps its ledger somewhere else. Without it the
@@ -37,7 +42,7 @@ The promise, in full, is in KNOWN-LIMITS.md ("Harness setup"). In short:
   remove again finishes the job.
 
 Setup installs no signal handler: Ctrl-C, SIGTERM and SIGHUP are hard stops.
-Apply and remove each hold one exclusive, non-blocking flock on
+Apply, remove and update each hold one exclusive, non-blocking flock on
 .claude/harness-setup.lock, a file that is never unlinked, and the
 `claude plugin configure` child that apply starts holds it with them. Below the
 home folder, every path is opened relative to its parent's descriptor without
@@ -688,6 +693,37 @@ class Tree:
                 self.temps.discard(f"{CLAUDE_REL}/{temp}")
             else:
                 self.unlink(f"{CLAUDE_REL}/{temp}")
+
+    def replace(self, rel: str, data: bytes, expected: bytes, verb: str,
+                landed: Callable[[], None], *, mode: int | None = None) -> None:
+        """Replace rel with data through a temp file, only if rel still holds
+        expected. The target is never partial."""
+        parent, name = self.parent_of(rel)
+        parent_rel = rel.rpartition("/")[0]
+        temp, fd = self.make_temp(parent, parent_rel, name)
+        placed = False
+        try:
+            try:
+                if mode is not None:
+                    os.fchmod(fd, mode)
+                write_all(fd, data)
+                sync(fd)
+            finally:
+                os.close(fd)
+            current = self.read(rel)
+            if (current[0] if current else None) != expected:
+                raise SetupError(
+                    f"{self.show(rel)} changed while {verb} was running; "
+                    "it was not written")
+            os.replace(temp, name, src_dir_fd=parent, dst_dir_fd=parent)
+            placed = True
+            landed()
+            sync(parent)
+        finally:
+            if placed:
+                self.temps.discard(f"{parent_rel}/{temp}")
+            else:
+                self.unlink(f"{parent_rel}/{temp}")
 
     def rmdir(self, rel: str) -> bool:
         """Remove the folder rel if it is empty. False when it stays."""
@@ -1459,6 +1495,72 @@ def remove_locked(tree: Tree) -> tuple[str, list[str]]:
 
 
 # ---------------------------------------------------------------------------
+# Update: replace the rules default when it still matches the record
+
+
+def recorded_rules_hash(body: dict[str, Any]) -> str | None:
+    for item in body["files"]:
+        if item["path"] == RULES_REL:
+            return item["sha256"]
+    return None
+
+
+def record_with_rules_hash(head: dict[str, Any], body: dict[str, Any],
+                           sha: str) -> bytes:
+    files = [{"path": item["path"],
+              "sha256": sha if item["path"] == RULES_REL else item["sha256"]}
+             for item in body["files"]]
+    rewritten = {key: (files if key == "files" else value)
+                 for key, value in body.items()}
+    return header_line(head["backup"]) + json_line(rewritten)
+
+
+def update_verb(home: Path) -> tuple[str, list[str]]:
+    tree = Tree(home)
+    try:
+        lock = take_lock(tree)
+        try:
+            try:
+                return update_locked(tree)
+            except Exception:
+                tree.drop_temps()
+                raise
+        finally:
+            os.close(lock)
+    finally:
+        tree.close()
+
+
+def update_locked(tree: Tree) -> tuple[str, list[str]]:
+    raw, head, body = read_record(tree)
+    if raw is None:
+        raise SetupError(f"no record at {tree.show(RECORD_REL)}")
+    if body is None:
+        raise hard_stop_refusal(tree, head)
+    shown = tree.show(RULES_REL)
+    recorded = recorded_rules_hash(body)
+    if not is_hex64(recorded):
+        raise SetupError(f"unreadable hash for {shown}")
+    found = tree.read(RULES_REL)
+    if found is None:
+        raise SetupError(f"rules default is missing: {shown}")
+    live_sha = digest(found[0])
+    if live_sha != recorded:
+        raise SetupError(f"rules default changed since setup: {shown}")
+    default = load_source(RULES_SOURCE)
+    new_sha = digest(default)
+    if live_sha == new_sha:
+        return f"already current: {shown}\n", []
+    new_record = record_with_rules_hash(head, body, new_sha)
+    record_mode = tree.read(RECORD_REL)
+    tree.replace(RULES_REL, default, found[0], "update", lambda: None,
+                 mode=found[1])
+    tree.replace(RECORD_REL, new_record, raw, "update", lambda: None,
+                 mode=None if record_mode is None else record_mode[1])
+    return f"updated: {shown}\n", []
+
+
+# ---------------------------------------------------------------------------
 # Ledger-init: the first ledger write
 
 
@@ -1655,9 +1757,12 @@ def doctor_record(tree: Tree, report: Report) -> dict[str, Any] | None:
 
 def doctor_files(tree: Tree, body: dict[str, Any] | None, report: Report) -> None:
     listed = {item["path"]: item["sha256"] for item in body["files"]} if body else {}
+    installed_rules: tuple[bytes, int] | None = None
     for rel in (RULES_REL, OVERRIDE_REL):
         shown = tree.show(rel)
         found = tree.read(rel)
+        if rel == RULES_REL:
+            installed_rules = found
         if rel in listed:
             if found is None:
                 report.add("FAIL", "files", f"placed by setup and now missing: {shown}")
@@ -1673,6 +1778,14 @@ def doctor_files(tree: Tree, body: dict[str, Any] | None, report: Report) -> Non
             report.add("FAIL", "files", f"missing: {shown}")
         else:
             report.add("note", "files", f"no override file: {shown}")
+    if installed_rules is not None:
+        try:
+            default = load_source(RULES_SOURCE)
+        except SetupError as exc:
+            report.add("FAIL", "files", str(exc))
+        else:
+            if digest(installed_rules[0]) != digest(default):
+                report.add("note", "files", "newer default available")
 
 
 def doctor_settings(tree: Tree, body: dict[str, Any] | None, report: Report) -> None:
@@ -2091,9 +2204,9 @@ class Parser(argparse.ArgumentParser):
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = Parser(description="Plan, apply or remove the default-tier setup.")
+    parser = Parser(description="Plan, apply, remove, update or doctor the default-tier setup.")
     parser.add_argument("verb",
-                        choices=("plan", "apply", "remove", "doctor", "ledger-init",
+                        choices=("plan", "apply", "remove", "update", "doctor", "ledger-init",
                                  "instance-plan", "instance-create"))
     parser.add_argument("--home", required=True, help="absolute path of the home folder")
     parser.add_argument("--operator", default=None,
@@ -2128,6 +2241,9 @@ def run(argv: list[str]) -> tuple[str, list[str], int]:
     home = resolve_home(vars(args)["home"])
     if args.verb == "remove":
         out, warnings = remove_verb(home)
+        return out, warnings, 0
+    if args.verb == "update":
+        out, warnings = update_verb(home)
         return out, warnings, 0
     if args.verb == "doctor":
         return doctor_verb(home)
