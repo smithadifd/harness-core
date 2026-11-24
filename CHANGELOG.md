@@ -5,10 +5,7 @@ and any pin move of the vendored ledger.
 
 ## Unreleased
 
-- The `rails` git guard asks before pipelines into shells, including wrapped,
-  grouped and computed stages and unreadable pipeline text, with reason
-  `pipeline_to_shell`. This fixed floor rule denies unattended and is silent
-  in the stored-options hook, so it asks only once. No plugin version change.
+- The `rails` git guard asks before pipelines into shells (`pipeline_to_shell`), including substitutions in parameter operands and expanding heredocs, wrapped, grouped, computed or unreadable stages and over-cap shell-word presumptions; compound piped stages deliberately ask for parity. The fixed floor denies unattended and is silent in the stored-options hook. No plugin version change.
 
 ## v0.3.2
 

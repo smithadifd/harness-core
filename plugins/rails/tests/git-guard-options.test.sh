@@ -237,4 +237,15 @@ GG_MAIN=off
 GG_FORCE=off
 gg_row "pipeline_fixed both push options off" ask:pipeline_to_shell 'cat x | sh'
 
+GG_MAIN=deny
+GG_FORCE=deny
+gg_row "F5 unreadable pipeline retains push presumption" deny:push_unreadable_segment 'git push --force origin main; echo x | cat >'
+GG_MAIN=ask
+GG_FORCE=ask
+GG_COMMIT=deny
+gg_row "F5 unreadable pipeline retains commit presumption" deny:commit_message_unreadable 'git commit -m "docs: x"; echo x | cat >'
+GG_COMMIT=off
+gg_row "F5 unreadable pipeline without stricter gate" ask:pipeline_to_shell 'echo x | cat >'
+gg_both "F5 readable data pipeline" silent 'echo x | cat > out'
+
 gg_finish OPTIONS

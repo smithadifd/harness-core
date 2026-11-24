@@ -2009,11 +2009,23 @@ command_word_is_pattern() { # RAW
 PL_TOKENS=()
 PL_RAW=()
 PL_FALLBACK=0
-pipeline_quoted_substitutions() { # DOUBLE_QUOTE_CONTENT
-  local s="$1" i=0 n=${#1} end
+# Expanded text is not shell source: quotes in a heredoc are literal. Only
+# parameter operands give single quotes their own data spans.
+pipeline_quoted_substitutions() { # CONTENT [parameter]
+  local s="$1" mode="${2:-expanded}" i=0 n=${#1} end
   while [ "$i" -lt "$n" ]; do
     case "${s:i:1}:${s:i+1:1}" in
       "\\:"*) i=$((i + 2)); continue ;;
+      "'":*)
+        if [ "$mode" = parameter ]; then
+          redirect_skip_token "$s" "$i" || return 0
+          i="$SKIP_END"; continue
+        fi ;;
+      '$:{')
+        skip_brace "$s" $((i + 2)) || return 0
+        end="$SKIP_END"
+        if pipeline_quoted_substitutions "${s:i+2:end-i-3}" parameter; then return 0; fi
+        i="$end"; continue ;;
       '$:(')
         PL_FALLBACK=1
         skip_paren "$s" $((i + 2)) || return 0
@@ -2033,7 +2045,9 @@ pipeline_quoted_substitutions() { # DOUBLE_QUOTE_CONTENT
 }
 
 pipeline_tokens() { # TEXT
-  local s="$1" i=0 n=${#1} word="" c next end header="" line d k piece
+  local s="$1" i=0 n=${#1} word="" c next end header="" line d k piece start body closed
+  local -a expands delims strips
+  expands=()
   PL_TOKENS=()
   PL_RAW=()
   PL_FALLBACK=0
@@ -2043,6 +2057,27 @@ pipeline_tokens() { # TEXT
     case "$c" in
       "'"|'"'|'`'|'$'|'<'|'>')
         case "$c:$next" in
+          '<:<')
+            # Delimiter words never expand. Keep their raw quoting separately
+            # from the pinned collector's dequoted delimiter and tab flag.
+            if [ "${s:i:3}" = '<<<' ]; then
+              word="$word<<<"; header="$header<<<"; i=$((i + 3)); continue
+            fi
+            start=$((i + 2))
+            [ "${s:start:1}" != '-' ] || start=$((start + 1))
+            while [ "${s:start:1}" = ' ' ] || [ "${s:start:1}" = $'\t' ]; do start=$((start + 1)); done
+            redirect_target_end "$s" "$start" || return 1
+            end="$SKIP_END"
+            [ "$end" -gt "$start" ] || return 1
+            piece="${s:start:end-start}"
+            case "$piece" in *"'"*|*'"'*|*\\*) expands+=(0) ;; *) expands+=(1) ;; esac
+            word="$word${s:i:end-i}"; header="$header${s:i:end-i}"
+            i="$end"; continue ;;
+          '$:{')
+            skip_brace "$s" $((i + 2)) || return 1
+            end="$SKIP_END"
+            if pipeline_quoted_substitutions "${s:i+2:end-i-3}" parameter; then return 2; fi
+            SKIP_END="$end" ;;
           '$:('|'<:('|'>:(')
             PL_FALLBACK=1
             skip_paren "$s" $((i + 2)) || return 1
@@ -2061,7 +2096,7 @@ pipeline_tokens() { # TEXT
           *) ;;
         esac
         case "$c:$next" in
-          '$:('|'<:('|'>:('|'`:'*) ;;
+          '$:('|'$:{'|'<:('|'>:('|'`:'*) ;;
           *)
             if redirect_skip_token "$s" "$i"; then :; else
               case "$c" in "'"|'"') return 1 ;; *) SKIP_END=$((i + 1)) ;; esac
@@ -2119,21 +2154,27 @@ pipeline_tokens() { # TEXT
         esac
         if [ "$c" = $'\n' ]; then
           collect_heredocs "$header"
+          delims=(${HEREDOC_DELIMS[@]+"${HEREDOC_DELIMS[@]}"})
+          strips=(${HEREDOC_STRIP_TABS[@]+"${HEREDOC_STRIP_TABS[@]}"})
+          [ "${#delims[@]}" -eq "${#expands[@]}" ] || return 1
           i=$((i + 1))
           k=0
-          while [ "$k" -lt "${#HEREDOC_DELIMS[@]}" ]; do
-            d="${HEREDOC_DELIMS[$k]}"
+          while [ "$k" -lt "${#delims[@]}" ]; do
+            d="${delims[$k]}"; body=""; closed=0
             while [ "$i" -lt "$n" ]; do
               end="$i"
               while [ "$end" -lt "$n" ] && [ "${s:end:1}" != $'\n' ]; do end=$((end + 1)); done
               line="${s:i:end-i}"
-              [ "${HEREDOC_STRIP_TABS[$k]}" -eq 0 ] || while [ "${line#$'\t'}" != "$line" ]; do line="${line#$'\t'}"; done
+              [ "${strips[$k]}" -eq 0 ] || while [ "${line#$'\t'}" != "$line" ]; do line="${line#$'\t'}"; done
               i=$((end + 1))
-              [ "$line" != "$d" ] || break
+              if [ "$line" = "$d" ]; then closed=1; break; fi
+              body="$body$line"$'\n'
             done
+            [ "$closed" -eq 1 ] || return 1
+            if [ "${expands[$k]}" -eq 1 ] && pipeline_quoted_substitutions "$body"; then return 2; fi
             k=$((k + 1))
           done
-          header=""; continue
+          header=""; expands=(); continue
         fi
         ;;
       *) word="$word$c" ;;
@@ -2270,6 +2311,21 @@ pipeline_to_shell() { # TEXT
     [ -n "$stage" ] || return 0
     pipeline_stage "$stage" "$fallback" && return 0
   fi
+  return 1
+}
+
+# Above the cap, do not enter the superlinear shell reader. A single byte
+# tokenization ignores quoting deliberately; is_shell_name remains the list.
+pipeline_over_cap() { # TEXT
+  local words word IFS=$'\n'
+  case "$1" in *'|'*) ;; *) return 1 ;; esac
+  words="$(printf '%s\n' "$1" | HOME=/dev/null "$JQ_BIN" -Rr 'splits("[^A-Za-z0-9_/.-]+") | split("/")[-1] | select(length <= 8)')" || policy_deny extraction_failure
+  # Basenames and the longest accepted name (parallel, eight bytes) are
+  # bounded in jq: Bash 3.2's ##*/ glob is quadratic on a long non-path word.
+  # The alphabet excludes glob metacharacters, so splitting cannot glob.
+  for word in $words; do
+    is_shell_name "$word" && return 0
+  done
   return 1
 }
 
@@ -3932,7 +3988,11 @@ run_policy() {
   # selects the tighten-only engine mode and never judges this class.
   if [ "$PIPELINE_FLOOR" -eq 1 ]; then
     PIPELINE_READING=1
-    if pipeline_to_shell "$command_raw"; then record_code pipeline_to_shell; fi
+    if [ "$command_len" -gt "$MAX_COMMAND_CHARS" ]; then
+      if pipeline_over_cap "$command_raw"; then record_code pipeline_to_shell; fi
+    elif pipeline_to_shell "$command_raw"; then
+      record_code pipeline_to_shell
+    fi
     PIPELINE_READING=0
   fi
 
@@ -3956,8 +4016,7 @@ run_policy() {
     finish_verdict
   fi
 
-  # The length cap: a push word in an over-long command is presumed; nothing
-  # else is judged there.
+  # Above the length cap only the push and pipeline presumptions apply.
   if [ "$command_len" -gt "$MAX_COMMAND_CHARS" ]; then
     [ "$HAS_PUSH" -eq 1 ] || finish_verdict
     record_code push_command_too_long

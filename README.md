@@ -689,7 +689,9 @@ to do. It never carries the command or a path from it. Known limits are in
   reader cannot classify also asks. This is a mistake catcher, not a sandbox
   against deliberate obfuscation. The floor hook alone judges this class;
   stored options cannot disable it or produce a second prompt. Unattended,
-  it denies with the same code. Data pipelines and command lookups stay silent.
+  it denies with the same code. Ordinary data pipelines and command lookups
+  stay silent; a loop or other compound command in a piped stage asks whatever
+  its body runs, deliberately matching the dotfiles guard.
 - **Options.** Three. A bare install works with the defaults, but store all
   three: `push_to_main` and `force_push` take `ask` (the default, and the
   floor) or `deny`, and `commit_style` takes `off` (the default), `ask` or

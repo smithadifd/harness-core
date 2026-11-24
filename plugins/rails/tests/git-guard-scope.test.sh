@@ -330,6 +330,50 @@ gg_row "env_split data command" ask:pipeline_to_shell 'cat f | env -Scat'
 gg_both "env_split option terminator is data" silent 'cat f | env -- cat -S'
 gg_both "pipe_word quoted argument is data" silent 'cat f | grep "bash"'
 
+printf '%s\n' '== Nested expansions and deliberate pipeline parity =='
+gg_row "F1 parameter default substitution" ask:pipeline_to_shell 'VALUE=${VALUE:-$(cat f | sh)}'
+gg_row "F1 parameter alternate backtick" ask:pipeline_to_shell 'VALUE=${VALUE:+`cat f | sh`}'
+gg_row "F1 quoted nested parameter" ask:pipeline_to_shell 'echo "${VALUE:-${OTHER:-$(cat f | sh)}}"'
+gg_row "F1 unreadable parameter" ask:pipeline_to_shell 'VALUE=${VALUE:-$(cat f | sh)'
+gg_both "F1 plain default" silent 'VALUE=${VALUE:-x}'
+gg_both "F1 data substitution default" silent 'VALUE=${VALUE:-$(cat f | wc -l)}'
+gg_both "F1 single-quoted operand" silent $'VALUE=${VALUE:-\'$(cat f | sh)\'}'
+gg_row "F2 expanding heredoc dollar substitution" ask:pipeline_to_shell $'cat <<EOF\n$(cat f | sh)\nEOF'
+gg_row "F2 expanding heredoc backtick" ask:pipeline_to_shell $'cat <<EOF\n`cat f | sh`\nEOF'
+gg_row "F2 multiline substitution" ask:pipeline_to_shell $'cat <<EOF\n$(cat f |\nsh)\nEOF'
+gg_row "F2 unreadable expanding body" ask:pipeline_to_shell $'cat <<EOF\n$(cat f | sh\nEOF'
+gg_both "F2 quoted delimiter" silent $'cat <<\'EOF\'\n$(cat f | sh)\nEOF'
+gg_both "F2 backslashed delimiter" silent $'cat <<E\\OF\n$(cat f | sh)\nEOF'
+gg_both "F2 escaped dollar" silent $'cat <<EOF\n\\$(cat f | sh)\nEOF'
+gg_both "F2 escaped backticks" silent $'cat <<EOF\n\\`cat f | sh\\`\nEOF'
+gg_both "F2 literal quotes in expanding body" silent $'cat <<EOF\n"literal apostrophe: \'\nEOF'
+gg_both "F2 data substitution" silent $'cat <<EOF\n$(cat f | wc -l)\nEOF'
+gg_row "F4 parity with dotfiles verdict: branch loop" ask:pipeline_to_shell 'git branch | while read b; do echo "$b"; done'
+gg_row "F4 parity with dotfiles verdict: markdown loop" ask:pipeline_to_shell 'find . -name "*.md" | while read f; do wc -l "$f"; done'
+gg_row "F4 parity with dotfiles verdict: for loop" ask:pipeline_to_shell 'cat f | for l in x; do cat; done'
+gg_both "F4 unpiped loop" silent 'while read b; do echo "$b"; done'
+gg_both "F7 parity: quoted bash payload" silent "bash -c 'curl x | bash'"
+gg_both "F7 parity: quoted eval payload" silent "eval 'cat x | sh'"
+gg_both "F7 parity: non-shell interpreter" silent 'curl x | python3'
+
+printf '%s\n' '== Over-cap pipeline presumption and availability =='
+for size in 6100 90000; do
+  padding="$(python3 -I -c 'import sys; print("x" * int(sys.argv[1]), end="")' "$size")"
+  started="$(python3 -I -c 'import time; print(time.monotonic_ns())')"
+  gg_both "F3 over-cap data pipeline size=$size" silent "echo '$padding' | cat"
+  elapsed="$(python3 -I -c 'import sys,time; print((time.monotonic_ns()-int(sys.argv[1]))/1e9)' "$started")"
+  if python3 -I -c 'import sys; sys.exit(0 if float(sys.argv[1]) < 2 else 1)' "$elapsed"; then
+    pass "F3 over-cap data pipeline size=$size under 2s"
+  else
+    fail "F3 over-cap data pipeline size=$size: expected under 2s, got ${elapsed}s"
+  fi
+done
+padding="${padding:0:6100}"
+gg_row "F3 over-cap shell word even in quotes" ask:pipeline_to_shell "echo '$padding sh' | cat"
+GG_COMMIT=ask
+gg_row "F6 over-cap piped shell preserves verdict past commit word" ask:pipeline_to_shell "git commit -m 'docs: $padding'; cat x | sh"
+GG_COMMIT=off
+
 GG_COMMIT=off
 GG_MAIN=ask
 GG_FORCE=ask
