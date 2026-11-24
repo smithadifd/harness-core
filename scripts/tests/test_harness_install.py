@@ -696,6 +696,27 @@ def test_the_documented_apply_command_runs_through_bash_with_a_deny_id(tmp_path)
     assert stored["sandbox"]["enabled"] is True
 
 
+def test_the_readme_shell_setup_completes_without_a_session(tmp_path):
+    home, bin_dir = fixture(tmp_path, settings=None)
+    lines = section(README.read_text(encoding="utf-8"), "#### Set up from a shell")
+    commands = [line for line in lines if line.startswith('python3 "$setup_py" ')]
+    assert commands, "the shell instructions contain no setup commands"
+    env = child_env(home, bin_dir)
+    env["setup_py"] = str(ROOT / "plugins" / "harness" / "setup.py")
+    for template in commands:
+        command = template.replace("<operator>", OPERATOR)
+        done = subprocess.run(["/bin/bash", "-eu", "-c", command], capture_output=True,
+                              text=True, env=env, timeout=120)
+        assert done.returncode == 0, f"{command}\n{done.stdout}{done.stderr}"
+        if " apply " in command:
+            # The existing CLI fixture persists configure's input for --json.
+            show_stored(bin_dir)
+    for rel in (RECORD, RULES, OVERRIDE, DB):
+        assert at(home, rel).is_file(), f"shell setup did not create {rel}"
+    assert "0 FAIL" in done.stdout, done.stdout
+    assert not at(home, SETTINGS).exists(), "shell setup opted into optional settings"
+
+
 # ---------------------------------------------------------------------------
 # The walk's README and skill friction: each claim a newcomer meets is pinned.
 

@@ -47,6 +47,10 @@ link.
 No plugin change:
 
 - The README's named current tag moves to `v0.3.2`.
+- The README documents setup without a chat session: locate the installed
+  script and ledger command, then run `plan`, `apply`, `ledger-init` and
+  `doctor`. The shell example leaves every optional settings change out;
+  the script and its existing-file refusals are unchanged.
 
 ## v0.3.1
 

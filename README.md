@@ -277,7 +277,7 @@ outside your Claude folder.
 
 ### Set up
 
-In a session, run:
+The main path is the setup slash command in a session:
 
 ```text
 /harness:setup
@@ -306,6 +306,95 @@ at its path, setup leaves it as it is and uninstall leaves it too.
 
 Before the closing note, the skill also offers an instance folder (below). It
 asks once, and runs it only if you say yes.
+
+#### Set up from a shell
+
+Use this path when you do not have an open Claude Code session, including
+from a headless agent's shell. It needs no session or nested `claude -p`
+call. Plugins installed during a session load only in a new session or
+after `/reload-plugins`; installing them does not make `/harness:setup`
+available in that same session automatically.
+
+After `claude plugin install harness@harness-core`, the script is at
+`~/.claude/plugins/cache/harness-core/harness/<version>/setup.py`, where
+`<version>` is the installed plugin's cache version, not the repository tag.
+Find the available copies:
+
+```sh
+ls -d "$HOME"/.claude/plugins/cache/harness-core/harness/*/setup.py
+```
+
+Choose the copy from the install you want to set up, replacing `<version>`
+below. The ledger command is normally on a session's PATH, not your shell's.
+Find the installed command and replace `<ledger-command-directory>` with
+its containing directory (an absolute path, without the final `/ledger`).
+If several versions are listed, choose the one from the same install:
+
+```sh
+setup_py="$HOME/.claude/plugins/cache/harness-core/harness/<version>/setup.py"
+find "$HOME/.claude/plugins/cache/harness-core/ledger-hooks" -type f -name ledger
+export PATH='<ledger-command-directory>':"$PATH"
+```
+
+Keep that shell open for the commands below. Python 3.11 or later and the
+`claude` CLI must also be on PATH. Replace `<operator>` with the name the
+ledger should stamp on your writes, using the same value in all three
+commands. `claude-code` is the harness name; replace it consistently if you
+use another.
+
+1. **Read the plan before approving any write.** This command writes nothing:
+
+```sh
+python3 "$setup_py" plan --home "$HOME" --operator '<operator>' --harness 'claude-code'
+```
+
+Read every `FILE`, the three `LEDGER` options and the `FIRST LEDGER WRITE`
+command. These have no approval IDs: choosing to run `apply` and
+`ledger-init` below approves them. Each `OPTIONAL <id>` names one optional
+settings change and prints its exact text; only those IDs go to `--approve`.
+For example, `sandbox` and `deny:Read(.env)` are separate IDs.
+
+2. **Apply the files and ledger options.** Run this only after approving the
+files, the ledger options and the first ledger write. With no `--approve`,
+every optional settings change is left out; the setup is still complete:
+
+```sh
+python3 "$setup_py" apply --home "$HOME" --operator '<operator>' --harness 'claude-code'
+```
+
+To opt into individual optional changes instead, append one `--approve '<id>'`
+per approved ID from your plan to that command, for example
+`--approve 'sandbox' --approve 'deny:Read(.env)'`. Single-quote each ID:
+parentheses in a deny ID are shell syntax when unquoted. Never use
+`--approve-all`, and never treat approval of the files as approval of an
+optional item.
+
+3. **Make the first ledger write.** `apply` does not do this step:
+
+```sh
+python3 "$setup_py" ledger-init --home "$HOME" --operator '<operator>' --harness 'claude-code'
+```
+
+It creates the database with one closed "Harness setup" topic when absent;
+an existing database is kept without a write.
+
+4. **Check the result:**
+
+```sh
+python3 "$setup_py" doctor --home "$HOME"
+```
+
+`FAIL` means the setup is not complete; `note` is information. If any
+command refuses with `setup:`, stop and read the refusal; do not work
+around it or edit the files by hand.
+
+These are the same script commands the skill runs, with the same result:
+the rules default, override starter, setup record, lock, stored ledger
+options and first ledger write described below. The same refusal applies
+when a rules default already exists: setup does not overwrite or merge it.
+An existing override is kept. Start a new session when finished so it reads
+the rules and stored ledger options.
+
 
 #### What setup writes
 
@@ -367,6 +456,9 @@ inside them when `rails` arrives.
 ```text
 /harness:setup doctor
 ```
+
+Without a session, use `python3 "$setup_py" doctor --home "$HOME"` from
+**Set up from a shell**, with the same script path and PATH.
 
 It reads and writes nothing. It reports the placed files (unchanged, changed
 since setup, or missing), the settings items setup added, the stored ledger
