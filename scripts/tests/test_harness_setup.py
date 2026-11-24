@@ -2444,6 +2444,36 @@ def test_a_failed_folder_sync_after_the_restore_landed_reports_the_restored_file
     assert again.out == f"updated: {rules}\n"
 
 
+def test_a_failed_restore_that_cannot_read_the_file_back_names_both_states(tmp_path):
+    bin_dir = install(tmp_path)
+    record_n = record_write_point(tmp_path, bin_dir)
+    probe = make_home(tmp_path, name="probe")
+    assert apply_all(probe, bin_dir).rc == 0
+    plant_old_rules(probe)
+    rolled = run("update", probe, bin_dir=bin_dir, hooks={"raise_at": [record_n]})
+    restore_temp = [n for n in temp_points(rolled.events, "harness.md") if n > record_n][0]
+    home = make_home(tmp_path)
+    assert apply_all(home, bin_dir).rc == 0
+    old_sha = plant_old_rules(home)
+    record = record_bytes(home)
+    rules = at(home, mod.RULES_REL)
+    # A symlink in place of the file: the restore refuses and the read-back raises.
+    action = (f"os.symlink('/dev/null', {str(rules) + '.link'!r}); "
+              f"os.replace({str(rules) + '.link'!r}, {str(rules)!r})")
+    done = run("update", home, bin_dir=bin_dir, hooks={
+        "raise_at": [record_n], "act_after": {str(restore_temp): action}})
+    line = one_refusal(done)
+    assert line == (
+        f"setup: update could not put {rules} back after the record write failed "
+        f"([Errno 5] injected; restore failed: {rules} is a symlink); the state "
+        "of the file could not be confirmed; if it holds the plugin's new default, "
+        f"restore it to the bytes with the hash {old_sha} that "
+        f"{at(home, mod.RECORD_REL)} holds, or set the hash of {mod.RULES_REL} in "
+        f"the record to {sha(RULES_SOURCE.read_bytes())}; if it holds its previous "
+        "bytes, nothing needs to change")
+    assert record_bytes(home) == record
+
+
 def test_a_failed_restore_that_leaves_the_file_unconfirmed_names_both_states(tmp_path):
     bin_dir = install(tmp_path)
     record_n = record_write_point(tmp_path, bin_dir)
