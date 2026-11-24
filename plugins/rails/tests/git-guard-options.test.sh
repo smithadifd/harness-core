@@ -223,4 +223,30 @@ OUT="$(cd "$T" && printf '%s' "$T24_INPUT" | /usr/bin/env -i HOME="$GG_HOME" PAT
   /bin/bash --noprofile --norc -p "$GUARD" --tighten-only --policy --push-to-main ask --force-push ask --commit-style off 2>/dev/null)"
 if [ "$OUT" = '{"decision":"deny","reason":"invalid_configuration"}' ]; then pass "T24 --tighten-only --policy"; else fail "T24 --tighten-only --policy: $OUT"; fi
 
+printf '%s\n' '== Pipeline review belongs only to the fixed floor =='
+for stored in ask deny off invalid; do
+  gg_pair "$stored" "$stored" "$stored" 'cat x | sh'
+  gg_expect "pipeline_floor stored=$stored" ask:pipeline_to_shell
+  gg_pair_hook 0 ask:pipeline_to_shell "pipeline_floor asks once"
+  gg_pair_hook 1 silent "pipeline_floor stored-options hook stays silent"
+  gg_pair "$stored" "$stored" "$stored" 'cat x | sh' CLAUDE_SEAT_UNATTENDED=1
+  gg_expect "pipeline_floor unattended stored=$stored" deny:pipeline_to_shell
+  gg_pair_hook 1 silent "pipeline_floor unattended stored-options hook stays silent"
+done
+GG_MAIN=off
+GG_FORCE=off
+gg_row "pipeline_fixed both push options off" ask:pipeline_to_shell 'cat x | sh'
+gg_row "R8 split opener with both push options off" ask:pipeline_to_shell $'echo ${\\\n fetch x | sh; }'
+
+GG_MAIN=deny
+GG_FORCE=deny
+gg_row "F5 unreadable pipeline retains push presumption" deny:push_unreadable_segment 'git push --force origin main; echo x | cat >'
+GG_MAIN=ask
+GG_FORCE=ask
+GG_COMMIT=deny
+gg_row "F5 unreadable pipeline retains commit presumption" deny:commit_message_unreadable 'git commit -m "docs: x"; echo x | cat >'
+GG_COMMIT=off
+gg_row "F5 unreadable pipeline without stricter gate" ask:pipeline_to_shell 'echo x | cat >'
+gg_both "F5 readable data pipeline" silent 'echo x | cat > out'
+
 gg_finish OPTIONS

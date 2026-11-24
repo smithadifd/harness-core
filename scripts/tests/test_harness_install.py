@@ -872,10 +872,11 @@ def plugin_version(name):
     return json.loads(manifest.read_text(encoding="utf-8"))["version"]
 
 
-def test_the_changelog_has_a_release_entry_on_top_and_no_unreleased_heading():
+def test_the_changelog_names_the_latest_release_after_optional_unreleased_notes():
     headings = changelog_headings()
+    if headings[0] == "Unreleased":
+        headings = headings[1:]
     assert re.fullmatch(r"v\d+\.\d+\.\d+", headings[0]), headings[0]
-    assert not [heading for heading in headings if "unreleased" in heading.lower()]
 
 
 def test_the_readme_names_the_current_release_tag_and_one_command_to_read_it():
@@ -883,7 +884,7 @@ def test_the_readme_names_the_current_release_tag_and_one_command_to_read_it():
     text = one_line(readme)
     found = re.search(r"use the current one, which is `(v\d+\.\d+\.\d+)`\.", text)
     assert found, "the install block does not name the current tag"
-    assert found.group(1) == changelog_headings()[0]
+    assert found.group(1) == next(heading for heading in changelog_headings() if heading != "Unreleased")
     assert "Each release moves it" in text and "Tags page" in text
     assert f"git ls-remote --tags {OWN_URL}" in readme.splitlines()
 

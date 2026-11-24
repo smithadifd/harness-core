@@ -32,15 +32,15 @@ gg_row "C-16 sh -c" ask:push_beside_shell "sh -c 'git push origin feature'"
 gg_row "C-17 flock" ask:push_beside_flock 'flock /tmp/l git push origin feature'
 gg_row "C-18 node -e" ask:push_beside_interpreter "node -e 'require(\"child_process\").execSync(\"git push\")'"
 gg_row "C-19 a shell whose pipeline holds a \$" ask:push_beside_shell 'CMD="git push -f"; bash -c "$CMD"'
-gg_row "C-20 source in the push's pipeline" ask:push_beside_source 'echo git push | source /dev/stdin'
-gg_row "C-21 dot as a command word in the push's pipeline" ask:push_beside_source "printf 'git push -f' | . /dev/stdin"
+gg_row "C-20 source in the push's pipeline" ask:pipeline_to_shell 'echo git push | source /dev/stdin'
+gg_row "C-21 dot as a command word in the push's pipeline" ask:pipeline_to_shell "printf 'git push -f' | . /dev/stdin"
 gg_row "C-21b source in another pipeline, before a feature push" silent 'source ./env.sh && git push origin feature'
 gg_row "C-22 python3.12 -c" ask:push_beside_interpreter "python3.12 -c 'import os; os.system(\"git push\")'"
 gg_row "C-23 a pattern command word" ask:push_beside_variable_command 'gi? push origin feature'
 gg_row "C-24 push as the last element of a python list" ask:push_beside_interpreter "python3 -c \"import subprocess; subprocess.run(['git','push'])\""
-gg_row "C-25 a pipeline into a group that runs sh" ask:push_beside_shell "printf 'git push --force origin main\\n' | { cat; sh; }"
-gg_row "C-26 a pipeline into a subshell that runs sh" ask:push_beside_shell "printf 'git push --force origin main\\n' | (cat; sh)"
-gg_row "C-27 a group, then a pipe into sh" ask:push_beside_shell "{ printf 'git push -f'; } | sh"
+gg_row "C-25 a pipeline into a group that runs sh" ask:pipeline_to_shell "printf 'git push --force origin main\\n' | { cat; sh; }"
+gg_row "C-26 a pipeline into a subshell that runs sh" ask:pipeline_to_shell "printf 'git push --force origin main\\n' | (cat; sh)"
+gg_row "C-27 a group, then a pipe into sh" ask:pipeline_to_shell "{ printf 'git push -f'; } | sh"
 gg_row "C-28 a glob suffix on the push word, beside a substitution" ask:push_beside_substitution 'echo "row $(date +%s) | git push"*'
 
 printf '%s\n' '== Pipeline scope (P-S rows): silent =='
@@ -49,8 +49,8 @@ gg_row "P-S2 inline python before a feature push" silent 'python3 -c "import jso
 gg_row "P-S3 xargs in another pipeline" silent 'git ls-files | xargs grep x && git push origin feature'
 gg_row "P-S4 echo of a push" silent 'echo never git push --force'
 gg_row "P-S5 grep for push" silent 'grep -n push notes.md'
-gg_row "P-S6 |& joins the pipeline" ask:push_beside_shell "printf 'git push -f\\n' |& sh"
-gg_row "P-S7 a newline after | joins the pipeline" ask:push_beside_shell $'printf \'git push -f\\n\' |\nsh'
+gg_row "P-S6 |& joins the pipeline" ask:pipeline_to_shell "printf 'git push -f\\n' |& sh"
+gg_row "P-S7 a newline after | joins the pipeline" ask:pipeline_to_shell $'printf \'git push -f\\n\' |\nsh'
 
 printf '%s\n' '== Rule G and the plain text (C-G rows) =='
 INCIDENT_A='node /opt/agent/companion.mjs task --cwd /srv/lanes/lane-1 --prompt "You are a builder working ONLY inside your worktree. Never rm -rf; never export HOME; never git push or --force; never launchctl; never write the agent config folders. Exactly one commit." --write'
@@ -70,8 +70,8 @@ INCIDENT_B=$'cat <<\'EOF\' >> "$SCRATCH/lane-preamble.md"\nRules for this lane: 
 gg_row "C-H1 incident B: a heredoc brief appended to a file" silent "$INCIDENT_B"
 gg_row "C-H2 gh --body-file - with a push in the body" silent $'gh pr create --body-file - <<\'EOF\'\nNever push to main.\nEOF'
 gg_row "C-H3 git commit -F - with push in the body" silent $'git commit -F - <<EOF\ndocs: never git push from here\nEOF'
-gg_row "C-H4 a heredoc piped to sh" ask:push_beside_heredoc $'cat <<EOF | sh\ngit push -f origin feature\nEOF'
-gg_row "C-H5 a pipe carried over a newline to sh" ask:push_beside_heredoc $'cat <<EOF |\ngit push -f origin feature\nEOF\nsh'
+gg_row "C-H4 a heredoc piped to sh" ask:pipeline_to_shell $'cat <<EOF | sh\ngit push -f origin feature\nEOF'
+gg_row "C-H5 a pipe carried over a newline to sh" ask:pipeline_to_shell $'cat <<EOF |\ngit push -f origin feature\nEOF\nsh'
 gg_row "C-H6 a data heredoc, then a real push to main" ask:push_main_branch $'cat <<EOF > x\ngit push\nEOF\ngit push origin main'
 gg_row "C-H7 an arithmetic shift is not a consumer" ask:push_beside_heredoc $'((y=1<<E))\ngit push -f origin main\nE'
 gg_row "C-H7b an arithmetic shift with a clean delimiter and its line" ask:push_beside_heredoc $'(( y = 1 << E ))\ngit push -f origin main\nE'
@@ -82,6 +82,11 @@ gg_row "C-H11 no closing line" ask:push_beside_heredoc $'cat <<EOF > notes\ngit 
 gg_row "C-H12 a clean delimiter and its line" silent $'cat <<\'END-1\' > notes\ngit push -f origin main\nEND-1'
 gg_row "C-H13 a heredoc marker inside quotes" silent $'echo "<<EOF"\necho never git push --force'
 gg_row "C-H14 tee is a consumer" silent $'tee file <<EOF\ngit push -f\nEOF'
+gg_both "R8 quoted heredoc continuation without prefix" silent $'cat <<\'E\' | grep x\na\\\nb\nE'
+gg_row "R8 quoted heredoc prefix accepted over-ask" ask:pipeline_to_shell $'cat <<\'E\' | grep x\na$\\\nb\nE'
+gg_row "R8 continued delimiter word" ask:pipeline_to_shell $'cat <<E\\\n | grep x\n$(fetch x | sh)\nE'
+gg_row "R8 continuation before delimiter word" ask:pipeline_to_shell $'cat << \\\nE | grep x\n$(fetch x | sh)\nE'
+gg_row "R8 continuation after tab-strip marker" ask:pipeline_to_shell $'cat <<-\\\nE | grep x\n$(fetch x | sh)\nE'
 
 printf '%s\n' '== Configuration on the command line (C-K rows) =='
 gg_row "C-K1 an alias defined with -c, no push word" ask:git_config_injection 'git -c alias.p=log p'
@@ -191,7 +196,7 @@ gg_row_at "$REPO_FEATURE" $'GT:1423 argument count before push' ask $'echo $#; g
 gg_row_at "$REPO_FEATURE" $'GT:1424 brace word before push' ask $'echo {#a}; git push --force origin main'
 gg_row_at "$REPO_FEATURE" $'GT:1426 force push text via stdout and stderr pipe' ask $'printf \'git push -f\\n\' |& sh'
 gg_row_at "$REPO_FEATURE" $'GT:1427 global-option push text via stdout and stderr pipe' ask $'printf \'git -C /tmp push -f\\n\' |& sh'
-gg_row_at "$REPO_FEATURE" $'GT:1428 possible shell input via stdout and stderr pipe' silent $'echo x |& bash'
+gg_row_at "$REPO_FEATURE" $'GT:1428 possible shell input via stdout and stderr pipe' ask:pipeline_to_shell $'echo x |& bash'
 gg_row_at "$REPO_FEATURE" $'GT:1429 status through stdout and stderr pipe to cat' silent $'git status |& cat'
 gg_row_at "$REPO_FEATURE" $'GT:1435 push-free R4L1' ask $'echo \''"$GG_A_30000"$'\' && git push --force origin main'
 gg_row_at "$REPO_FEATURE" $'GT:1436 push-free R4L2' silent $'python3 -c \''"$GG_A_30000"$'\''
@@ -289,7 +294,7 @@ gg_row_at "$REPO_FEATURE" $'GT:1520 push-free D16' ask $'echo "- x" "y"$(date \'
 gg_row_at "$REPO_FEATURE" $'GT:1521 push-free E1' ask $'echo "- $(date +%s)" && git push --force origin main'
 gg_row_at "$REPO_FEATURE" $'GT:1522 push-free E2' ask $'echo "- $(date +%s)"; git push --force origin main'
 # S1: no push word
-gg_row_at "$REPO_FEATURE" $'GT:1523 push-free E3' silent $'echo "- $(date +%s)" | sh'
+gg_row_at "$REPO_FEATURE" $'GT:1523 push-free E3' ask:pipeline_to_shell $'echo "- $(date +%s)" | sh'
 gg_row_at "$REPO_FEATURE" $'GT:1524 push-free E4' ask $'echo "- $(date +%s)" > >(git push --force origin main)'
 gg_row_at "$REPO_FEATURE" $'GT:1525 push-free E5' ask $'echo "- $(date +%s)" <<< "git push"'
 gg_row_at "$REPO_FEATURE" $'GT:1526 push-free E6' ask $'echo "- $(date +%s) git push" > f > g'

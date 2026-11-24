@@ -2,11 +2,12 @@
 # The rails plugin's git guard: a fail-closed git push and commit-style policy
 # and its Claude Code PreToolUse adapter.
 #
-# What it claims. Three things are judged: a git push (the main gate and the
-# force gate), a push the guard cannot read (presumed to be both), and, when
-# the commit_style option is on, the first line of a top-level git commit
-# message. Everything else gets no opinion: silence, and Claude Code's own
-# permission flow decides.
+# What it claims. It judges git pushes (the main and force gates), pushes it
+# cannot read (presumed to be both), pipelines into shells, and, with
+# commit_style on, the first line of a top-level git commit message.
+# Pipeline review is a fixed ask, including text it cannot read; only hook A
+# judges it. Everything else gets no opinion: Claude Code's permission flow
+# decides. This is a mistake catcher, not a boundary against hostile code.
 #
 # It never returns an allow. The engine's verdicts are deny, ask and
 # no_opinion; the adapter prints an ask, a deny, or nothing. Every path that
@@ -234,11 +235,19 @@ GUARD_LOG_INPUT=""
 
 # --adapter-policy and --timeout-runner are test seams of the adapter only;
 # hooks.json passes neither.
+# Internal engine mode used by the stored-options adapter.
+PIPELINE_FLOOR=1
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --policy)
       [ "$MODE" = "adapter" ] || ARG_ERROR=1
       MODE="policy"
+      shift
+      ;;
+    --policy-tighten)
+      [ "$MODE" = adapter ] || ARG_ERROR=1
+      MODE=policy
+      PIPELINE_FLOOR=0
       shift
       ;;
     --tighten-only)
@@ -276,6 +285,7 @@ ROOTS_HINT="/usr/bin, /bin, /usr/local/bin, /opt/homebrew/bin or /home""/linuxbr
 VERDICT_HINT=""
 verdict_hint() {
   case "$1" in
+    pipeline_to_shell) VERDICT_HINT='a pipeline feeds a shell or a stage the guard cannot read safely; review it before running' ;;
     push_main_branch) VERDICT_HINT="this push updates main or master, which the rails plugin's push_to_main option guards" ;;
     push_main_unresolved) VERDICT_HINT='the guard could not tell which branch this push updates (the current branch, the folder or the repository is unknown), so it treats it as a push to main' ;;
     push_config_remap) VERDICT_HINT="git configuration (push.default, or a remote's push or mirror setting) decides what this push updates, so the guard treats it as a push to main" ;;
@@ -558,6 +568,7 @@ GATE=""
 code_gate() { # CODE
   case "$1" in
     push_main_branch|push_main_unresolved|push_config_remap|push_all_branches|push_matching_refspec|push_pattern_refspec) GATE=main ;;
+    pipeline_to_shell) GATE=pipeline ;;
     push_force|push_delete|push_mirror|push_prune) GATE=force ;;
     commit_nonconventional|commit_message_unreadable) GATE=commit ;;
     *) GATE=presumed ;;
@@ -571,6 +582,7 @@ record_code() { # CODE
   local code="$1" level printed="$1" main_level force_level
   code_gate "$code"
   case "$GATE" in
+    pipeline) level=1 ;;
     main)
       option_level "$OPT_MAIN"; level="$LEVEL"
       [ "$level" -lt 3 ] || printed=option_invalid_push_to_main
@@ -624,7 +636,17 @@ policy_no_opinion() {
 # the stricter is printed: a push word is presumed (push_unreadable_segment),
 # or with no push word a § 7.2 marker is (git_config_injection); a commit word
 # with commit style on fails the commit check (commit_message_unreadable).
+PIPELINE_READING=0
 policy_deny() {
+  if [ "$1" = unsupported_syntax ] && [ "$PIPELINE_READING" -eq 1 ]; then
+    record_code pipeline_to_shell
+    # Preserve stricter push/commit options even if a redirection cannot be
+    # read while judging the pipeline before the other gates start.
+    text_words "$command_raw"
+    [ "$WT_PUSH" -eq 0 ] || record_code push_unreadable_segment
+    [ "$WT_COMMIT" -eq 0 ] || record_code commit_message_unreadable
+    finish_verdict
+  fi
   if [ "$1" = unsupported_syntax ] && [ "$GATES_LIVE" -eq 1 ]; then
     GATES_LIVE=0
     if [ "$HAS_PUSH" -eq 1 ]; then
@@ -1976,6 +1998,409 @@ command_word_is_pattern() { # RAW
     i=$((i + 1))
   done
   return 1
+}
+
+# ---------------------------------------------------------------------------
+# Pipeline review. This reader never evaluates command text. The pinned word
+# lexer removes quotes; this layer retains operators and group scope. A failed
+# strict reading uses the deliberately broader fallback: every shell/reserved
+# word in a piped stage is suspect, not just its command word.
+# ---------------------------------------------------------------------------
+PL_TOKENS=()
+PL_RAW=()
+PL_FALLBACK=0
+# The pinned brace reader is deliberately not a shell-specific expansion
+# parser. Do not trust an extent whose quotes or bare braces can move its end.
+pipeline_parameter_end() { # TEXT INDEX_AFTER_OPEN
+  local s="$1" start="$2" i="$2" end
+  case "${s:start:1}" in ' '|$'\t'|$'\n'|'|') return 1 ;; esac
+  skip_brace "$s" "$start" || return 1
+  end="$SKIP_END"
+  case "${s:start:end-start}" in *"'"*) return 1 ;; esac
+  while [ "$i" -lt "$end" ]; do
+    if [ "${s:i:1}" = '{' ]; then
+      case "${s:i-1:1}" in '$'|"\\") ;; *) return 1 ;; esac
+    fi
+    i=$((i + 1))
+  done
+  SKIP_END="$end"
+}
+
+pipeline_parameter_extents() { # EXPANDED_CONTENT
+  local s="$1" i=0 n=${#1}
+  while [ "$i" -lt "$n" ]; do
+    case "${s:i:1}:${s:i+1:1}" in
+      "\\:"*) i=$((i + 2)); continue ;;
+      '$:{')
+        pipeline_parameter_end "$s" $((i + 2)) || return 1
+        i="$SKIP_END"; continue ;;
+    esac
+    i=$((i + 1))
+  done
+  return 0
+}
+
+# Join only expanded text here. Substitution bodies retain their physical
+# bytes: their recursive source scan owns quotes, comments and heredocs.
+PIPELINE_JOINED=""
+pipeline_expanded_continuations() { # CONTENT
+  local s="$1" i=0 n=${#1} out="" end
+  case "$s" in *$'\\\n'*) ;; *) PIPELINE_JOINED="$s"; return 0 ;; esac
+  while [ "$i" -lt "$n" ]; do
+    if [ "${s:i:2}" = $'\\\n' ]; then i=$((i + 2)); continue; fi
+    case "${s:i:1}:${s:i+1:1}" in
+      "\\:"*) out="$out${s:i:2}"; i=$((i + 2)); continue ;;
+      '$:('|'<:('|'>:(')
+        skip_paren "$s" $((i + 2)) || return 1
+        end="$SKIP_END"
+        out="$out${s:i:end-i}"; i="$end"; continue ;;
+      '`:'*)
+        skip_backtick "$s" $((i + 1)) || return 1
+        end="$SKIP_END"
+        out="$out${s:i:end-i}"; i="$end"; continue ;;
+    esac
+    out="$out${s:i:1}"; i=$((i + 1))
+  done
+  PIPELINE_JOINED="$out"
+}
+
+# Expanded text is not shell source. Scan flat: neither quotes nor parameter
+# operators hide substitutions, and a heredoc's literal braces need no match.
+pipeline_quoted_substitutions() { # CONTENT
+  local s="$1" i=0 n=${#1} end
+  while [ "$i" -lt "$n" ]; do
+    case "${s:i:1}:${s:i+1:1}" in
+      "\\:"*) i=$((i + 2)); continue ;;
+      '$:{')
+        case "${s:i+2:1}" in ' '|$'\t'|$'\n'|'|') return 0 ;; esac ;;
+      '$:(')
+        PL_FALLBACK=1
+        skip_paren "$s" $((i + 2)) || return 0
+        end="$SKIP_END"
+        pipeline_to_shell "${s:i+2:end-i-3}" && return 0
+        i="$end"; continue ;;
+      '`:'*)
+        PL_FALLBACK=1
+        skip_backtick "$s" $((i + 1)) || return 0
+        end="$SKIP_END"
+        pipeline_to_shell "${s:i+1:end-i-2}" && return 0
+        i="$end"; continue ;;
+    esac
+    i=$((i + 1))
+  done
+  return 1
+}
+
+pipeline_tokens() { # TEXT
+  local s="$1" i=0 n=${#1} word="" c next end header="" line d k piece start body closed run
+  local -a expands delims strips
+  expands=()
+  PL_TOKENS=()
+  PL_RAW=()
+  PL_FALLBACK=0
+  while [ "$i" -lt "$n" ]; do
+    c="${s:i:1}"; next="${s:i+1:1}"
+    case "$c" in
+      "'"|'"'|'`'|'$'|'<'|'>')
+        case "$c:$next" in
+          '$:$')
+            # The PID consumes both dollars; a following quote is plain.
+            word="$word\$\$"; header="$header\$\$"; i=$((i + 2)); continue ;;
+          '<:<')
+            # Delimiter words never expand. Keep their raw quoting separately
+            # from the pinned collector's dequoted delimiter and tab flag.
+            if [ "${s:i:3}" = '<<<' ]; then
+              word="$word<<<"; header="$header<<<"; i=$((i + 3)); continue
+            fi
+            start=$((i + 2))
+            [ "${s:start:1}" != '-' ] || start=$((start + 1))
+            while [ "${s:start:1}" = ' ' ] || [ "${s:start:1}" = $'\t' ]; do start=$((start + 1)); done
+            redirect_target_end "$s" "$start" || return 1
+            end="$SKIP_END"
+            [ "$end" -gt "$start" ] || return 1
+            piece="${s:start:end-start}"
+            case "$piece" in *'$'*|*'`'*|*$'\n'*) return 1 ;; esac
+            case "$piece" in *"'"*|*'"'*|*\\*) expands+=(0) ;; *) expands+=(1) ;; esac
+            word="$word${s:i:end-i}"; header="$header${s:i:end-i}"
+            i="$end"; continue ;;
+          '$:{')
+            pipeline_parameter_end "$s" $((i + 2)) || return 1
+            end="$SKIP_END"
+            if pipeline_quoted_substitutions "${s:i+2:end-i-3}"; then return 2; fi
+            SKIP_END="$end" ;;
+          '$:('|'<:('|'>:(')
+            PL_FALLBACK=1
+            skip_paren "$s" $((i + 2)) || return 1
+            end="$SKIP_END"
+            # Substitutions can themselves contain a reviewed pipeline.
+            if pipeline_to_shell "${s:i+2:end-i-3}"; then return 2; fi
+            SKIP_END="$end"
+            ;;
+          '`:'*)
+            PL_FALLBACK=1
+            skip_backtick "$s" $((i + 1)) || return 1
+            end="$SKIP_END"
+            if pipeline_to_shell "${s:i+1:end-i-2}"; then return 2; fi
+            SKIP_END="$end"
+            ;;
+          *) ;;
+        esac
+        case "$c:$next" in
+          '$:('|'$:{'|'<:('|'>:('|'`:'*) ;;
+          *)
+            if redirect_skip_token "$s" "$i"; then :; else
+              case "$c" in "'"|'"') return 1 ;; *) SKIP_END=$((i + 1)) ;; esac
+            fi
+            ;;
+        esac
+        piece="${s:i:SKIP_END-i}"
+        case "$c:$next" in
+          "'":*|'$:'"'") ;; # Proven literal single-quoted/ANSI-C pieces.
+          '$:('|'$:{'|'<:('|'>:('|'`:'*) ;; # Already scanned recursively.
+          *)
+            if [ "${#piece}" -gt 1 ]; then
+              end="$SKIP_END"
+              pipeline_expanded_continuations "$piece" || return 1
+              piece="$PIPELINE_JOINED"
+              pipeline_parameter_extents "$piece" || return 1
+              if pipeline_quoted_substitutions "$piece"; then return 2; fi
+              SKIP_END="$end"
+            fi ;;
+        esac
+        word="$word$piece"
+        case "$c:$next" in
+          '$:('|'<:('|'>:('|'`:'*) header="${header}x" ;;
+          *) header="$header$piece" ;;
+        esac
+        i="$SKIP_END"; continue
+        ;;
+      "\\")
+        [ -n "$next" ] || return 1
+        # At source level an escaped newline contributes no word bytes.
+        if [ "$next" = $'\n' ]; then i=$((i + 2)); continue; fi
+        word="$word$c$next"; header="$header$c$next"; i=$((i + 2)); continue ;;
+      '#')
+        if [ -z "$word" ]; then
+          while [ "$i" -lt "$n" ] && [ "${s:i:1}" != $'\n' ]; do i=$((i + 1)); done
+          continue
+        fi ;;
+      '&')
+        if [ "${s:i-1:1}" = '<' ] || [ "${s:i-1:1}" = '>' ] || [ "$next" = '>' ]; then
+          word="$word$c"; header="$header$c"; i=$((i + 1)); continue
+        fi ;;
+    esac
+    case "$c" in
+      ' '|$'\t'|$'\n'|';'|'|'|'&'|'('|')'|'{'|'}')
+        # Braces glued to a word are expansion/data, not group operators.
+        if { [ "$c" = '{' ] && [ -n "$word" ]; } \
+          || { [ "$c" = '{' ] && [ "$next" != ' ' ] && [ "$next" != $'\n' ]; } \
+          || { [ "$c" = '}' ] && [ -n "$word" ]; }; then
+          word="$word$c"; header="$header$c"; i=$((i + 1)); continue
+        fi
+        if [ -n "$word" ]; then
+          split_shell_words "$word" || return 1
+          PL_TOKENS+=("${SPLIT_WORDS[0]}"); PL_RAW+=("$word"); word=""
+        fi
+        case "$c" in
+          ' '|$'\t') ;;
+          *)
+            if { [ "$c" = '|' ] && [ "$next" = '|' ]; } \
+              || { [ "$c" = '&' ] && [ "$next" = '&' ]; } \
+              || { [ "$c" = '|' ] && [ "$next" = '&' ]; }; then
+              c="$c$next"; i=$((i + 1))
+            fi
+            PL_TOKENS+=("$c"); PL_RAW+=("$c")
+            ;;
+        esac
+        if [ "$c" = $'\n' ]; then
+          collect_heredocs "$header"
+          delims=(${HEREDOC_DELIMS[@]+"${HEREDOC_DELIMS[@]}"})
+          strips=(${HEREDOC_STRIP_TABS[@]+"${HEREDOC_STRIP_TABS[@]}"})
+          [ "${#delims[@]}" -eq "${#expands[@]}" ] || return 1
+          i=$((i + 1))
+          k=0
+          while [ "$k" -lt "${#delims[@]}" ]; do
+            d="${delims[$k]}"; body=""; closed=0
+            while [ "$i" -lt "$n" ]; do
+              line=""
+              while :; do
+                end="$i"
+                while [ "$end" -lt "$n" ] && [ "${s:end:1}" != $'\n' ]; do end=$((end + 1)); done
+                line="$line${s:i:end-i}"
+                i=$((end + 1))
+                # Only expanding bodies join physical lines, before matching
+                # the delimiter. An escaped backslash keeps its newline.
+                [ "${expands[$k]}" -eq 1 ] || break
+                run="${line##*[!\\]}"
+                [ $((${#run} % 2)) -eq 1 ] && [ "$end" -lt "$n" ] || break
+                line="${line%\\}"
+              done
+              [ "${strips[$k]}" -eq 0 ] || while [ "${line#$'\t'}" != "$line" ]; do line="${line#$'\t'}"; done
+              if [ "$line" = "$d" ]; then closed=1; break; fi
+              body="$body$line"$'\n'
+            done
+            [ "$closed" -eq 1 ] || return 1
+            if [ "${expands[$k]}" -eq 1 ] && pipeline_quoted_substitutions "$body"; then return 2; fi
+            k=$((k + 1))
+          done
+          header=""; expands=(); continue
+        fi
+        ;;
+      *) word="$word$c" ;;
+    esac
+    header="$header$c"; i=$((i + 1))
+  done
+  if [ -n "$word" ]; then
+    split_shell_words "$word" || return 1
+    PL_TOKENS+=("${SPLIT_WORDS[0]}"); PL_RAW+=("$word")
+  fi
+  return 0
+}
+
+# One stage, with redirections removed before wrapper options are read.
+# Return 0 means review; 1 means this stage is data.
+pipeline_stage() { # RAW_STAGE FALLBACK
+  local stage="$1" fallback="$2" i=0 n w base raw option
+  local -a words raws
+  strip_command_redirections "$stage"
+  split_shell_words "$REDIR_STRIPPED" || return 0
+  words=(${SPLIT_WORDS[@]+"${SPLIT_WORDS[@]}"})
+  raws=(${SPLIT_RAW[@]+"${SPLIT_RAW[@]}"})
+  n=${#words[@]}
+  [ "$n" -gt 0 ] || return 0
+  # A command lookup never executes the shell word it names.
+  if [ "${words[0]##*/}" = command ]; then
+    case "${words[1]-}" in -*v*|-*V*) return 1 ;; esac
+  fi
+  if [ "$fallback" -eq 1 ]; then
+    case "$stage" in *'`'*|*"\$'"*|*'$"'*|*'>('*|*'<('*) return 0 ;; esac
+    for w in ${words[@]+"${words[@]}"}; do
+      is_shell_name "$w" && return 0
+      case "$w" in '.'|source|eval|until|for|case|select|function|'[['|coproc|while|if) return 0 ;; esac
+    done
+  fi
+  while [ "$i" -lt "$n" ]; do
+    w="${words[$i]}"; raw="${raws[$i]}"; base="${w##*/}"
+    if [[ "$w" =~ ^[A-Za-z_][A-Za-z0-9_]*(\+)?= ]]; then i=$((i + 1)); continue; fi
+    case "$w" in '!') i=$((i + 1)); continue ;; esac
+    raw_word_literal "$raw" 0 || return 0
+    # Strict command-word branch (not argument scanning).
+    is_shell_name "$w" && return 0
+    case "$base" in
+      '.'|source|eval|su|runuser|chroot|flock) return 0 ;;
+      while|until|for|case|select|function|'[['|coproc|if) return 0 ;;
+      xargs)
+        # xargs constructs arguments, not a shell fed by its stdin.
+        [ "$fallback" -eq 1 ] || return 1
+        i=$((i + 1)); continue ;;
+      env|sudo|nohup|time|nice|timeout|stdbuf|setsid|exec|command|builtin|doas|caffeinate|noglob|nocorrect)
+        i=$((i + 1))
+        while [ "$i" -lt "$n" ]; do
+          option="${words[$i]}"
+          case "$base:$option" in
+            # env split-string introduces text this reader does not evaluate.
+            env:--s*) return 0 ;;
+            command:-*v*|command:-*V*) return 1 ;;
+            sudo:-s|sudo:-i) return 0 ;;
+            env:-a|env:--argv0) return 0 ;;
+            *:--) i=$((i + 1)); break ;;
+            env:-u|env:-C|env:-P|env:--unset|env:--chdir|sudo:-u|sudo:-g|sudo:-p|nice:-n|exec:-a|stdbuf:-i|stdbuf:-o|stdbuf:-e|timeout:-s|timeout:--signal|timeout:-k|timeout:--kill-after)
+              i=$((i + 2)); continue ;;
+            env:--unset=*|env:--chdir=*|env:--block-signal*|env:--default-signal*|env:--ignore-signal*|env:-i|env:-v|env:--ignore-environment|sudo:-n|sudo:-E|sudo:-H|time:-p|command:-p|exec:-c|exec:-l|setsid:-f|setsid:-w|setsid:-c|stdbuf:-i?*|stdbuf:-o?*|stdbuf:-e?*|timeout:--foreground|timeout:--preserve-status)
+              i=$((i + 1)); continue ;;
+            env:-*S*) return 0 ;;
+            *:-*) return 0 ;;
+          esac
+          break
+        done
+        if [ "$base" = timeout ]; then
+          [ "$i" -lt "$n" ] || return 0
+          raw_word_literal "${raws[$i]}" 0 || return 0
+          i=$((i + 1))
+        fi
+        ;;
+      *)
+        # An unknown executable carrying a computed argument is unreadable;
+        # ordinary data commands retain their argument/data distinction.
+        case "$base" in
+          cat|grep|tar|head|tail|sort|wc|tr|echo|printf|git|tee|read|':') return 1 ;;
+          *)
+            i=$((i + 1))
+            while [ "$i" -lt "$n" ]; do
+              raw_word_literal "${raws[$i]}" 0 || return 0
+              i=$((i + 1))
+            done
+            return 1 ;;
+        esac
+        ;;
+    esac
+  done
+  return 1
+}
+
+pipeline_to_shell() { # TEXT
+  local text="$1" rc=0 k=0 depth=0 piped=0 pending=0 stage="" tok raw fallback=0
+  local -a PL_TOKENS PL_RAW inherited
+  local PL_FALLBACK=0
+  case "$text" in *'|'*) ;; *) return 1 ;; esac
+  # A split opener asks before any scanner can give its bytes another meaning.
+  case "$text" in *$'$\\\n'*|*$'<\\\n'*|*$'>\\\n'*|*$'${\\\n'*) return 0 ;; esac
+  pipeline_tokens "$text" || rc=$?
+  [ "$rc" -ne 2 ] || return 0
+  # Unclassifiable text holding a pipe byte must not become silence.
+  [ "$rc" -eq 0 ] || return 0
+  fallback="$PL_FALLBACK"
+  inherited=(0)
+  while [ "$k" -lt "${#PL_TOKENS[@]}" ]; do
+    tok="${PL_TOKENS[$k]}"; raw="${PL_RAW[$k]}"; k=$((k + 1))
+    case "$raw" in
+      '('|'{')
+        depth=$((depth + 1)); inherited[depth]="$piped"
+        [ "$fallback" -eq 0 ] || [ "$piped" -eq 0 ] || return 0
+        stage=""; pending=0 ;;
+      ')'|'}')
+        if [ "$piped" -eq 1 ] && [ -n "$stage" ] && pipeline_stage "$stage" "$fallback"; then return 0; fi
+        [ "$depth" -eq 0 ] || depth=$((depth - 1))
+        piped="${inherited[$depth]:-0}"; pending=0; stage="" ;;
+      '|'|'|&'|';'|'&&'|'||'|'&'|$'\n')
+        if [ "$piped" -eq 1 ] && [ -n "$stage" ] && pipeline_stage "$stage" "$fallback"; then return 0; fi
+        case "$raw" in
+          '|'|'|&') piped=1; pending=1 ;;
+          *)
+            if [ "$pending" -eq 1 ]; then
+              [ "$fallback" -eq 0 ] || return 0
+            else
+              piped="${inherited[$depth]:-0}"
+            fi ;;
+        esac
+        [ "$raw" != '&' ] || [ "$piped" -eq 0 ] || [ "$depth" -eq 0 ] || return 0
+        stage="" ;;
+      *) stage="${stage:+$stage }$raw"; pending=0 ;;
+    esac
+  done
+  if [ "$piped" -eq 1 ]; then
+    [ -n "$stage" ] || return 0
+    pipeline_stage "$stage" "$fallback" && return 0
+  fi
+  return 1
+}
+
+# Above the cap, every pipe byte is an operator. Only bare, plainly data
+# stages can stay silent; keep the existing text-wide shell-name presumption.
+pipeline_over_cap() { # TEXT
+  local review
+  case "$1" in *'|'*) ;; *) return 1 ;; esac
+  # One search per rule, not a global match or a Bash word loop. The bounded
+  # prefix and disjoint argument/blank alphabets keep the stage search linear.
+  review="$(printf '%s' "$1" | HOME=/dev/null "$JQ_BIN" -Rrs '
+    test("(^|[^A-Za-z0-9_.-])(?i:sh|bash|zsh|dash|ksh|mksh|ash|yash|fish|csh|tcsh|busybox|su|script|watch|parallel)(?=[^A-Za-z0-9_./-]|$)")
+    or test("\\|(?![|& \\t\\n]{0,64}(?:cat|grep|head|tail|sort|wc|tr|tee)(?:[ \\t]+[A-Za-z0-9_./=:,@%+\\-]+)*[ \\t]*(?=[\\n;|&)]|$))")
+  ')" || policy_deny extraction_failure
+  case "$review" in
+    true) return 0 ;;
+    false) return 1 ;;
+    *) policy_deny extraction_failure ;;
+  esac
 }
 
 # ---------------------------------------------------------------------------
@@ -3633,6 +4058,18 @@ run_policy() {
   command_len="$(set -o pipefail; printf '%s' "$normalized" | HOME=/dev/null "$JQ_BIN" -j '.command' 2>/dev/null | LC_ALL=C "$WC_BIN" -c | "$TR_BIN" -d '[:space:]')" || policy_deny extraction_failure
   case "$command_len" in ''|*[!0-9]*) policy_deny extraction_failure ;; esac
 
+  # The fixed floor is independent of all three configurable gates. Hook B
+  # selects the tighten-only engine mode and never judges this class.
+  if [ "$PIPELINE_FLOOR" -eq 1 ]; then
+    PIPELINE_READING=1
+    if [ "$command_len" -gt "$MAX_COMMAND_CHARS" ]; then
+      if pipeline_over_cap "$command_raw"; then record_code pipeline_to_shell; fi
+    elif pipeline_to_shell "$command_raw"; then
+      record_code pipeline_to_shell
+    fi
+    PIPELINE_READING=0
+  fi
+
   # P1: the push word, the commit word and the § 7.2 markers. None of them (a
   # commit word counts only with commit style on): no opinion, before any
   # segmenting.
@@ -3649,12 +4086,13 @@ run_policy() {
     esac
     shopt -u nocasematch
   fi
-  [ "$HAS_PUSH" -eq 1 ] || [ "$COMMIT_LIVE" -eq 1 ] || [ "$HAS_MARKER" -eq 1 ] || policy_no_opinion
+  if [ "$HAS_PUSH" -ne 1 ] && [ "$COMMIT_LIVE" -ne 1 ] && [ "$HAS_MARKER" -ne 1 ]; then
+    finish_verdict
+  fi
 
-  # The length cap: a push word in an over-long command is presumed; nothing
-  # else is judged there.
+  # Above the length cap only the push and pipeline presumptions apply.
   if [ "$command_len" -gt "$MAX_COMMAND_CHARS" ]; then
-    [ "$HAS_PUSH" -eq 1 ] || policy_no_opinion
+    [ "$HAS_PUSH" -eq 1 ] || finish_verdict
     record_code push_command_too_long
     finish_verdict
   fi
@@ -3865,7 +4303,10 @@ run_adapter() {
   fi
   # Only the runner's stdout is captured. The engine's stderr never reaches
   # it, and the runner's own stderr is discarded.
-  response="$(printf '%s\n' "$normalized" | "$TIMEOUT_RUNNER" -e "$GUARD_RUNNER_PROGRAM" "$TIMEOUT_SECONDS" /bin/bash --noprofile --norc -p "$POLICY_PATH" --policy --push-to-main "$main_value" --force-push "$force_value" --commit-style "$commit_value" 2>/dev/null)" || runner_rc=$?
+  local -a policy_mode
+  policy_mode=(--policy)
+  [ "$TIGHTEN_ONLY" -eq 0 ] || policy_mode=(--policy-tighten)
+  response="$(printf '%s\n' "$normalized" | "$TIMEOUT_RUNNER" -e "$GUARD_RUNNER_PROGRAM" "$TIMEOUT_SECONDS" /bin/bash --noprofile --norc -p "$POLICY_PATH" "${policy_mode[@]}" --push-to-main "$main_value" --force-push "$force_value" --commit-style "$commit_value" 2>/dev/null)" || runner_rc=$?
   [ "$runner_rc" -eq 0 ] || emit_claude_deny engine_failed
   # The framing line is the runner's last line; everything before it is the
   # engine's stdout.
