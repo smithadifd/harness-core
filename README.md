@@ -227,8 +227,8 @@ makes the first ledger write through the ledger plugin's `ledger` command. The
 ledger plugin pinned here (`v0.7.0`) declares those three options
 (`ledger_db`, `ledger_operator` and `ledger_harness`) and ships the `ledger`
 command, so `/harness:setup` gets past its ledger options step. The skills
-plugin pinned here is `sdlc` at `v1.5.0` (commit
-`5abfc37a5cac57f454ab3fbae7bd407b3f7f7b33`); it carries the `ticket` skill
+plugin pinned here is `sdlc` at `v1.6.0` (commit
+`b0c751a12e7c93f8b7f37e835bcdd2f1fb06244d`); it carries the `ticket` skill
 that "First use" below names. Install, update and uninstall work as written
 below.
 
@@ -252,7 +252,7 @@ claude plugin list
 ```
 
 `vX.Y.Z` is a release tag of this repository: use the current one, which is
-`v0.3.2`. Each release moves it, so if this text may be older than the
+`v0.3.3`. Each release moves it, so if this text may be older than the
 repository, read the newest tag on the repository's Tags page on GitHub, or run
 one command and take the highest version it lists:
 
@@ -263,7 +263,7 @@ git ls-remote --tags https://github.com/smithadifd/harness-core.git
 The list shows `harness`, `sdlc` and `ledger-hooks` enabled. Its version
 column is each plugin's own version, not this repository's tag: `harness` and
 `rails` show 0.2.0, the version in their manifests at this repository's tag,
-and `sdlc` shows 0.15.0, which is the skills release `v1.5.0` at the pinned
+and `sdlc` shows 0.16.0, which is the skills release `v1.6.0` at the pinned
 commit; `ledger-hooks` shows 0.7.0, which is the ledger release `v0.7.0` at
 the pinned commit. Start a new session, or run `/reload-plugins` in an
 open one, to load them. On its first run in a folder, Claude Code asks whether
