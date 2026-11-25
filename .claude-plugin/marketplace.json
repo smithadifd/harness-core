@@ -21,8 +21,8 @@
       "source": {
         "source": "url",
         "url": "https://github.com/smithadifd/skills.git",
-        "ref": "v1.5.0",
-        "sha": "5abfc37a5cac57f454ab3fbae7bd407b3f7f7b33"
+        "ref": "v1.6.0",
+        "sha": "b0c751a12e7c93f8b7f37e835bcdd2f1fb06244d"
       }
     },
     {
