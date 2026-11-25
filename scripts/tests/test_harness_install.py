@@ -942,12 +942,16 @@ def test_the_readme_version_labels_match_the_manifests_and_the_pin():
                     text)
     assert own, "the README does not say what harness and rails show"
     assert own.group(1) == plugin_version("harness") == plugin_version("rails")
-    skills = re.search(r"`sdlc` uses the skills release `(v[^`]+)` "
+    skills = re.search(r"`sdlc` shows (\d+\.\d+\.\d+), which is the skills release `(v[^`]+)` "
                        r"at the pinned commit", text)
-    assert skills, "the README does not say which skills release sdlc uses"
+    assert skills, "the README does not say what sdlc shows"
     source = next(e for e in marketplace_manifest()["plugins"] if e["name"] == "sdlc")["source"]
-    assert skills.group(1) == source["ref"]
-    assert f'`{source["sha"]}`' in text
+    assert skills.group(2) == source["ref"]
+    # The skills plugin's own version is not in this repository; the CHANGELOG records which
+    # version sits at each pinned commit, and the README must agree with it for the pin it names.
+    recorded = {sha: version for version, sha in re.findall(
+        r"`sdlc` plugin at (\d+\.\d+\.\d+), commit `([0-9a-f]{40})`", one_line(changelog_text()))}
+    assert recorded[source["sha"]] == skills.group(1)
 
 
 def test_the_readme_gives_the_command_that_confirms_the_rules_files_are_gone():
