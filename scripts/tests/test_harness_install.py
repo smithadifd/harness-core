@@ -433,7 +433,7 @@ def test_db_a_database_seeded_elsewhere_is_used_and_no_new_database_is_made(tmp_
     assert command[1:3] == ["--db", str(seeded)]
 
     applied = do("apply", home, bin_dir, *given, *approve_args(ALL_IDS),
-                 "--sandbox-folder", str(seeded.parent))
+                 "--sandbox-folder", "")
     assert applied.rc == 0, applied.err
     # The stored ledger_db option is the given path.
     assert show_stored(bin_dir)["ledger_db"] == str(seeded)

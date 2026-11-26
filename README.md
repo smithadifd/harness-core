@@ -427,9 +427,12 @@ suggestions (`promptSuggestionEnabled` set to `false`). Each is added only
 when absent, a deny rule is appended after the ones you have, nothing you
 have is changed, removed or reordered, and each addition is recorded so
 uninstall can take out exactly it. The sandbox proposal shows the exact folder
-before you accept it. If it is the filesystem root, your home folder, an
-ancestor of home, or cannot be resolved safely, setup leaves out the write
-path and prints why. Claude Code keeps its protected paths protected and
+before you accept it, and offers it only when that folder is strictly inside
+home by file identity. A ledger database outside home no longer gets a sandbox
+write path: setup proposes only `{"enabled": true}` and says why. Home itself
+and anything that cannot be resolved safely also get only that bare proposal.
+The default ledger lives under home, so the default setup is unchanged.
+Claude Code keeps its protected paths protected and
 combines write paths from different settings scopes. Setup adds no allow rule,
 extra working directory or automatic permission for sandboxed commands.
 

@@ -324,7 +324,7 @@ def test_doctor_reports_sandbox_on_without_recorded_ledger_folder(tmp_path, acce
 
 def test_doctor_checks_the_recorded_custom_folder_not_the_default(tmp_path):
     home, bin_dir = fixture(tmp_path)
-    database = tmp_path / "custom ledger" / "ledger.db"
+    database = home / "custom ledger" / "ledger.db"
     done = setup_run("apply", home, "--db", str(database), "--approve", "sandbox",
                      "--sandbox-folder", str(database.parent), bin_dir=bin_dir)
     assert done.rc == 0, done.err

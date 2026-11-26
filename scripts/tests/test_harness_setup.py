@@ -471,7 +471,7 @@ def test_sandbox_unresolvable_folder_fails_closed(tmp_path, monkeypatch, case):
 def test_sandbox_custom_database_resolves_folder_and_apply_matches_plan(tmp_path):
     bin_dir = install(tmp_path)
     home = make_home(tmp_path)
-    folder = tmp_path / "actual ledger"
+    folder = home / "actual ledger"
     folder.mkdir()
     link = tmp_path / "ledger link"
     link.symlink_to(folder, target_is_directory=True)
@@ -491,8 +491,8 @@ def test_sandbox_custom_database_resolves_folder_and_apply_matches_plan(tmp_path
 def test_sandbox_apply_refuses_retargeted_database_after_consent(tmp_path, target):
     bin_dir = install(tmp_path)
     home = make_home(tmp_path)
-    accepted = tmp_path / "accepted"
-    changed = tmp_path / "changed"
+    accepted = home / "accepted"
+    changed = home / "changed"
     accepted.mkdir()
     changed = home if target == "home" else changed
     changed.mkdir(exist_ok=True)
@@ -529,7 +529,7 @@ def test_sandbox_apply_requires_accepted_folder(tmp_path, approval):
 @pytest.mark.parametrize("fault", ["changed", "unreadable"])
 def test_sandbox_accepted_folder_identity_fails_closed(tmp_path, monkeypatch, fault):
     home = make_home(tmp_path)
-    folder = tmp_path / "ledger"
+    folder = home / "ledger"
     folder.mkdir()
     sandbox, reason = mod.sandbox_proposal(home, folder / "ledger.db")
     assert reason is None
@@ -557,13 +557,13 @@ def test_sandbox_symlink_to_home_is_not_a_write_path(tmp_path):
     link.symlink_to(home, target_is_directory=True)
     value, reason = mod.sandbox_proposal(home, link / "ledger.db")
     assert value == {"enabled": True}
-    assert reason == "the ledger folder is the home folder"
+    assert reason == "the ledger folder is not inside the home folder"
 
 
 @pytest.mark.parametrize("wide", [False, True], ids=["narrow-target", "home-target"])
 def test_sandbox_database_symlink_uses_target_folder(tmp_path, wide):
     home = make_home(tmp_path)
-    folder = home if wide else tmp_path / "target ledger"
+    folder = home if wide else home / "target ledger"
     folder.mkdir(exist_ok=True)
     link_folder = tmp_path / "links"
     link_folder.mkdir()
@@ -578,8 +578,11 @@ def test_sandbox_database_symlink_uses_target_folder(tmp_path, wide):
     assert json.loads(text) == {"sandbox": expected}, "sandbox did not use the database target folder"
 
 
-def test_sandbox_default_folder(tmp_path):
+@pytest.mark.parametrize("existing", [False, True], ids=["missing-tail", "existing"])
+def test_sandbox_default_folder(tmp_path, existing):
     home = make_home(tmp_path)
+    if existing:
+        (home / ".local/share/ledger").mkdir(parents=True)
     done = run("plan", home)
     assert done.rc == 0, done.err
     text = done.out.split("OPTIONAL sandbox\n----\n", 1)[1].split("\n----", 1)[0]
@@ -587,19 +590,27 @@ def test_sandbox_default_folder(tmp_path):
         "allowWrite": [str(home / ".local/share/ledger")]}}}
 
 
-@pytest.mark.parametrize("where", ["home", "root", "ancestor"])
-def test_sandbox_wide_folder(tmp_path, where):
+@pytest.mark.parametrize("where", ["home", "root", "ancestor", "outside"])
+def test_sandbox_folder_not_inside_home(tmp_path, where):
     home = make_home(tmp_path)
-    folder = {"home": home, "root": Path(home.anchor), "ancestor": home.parent}[where]
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    folder = {"home": home, "root": Path(home.anchor),
+              "ancestor": home.parent, "outside": outside}[where]
     done = run("plan", home, "--db", str(folder / "ledger.db"))
     assert done.rc == 0, done.err
     text = done.out.split("OPTIONAL sandbox\n----\n", 1)[1].split("\n----", 1)[0]
-    assert json.loads(text) == {"sandbox": {"enabled": True}}
+    assert json.loads(text) == {"sandbox": {"enabled": True}}, "a folder not inside home granted sandbox writes"
     reasons = [line for line in done.out.splitlines()
                if "ledger folder was not added to the sandbox's write paths" in line]
     assert len(reasons) == 1
-    assert {"home": "home folder", "root": "filesystem root",
-            "ancestor": "ancestor of the home folder"}[where] in reasons[0]
+    assert reasons[0] == mod.sandbox_note("the ledger folder is not inside the home folder")
+    if where == "outside":
+        done = run("apply", home, "--db", str(folder / "ledger.db"), "--approve", "sandbox",
+                   "--sandbox-folder", "", bin_dir=install(tmp_path))
+        assert done.rc == 0, done.err
+        assert json.loads(at(home, mod.SETTINGS_REL).read_bytes())["sandbox"] == {"enabled": True}
+        assert mod.sandbox_note("the ledger folder is not inside the home folder") in done.out
 
 
 @pytest.mark.parametrize("where", ["home", "root", "ancestor"])
@@ -616,46 +627,63 @@ def test_sandbox_folder_alias_is_not_a_write_path(tmp_path, monkeypatch, where):
     monkeypatch.setattr(mod, "file_identity", identity)
     value, reason = mod.sandbox_proposal(home, alias / "ledger.db")
     assert value == {"enabled": True}, "a folder alias granted sandbox writes"
-    assert reason == {
-        "home": "the ledger folder is the home folder",
-        "root": "the ledger folder is the filesystem root",
-        "ancestor": "the ledger folder is an ancestor of the home folder",
-    }[where]
+    assert reason == "the ledger folder is not inside the home folder"
 
 
-@pytest.mark.parametrize("tail_start", [1, -1], ids=["full-tail", "last-component"])
-@pytest.mark.parametrize("unreadable", [False, True], ids=["alias", "identity-error"])
-def test_sandbox_ancestor_tail_alias_is_not_a_write_path(tmp_path, monkeypatch,
-                                                       tail_start, unreadable):
+@pytest.mark.parametrize("where", ["alias-root", "alias-parent"])
+def test_sandbox_alias_root_and_parent_are_not_inside_home(tmp_path, monkeypatch, where):
     home = make_home(tmp_path)
-    folder = tmp_path / "volume"
-    folder.mkdir()
-    alias = folder.joinpath(*home.parts[tail_start:])
+    parent = tmp_path / "volume"
+    root = parent / "Data"
+    alias = root.joinpath(*home.parts[1:])
     alias.mkdir(parents=True)
     original = mod.file_identity
 
     def identity(path):
-        if path == alias:
-            if unreadable:
-                raise PermissionError("unreadable identity")
-            return original(home)
-        return original(path)
+        return original(home if path == alias else path)
+
+    monkeypatch.setattr(mod, "file_identity", identity)
+    folder = root if where == "alias-root" else parent
+    value, reason = mod.sandbox_proposal(home, folder / "ledger.db")
+    assert value == {"enabled": True}, "an alias root or its parent granted sandbox writes"
+    assert reason == "the ledger folder is not inside the home folder"
+
+
+@pytest.mark.parametrize("existing", [False, True], ids=["missing-tail", "existing"])
+def test_sandbox_folder_inside_home_alias_gets_write_path(tmp_path, monkeypatch, existing):
+    home = make_home(tmp_path)
+    alias = tmp_path / "alias"
+    alias.mkdir()
+    folder = alias / "ledger"
+    if existing:
+        folder.mkdir()
+    original = mod.file_identity
+
+    def identity(path):
+        return original(home if path == alias else path)
 
     monkeypatch.setattr(mod, "file_identity", identity)
     value, reason = mod.sandbox_proposal(home, folder / "ledger.db")
-    assert value == {"enabled": True}, "an ancestor reached by a home tail granted sandbox writes"
-    assert reason == (
-        "the ledger folder or home folder cannot be resolved to an absolute folder" if unreadable
-        else "the ledger folder is an ancestor of the home folder")
+    assert value == {"enabled": True, "filesystem": {"allowWrite": [str(folder)]}}, \
+        "a folder inside home by identity lost its sandbox write path"
+    assert reason is None
+
+
+def test_sandbox_missing_tail_dot_dot_fails_closed(tmp_path):
+    home = make_home(tmp_path)
+    value, reason = mod.sandbox_proposal(home, home / "missing" / ".." / "ledger.db")
+    assert value == {"enabled": True}, "a missing tail with dot-dot granted sandbox writes"
+    assert reason == "the ledger folder or home folder cannot be resolved to an absolute folder"
 
 
 @pytest.mark.parametrize("where", ["folder", "home", "root", "ancestor"])
 def test_sandbox_unreadable_identity_fails_closed(tmp_path, monkeypatch, where):
     home = make_home(tmp_path)
-    folder = tmp_path / "ledger"
-    folder.mkdir()
+    ancestor = home / "data"
+    folder = ancestor / "ledger"
+    folder.mkdir(parents=True)
     target = {"folder": folder, "home": home, "root": Path(home.anchor),
-              "ancestor": home.parent}[where]
+              "ancestor": ancestor}[where]
     original = mod.file_identity
 
     def identity(path):
@@ -697,7 +725,7 @@ def test_sandbox_symlink_loop_fails_closed(tmp_path, verb, loop_at):
 
 def test_sandbox_consent_names_folder(tmp_path):
     home = make_home(tmp_path)
-    folder = tmp_path / "chosen ledger"
+    folder = home / "chosen ledger"
     done = run("plan", home, "--db", str(folder / "ledger.db"))
     assert done.rc == 0, done.err
     assert f"and lets sandboxed commands write the ledger folder {folder}" in done.out

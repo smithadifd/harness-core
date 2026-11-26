@@ -85,9 +85,12 @@ Rules that hold in every mode:
    command that creates the database when it is absent; each `OPTIONAL` item is
    a settings change that is only made if the person says yes to that item.
    The optional sandbox item grants write access only under the exact ledger
-   folder it prints; Claude Code keeps protected paths protected. If the
-   folder is the root, home, an ancestor of home, or cannot be resolved safely,
-   the item only enables the sandbox and the plan prints why.
+   folder it prints, and only when that folder is strictly inside home by file
+   identity; Claude Code keeps protected paths protected. A ledger database
+   outside home no longer gets a sandbox write path: setup proposes only
+   `{"enabled": true}` and says why. Home itself and anything that cannot be
+   resolved safely also get only that bare proposal. The default ledger lives
+   under home, so the default setup is unchanged.
 
 3. **Take the yes.** The plan must already be in your own reply, in full, from
    step 2. First ask one yes or no for the files, the ledger options
