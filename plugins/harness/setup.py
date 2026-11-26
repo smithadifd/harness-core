@@ -358,6 +358,15 @@ def sandbox_proposal(home: Path, database: Path) -> tuple[dict[str, Any], str | 
                 return value, "the ledger folder is the home folder"
             if any(identity == file_identity(parent) for parent in resolved_home.parents):
                 return value, "the ledger folder is an ancestor of the home folder"
+            home_identity = file_identity(resolved_home)
+            for start in range(1, len(resolved_home.parts)):
+                candidate = folder.joinpath(*resolved_home.parts[start:])
+                try:
+                    candidate_identity = file_identity(candidate)
+                except FileNotFoundError:
+                    continue
+                if candidate_identity == home_identity:
+                    return value, "the ledger folder is an ancestor of the home folder"
     except (OSError, RuntimeError, ValueError):
         return value, "the ledger folder or home folder cannot be resolved to an absolute folder"
     value["filesystem"] = {"allowWrite": [str(folder)]}
@@ -366,6 +375,23 @@ def sandbox_proposal(home: Path, database: Path) -> tuple[dict[str, Any], str | 
 
 def sandbox_note(reason: str) -> str:
     return f"ledger folder was not added to the sandbox's write paths: {reason}"
+
+
+def check_sandbox_folder(sandbox: dict[str, Any], accepted: str | None) -> None:
+    """Bind approval to the exact plan spelling, and existing folder identity."""
+    proposed = sandbox.get("filesystem", {}).get("allowWrite", [""])[0]
+    refusal = "sandbox folder approval is missing or changed; show the plan and ask again"
+    if accepted is None or accepted != proposed:
+        raise SetupError(refusal)
+    if not proposed:
+        return  # Explicit approval of the bare sandbox switch.
+    try:
+        if file_identity(Path(accepted)) != file_identity(Path(proposed)):
+            raise SetupError(refusal)
+    except FileNotFoundError:
+        pass  # A missing ledger folder is permitted in the plan too.
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise SetupError(refusal) from exc
 
 
 def ledger_values(database: Path, operator: str, harness: str | None) -> dict[str, str]:
@@ -1208,13 +1234,14 @@ class Changes:
 
 
 def apply_verb(home: Path, database: Path, operator: str, harness: str | None,
-               approve: list[str], approve_all: bool) -> tuple[str, list[str]]:
+               approve: list[str], approve_all: bool,
+               sandbox_folder: str | None) -> tuple[str, list[str]]:
     tree = Tree(home)
     try:
         lock = take_lock(tree)
         try:
             return apply_locked(tree, lock, database, operator, harness, approve,
-                                approve_all)
+                                approve_all, sandbox_folder)
         finally:
             os.close(lock)
     finally:
@@ -1222,7 +1249,8 @@ def apply_verb(home: Path, database: Path, operator: str, harness: str | None,
 
 
 def apply_locked(tree: Tree, lock: int, database: Path, operator: str, harness: str | None,
-                 approve: list[str], approve_all: bool) -> tuple[str, list[str]]:
+                 approve: list[str], approve_all: bool,
+                 sandbox_folder: str | None) -> tuple[str, list[str]]:
     # Preconditions: no writes.
     sandbox, reason = sandbox_proposal(tree.root, database)
     rules_bytes, override_bytes = check_proposals(sandbox)
@@ -1240,6 +1268,8 @@ def apply_locked(tree: Tree, lock: int, database: Path, operator: str, harness: 
     tree.entry(SETTINGS_REL)
     claude = which_claude()
     ids = approved_ids(approve, approve_all, sandbox)
+    if "sandbox" in ids:
+        check_sandbox_folder(sandbox, sandbox_folder)
     check_types(tree, read_settings(tree), ids)
 
     # Configure, then the settings bytes apply builds on.
@@ -2379,6 +2409,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="approve one optional settings proposal by id")
     parser.add_argument("--approve-all", action="store_true",
                         help="approve every optional settings proposal")
+    parser.add_argument("--sandbox-folder", default=None,
+                        help="the exact absolute folder accepted from the sandbox plan "
+                             "(apply); an empty value accepts no write path")
     parser.add_argument("--db", default=None,
                         help="the absolute path of the ledger database (plan, apply and "
                              "ledger-init); a database already there is used as it is")
@@ -2425,7 +2458,7 @@ def run(argv: list[str]) -> tuple[str, list[str], int]:
     if args.verb == "plan":
         return format_plan(home, database, args.operator, harness), [], 0
     out, warnings = apply_verb(home, database, args.operator, harness, args.approve,
-                               args.approve_all)
+                               args.approve_all, args.sandbox_folder)
     return out, warnings, 0
 
 

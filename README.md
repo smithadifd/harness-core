@@ -364,10 +364,14 @@ python3 "$setup_py" apply --home "$HOME" --operator '<operator>' --harness 'clau
 
 To opt into individual optional changes instead, append one `--approve '<id>'`
 per approved ID from your plan to that command, for example
-`--approve 'sandbox' --approve 'deny:Read(.env)'`. Single-quote each ID:
-parentheses in a deny ID are shell syntax when unquoted. Never use
-`--approve-all`, and never treat approval of the files as approval of an
-optional item.
+`--approve 'sandbox' --approve 'deny:Read(.env)'`. For `sandbox`, also append
+`--sandbox-folder '<folder>'` with the exact absolute folder from the plan
+you accepted; do not resolve the database path again to choose that value.
+If the plan offers only the sandbox switch, pass `--sandbox-folder ''`
+instead. A missing or changed folder approval refuses before configuration
+or settings writes. Single-quote each ID and folder: parentheses in a deny ID
+are shell syntax when unquoted. Never use `--approve-all`, and never treat
+approval of the files as approval of an optional item.
 
 3. **Make the first ledger write.** `apply` does not do this step:
 

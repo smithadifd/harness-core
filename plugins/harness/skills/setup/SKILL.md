@@ -42,8 +42,9 @@ Rules that hold in every mode:
   settings file, the ledger or an instance folder yourself.
 - Never ask for, print or store a credential.
 - Single-quote every value you put into a command: the operator, the harness,
-  each `--approve` id, the ledger database's path and the instance folder's
-  path, exactly as the templates below show. The deny ids contain parentheses
+  each `--approve` id, the accepted sandbox folder, the ledger database's path
+  and the instance folder's path, exactly as the templates below show. The
+  deny ids contain parentheses
   (`deny:Read(.env)`), which the shell reads as syntax, so an unquoted id stops
   the command before the script runs. If a value itself holds a single quote,
   write that quote as `'\''`.
@@ -110,10 +111,16 @@ Rules that hold in every mode:
    path.
 
 4. **Apply.** Pass one `--approve <id>` for each item the person said yes to,
-   using the id printed after `OPTIONAL`, and nothing for the others:
+   using the id printed after `OPTIONAL`, and nothing for the others. If they
+   accepted `sandbox`, also pass `--sandbox-folder '<folder>'`, copying the
+   exact absolute folder from the plan you presented, never recomputing it.
+   For a plan that only enables the sandbox, pass `--sandbox-folder ''`
+   instead. Without sandbox approval, omit `--sandbox-folder`. A missing or
+   changed folder approval refuses before configuration or settings writes;
+   show the refusal and stop:
 
    ```text
-   python3 "${CLAUDE_SKILL_DIR}/../../setup.py" apply --home "$HOME" --operator '<operator>' --harness '<harness>' --approve '<id>' --approve '<id>'
+   python3 "${CLAUDE_SKILL_DIR}/../../setup.py" apply --home "$HOME" --operator '<operator>' --harness '<harness>' --approve '<id>' --approve '<id>' --sandbox-folder '<folder>'
    ```
 
    If the output says a file "already existed" and was kept, tell the person

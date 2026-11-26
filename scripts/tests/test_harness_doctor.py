@@ -37,7 +37,8 @@ def args_for(ids):
 
 
 def finish_setup(home, bin_dir, ids=ALL_IDS):
-    applied = setup_run("apply", home, *args_for(ids), bin_dir=bin_dir)
+    applied = setup_run("apply", home, *args_for(ids), "--sandbox-folder",
+                        str(at(home, DB).parent), bin_dir=bin_dir)
     assert applied.rc == 0, applied.err
     show_stored(bin_dir)
     init = setup_run("ledger-init", home, bin_dir=bin_dir)
@@ -325,7 +326,7 @@ def test_doctor_checks_the_recorded_custom_folder_not_the_default(tmp_path):
     home, bin_dir = fixture(tmp_path)
     database = tmp_path / "custom ledger" / "ledger.db"
     done = setup_run("apply", home, "--db", str(database), "--approve", "sandbox",
-                     bin_dir=bin_dir)
+                     "--sandbox-folder", str(database.parent), bin_dir=bin_dir)
     assert done.rc == 0, done.err
     show_stored(bin_dir)
     _rc, lines = doctor(home, bin_dir)
