@@ -37,7 +37,7 @@ from harness_fixtures import (
 )
 
 setup = load_setup()
-ALL_IDS = [ident for ident, _text in setup.optional_items()]
+ALL_IDS = [ident for ident, _text in setup.optional_items({"enabled": True})]
 RULES, OVERRIDE, RECORD, LOCK, DB = (setup.RULES_REL, setup.OVERRIDE_REL, setup.RECORD_REL,
                                      setup.LOCK_REL, setup.DB_REL)
 SETTINGS = setup.SETTINGS_REL
@@ -281,7 +281,8 @@ def test_install_3_approved_items_are_added_and_nothing_else_in_settings_changes
     now = json.loads(at(home, SETTINGS).read_text(encoding="utf-8"))
     seeded = SEEDED_SETTINGS
     assert set(now) == set(seeded) | {"sandbox", "promptSuggestionEnabled"}
-    assert now["sandbox"] == {"enabled": True}
+    assert now["sandbox"] == {"enabled": True, "filesystem": {
+        "allowWrite": [str(home / ".local/share/ledger")]}}
     assert now["promptSuggestionEnabled"] is False
     assert now["model"] == seeded["model"]
     assert now["additionalDirectories"] == seeded["additionalDirectories"]
@@ -640,6 +641,7 @@ def test_the_readme_names_every_optional_setting_the_plan_proposes():
     for rule in setup.DENY_RULES:
         assert f"`{rule}`" in text, rule
     assert '`{"enabled": true}`' in text
+    assert "`filesystem.allowWrite`" in text
     for key in ("ledger_db", "ledger_operator", "ledger_harness"):
         assert f"`{key}`" in text, key
 
@@ -772,7 +774,6 @@ def test_the_readme_first_use_says_how_to_file_stop_resume_and_where_ledger_runs
 def test_the_readme_says_where_it_talks_about_grants_that_auto_mode_is_the_default():
     text = README.read_text(encoding="utf-8")
     grants = "\n".join(section(text, "#### What setup writes"))
-    assert "Setup never proposes anything that grants" in grants
     assert "auto mode" in grants and "2.1.326" in grants and "shift+tab" in grants
 
 

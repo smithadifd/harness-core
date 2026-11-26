@@ -83,7 +83,10 @@ Rules that hold in every mode:
    settings file besides the optional items; `FIRST LEDGER WRITE` is the
    command that creates the database when it is absent; each `OPTIONAL` item is
    a settings change that is only made if the person says yes to that item.
-   Nothing the plan lists grants permission to anything.
+   The optional sandbox item grants write access only under the exact ledger
+   folder it prints; Claude Code keeps protected paths protected. If the
+   folder is the root, home, an ancestor of home, or cannot be resolved safely,
+   the item only enables the sandbox and the plan prints why.
 
 3. **Take the yes.** The plan must already be in your own reply, in full, from
    step 2. First ask one yes or no for the files, the ledger options
@@ -98,6 +101,13 @@ Rules that hold in every mode:
    suggestions off (`promptSuggestionEnabled` set to `false`), so an empty
    prompt stays empty. No leaves Claude Code's suggestions as they are. Setup
    adds the key only when it is absent, and uninstall takes it out again.
+   When the sandbox proposal includes a write path, name the exact absolute
+   ledger folder shown in the plan: it turns the sandbox on and lets sandboxed
+   commands write that folder. A yes accepts both together. Otherwise, explain
+   the printed reason for offering only the sandbox switch. Without a yes,
+   pass no sandbox approval. Setup never extends an existing sandbox block.
+   Uninstall keeps the whole block if the person later changes it or adds a
+   path.
 
 4. **Apply.** Pass one `--approve <id>` for each item the person said yes to,
    using the id printed after `OPTIONAL`, and nothing for the others:
@@ -200,6 +210,11 @@ show. If the first lines say setup has not run, say to run `/harness:setup`.
 After the plugin is at a newer tag, replace the installed rules default with
 the plugin's current file when the installed file is still the bytes setup
 recorded. The override file and every settings item are left alone.
+If the recorded sandbox value differs from today's proposal, update reports
+the difference, including the proposed folder, but never adds it silently.
+Doctor notes when the sandbox is on without the recorded ledger folder in
+the user settings' write paths; other settings scopes may also grant paths.
+
 
 1. Run `doctor` as above. A `note files: newer default available` line means
    the installed rules file still matches the setup record and differs from

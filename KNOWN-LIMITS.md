@@ -92,6 +92,7 @@ Advice, not a guarantee. The next apply or remove refuses, naming the record and
 - **Configure is not undone.** Its changes stay when apply fails after it, and the refusal says so.
 - **CI runs on Linux only.** No harness-core CI job runs on macOS. Setup uses only portable calls (`flock`, `mkstemp`, `fchmod`, `fsync`, `link`, `os.replace`, `O_NOFOLLOW`, `SIG_DFL`, and `F_FULLFSYNC` only where defined), but it is not tested on macOS in CI.
 - **Settings are re-serialized.** When apply adds an item, or remove takes one out, settings.json is written back as JSON with the indent it had (two spaces when none is found) and a final newline; key order and every value are kept, but other spacing is not.
+- **The optional sandbox write path.** Only accepting the sandbox item adds `sandbox.filesystem.allowWrite`, with exactly the resolved absolute parent folder of the ledger database. Setup leaves an existing sandbox block alone. It offers only `{"enabled": true}` and prints why when the folder is the root, home, an ancestor of home, or cannot be resolved safely. Remove keeps the whole block if you change it or add a path. Update reports a changed proposal but never widens an older setup's settings. Doctor notes when the sandbox is on but the recorded ledger folder is absent from the user settings' write paths; it cannot see write paths from other settings scopes.
 
 ### Doctor and the first ledger write
 

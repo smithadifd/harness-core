@@ -55,10 +55,10 @@ What that looks like in practice:
   need one. A guard never allows a command on its own, and each guard's
   default hook blocks the command when it cannot run.
 - **An install you can read first and take back out.** Setup shows every file
-  and every setting it will write before it writes one, and proposes nothing
-  that grants a permission. Uninstall removes what setup placed, keeps and
-  names any file you have changed since, and leaves your ledger database,
-  because that is your data.
+  and every setting it will write before it writes one. Its optional sandbox
+  item offers write access to the ledger folder. Uninstall removes what setup
+  placed, keeps and names any file you have changed since, and leaves your
+  ledger database, because that is your data.
 - **One tag, one tested set.** The two plugins that come from other
   repositories are each fixed to a full commit id, and the two in this
   repository by the tag you install from. Nothing follows a branch, and
@@ -415,14 +415,19 @@ Setup also asks Claude Code to store the ledger plugin's three options
 in your user `settings.json` and deletes when the plugin is uninstalled.
 
 The optional settings changes are the sandbox switch (`sandbox` set to
-`{"enabled": true}`), six deny rules that stop the agent reading secret
+`{"enabled": true}` with `filesystem.allowWrite` listing the ledger database's
+absolute parent folder), six deny rules that stop the agent reading secret
 files: `Read(.env)`, `Read(.env.*)`, `Read(**/.env)`, `Read(**/.env.*)`,
 `Read(**/*.pem)` and `Read(**/*.key)`, and turning off Claude Code's prompt
 suggestions (`promptSuggestionEnabled` set to `false`). Each is added only
 when absent, a deny rule is appended after the ones you have, nothing you
 have is changed, removed or reordered, and each addition is recorded so
-uninstall can take out exactly it. Setup never proposes anything that grants: no allow rule, no extra
-directory, no automatic permission for sandboxed commands.
+uninstall can take out exactly it. The sandbox proposal shows the exact folder
+before you accept it. If it is the filesystem root, your home folder, an
+ancestor of home, or cannot be resolved safely, setup leaves out the write
+path and prints why. Claude Code keeps its protected paths protected and
+combines write paths from different settings scopes. Setup adds no allow rule,
+extra working directory or automatic permission for sandboxed commands.
 
 If you are unsure what to answer to the optional changes:
 
@@ -430,7 +435,10 @@ If you are unsure what to answer to the optional changes:
   inside Claude Code's sandbox, which limits what they can write and reach on
   the network, so a command that needs more can fail or ask first. If you say
   no, you give up that confinement, and the permission prompts still apply.
-  Say yes when you want it.
+  Say yes when you want it, including the ledger folder write path shown in
+  the plan. An existing sandbox block is never extended. If you later change
+  the block or add a write path, uninstall keeps the whole block. Update leaves
+  settings alone and reports when the recorded sandbox proposal differs.
 - **The six deny rules.** Yes is recommended. They stop the agent reading
   `.env` files and `.pem` and `.key` files, and the cost is a refused read when
   you do want it to see one, in which case you paste what it needs. No is
