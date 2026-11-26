@@ -536,6 +536,73 @@ def test_sandbox_wide_folder(tmp_path, where):
             "ancestor": "ancestor of the home folder"}[where] in reasons[0]
 
 
+@pytest.mark.parametrize("where", ["home", "root", "ancestor"])
+def test_sandbox_folder_alias_is_not_a_write_path(tmp_path, monkeypatch, where):
+    home = make_home(tmp_path)
+    alias = tmp_path / "alias"
+    alias.mkdir()
+    target = {"home": home, "root": Path(home.anchor), "ancestor": home.parent}[where]
+    original = mod.file_identity
+
+    def identity(path):
+        return original(target if path == alias else path)
+
+    monkeypatch.setattr(mod, "file_identity", identity)
+    value, reason = mod.sandbox_proposal(home, alias / "ledger.db")
+    assert value == {"enabled": True}, "a folder alias granted sandbox writes"
+    assert reason == {
+        "home": "the ledger folder is the home folder",
+        "root": "the ledger folder is the filesystem root",
+        "ancestor": "the ledger folder is an ancestor of the home folder",
+    }[where]
+
+
+@pytest.mark.parametrize("where", ["folder", "home", "root", "ancestor"])
+def test_sandbox_unreadable_identity_fails_closed(tmp_path, monkeypatch, where):
+    home = make_home(tmp_path)
+    folder = tmp_path / "ledger"
+    folder.mkdir()
+    target = {"folder": folder, "home": home, "root": Path(home.anchor),
+              "ancestor": home.parent}[where]
+    original = mod.file_identity
+
+    def identity(path):
+        if path == target:
+            raise PermissionError("unreadable identity")
+        return original(path)
+
+    monkeypatch.setattr(mod, "file_identity", identity)
+    value, reason = mod.sandbox_proposal(home, folder / "ledger.db")
+    assert value == {"enabled": True}, "an unreadable identity granted sandbox writes"
+    assert reason == "the ledger folder or home folder cannot be resolved to an absolute folder"
+
+
+@pytest.mark.parametrize("loop_at", ["folder", "database"])
+@pytest.mark.parametrize("verb", ["plan", "apply"])
+def test_sandbox_symlink_loop_fails_closed(tmp_path, verb, loop_at):
+    bin_dir = install(tmp_path)
+    home = make_home(tmp_path, b'{"sandbox": {"enabled": true}}\n')
+    folder = home / "ledger"
+    folder.mkdir()
+    (folder / "loopA").symlink_to("loopB")
+    (folder / "loopB").symlink_to("loopA")
+    database = folder / "loopA"
+    if loop_at == "folder":
+        database /= "ledger.db"
+    settings = at(home, mod.SETTINGS_REL)
+    before = settings.read_bytes()
+    args = ("--approve", "sandbox") if verb == "apply" else ()
+    done = run(verb, home, "--db", str(database), *args, bin_dir=bin_dir)
+    assert done.rc == 0, done.err
+    assert "ledger folder was not added to the sandbox's write paths: " \
+           "the ledger folder or home folder cannot be resolved to an absolute folder" in done.out
+    if verb == "plan":
+        text = done.out.split("OPTIONAL sandbox\n----\n", 1)[1].split("\n----", 1)[0]
+        assert json.loads(text) == {"sandbox": {"enabled": True}}
+    assert settings.read_bytes() == before, "an unresolved folder changed existing settings"
+    assert "allowWrite" not in settings.read_text()
+
+
 def test_sandbox_consent_names_folder(tmp_path):
     home = make_home(tmp_path)
     folder = tmp_path / "chosen ledger"

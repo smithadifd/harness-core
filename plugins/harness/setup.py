@@ -305,6 +305,29 @@ def recorded_database(home: Path, body: dict[str, Any]) -> Path:
     return Path(raw)
 
 
+def resolve_missing_path(path: Path) -> Path:
+    """Resolve existing components strictly, allowing only a missing tail.
+
+    Resolve dangling symlink targets too, before taking the database's parent.
+    Unlike non-strict resolve on newer Python, loops and other errors propagate.
+    """
+    try:
+        return path.resolve(strict=True)
+    except FileNotFoundError:
+        try:
+            target = Path(os.readlink(path))
+        except FileNotFoundError:
+            parent = resolve_missing_path(path.parent)
+            return parent.parent if path.name == ".." else parent / path.name
+        return resolve_missing_path(target if target.is_absolute() else path.parent / target)
+
+
+def file_identity(path: Path) -> tuple[int, int]:
+    """The file identity used by os.path.samefile, independent of its spelling."""
+    info = path.stat()
+    return info.st_dev, info.st_ino
+
+
 def sandbox_proposal(home: Path, database: Path) -> tuple[dict[str, Any], str | None]:
     """Resolve the folder, never widening sandbox writes to home or above it."""
     value: dict[str, Any] = {"enabled": True}
@@ -314,17 +337,29 @@ def sandbox_proposal(home: Path, database: Path) -> tuple[dict[str, Any], str | 
         resolved_home = home.resolve(strict=True)
         if not resolved_home.is_dir():
             raise ValueError("home is not a folder")
-        folder = database.resolve().parent
+        folder = resolve_missing_path(database).parent
         if not folder.is_absolute():
             raise ValueError("folder is not absolute")
+        if folder == Path(folder.anchor):
+            return value, "the ledger folder is the filesystem root"
+        if folder == resolved_home:
+            return value, "the ledger folder is the home folder"
+        if folder in resolved_home.parents:
+            return value, "the ledger folder is an ancestor of the home folder"
+        try:
+            folder.lstat()
+        except FileNotFoundError:
+            pass  # A missing folder cannot be home, root or an ancestor of home.
+        else:
+            identity = file_identity(folder)
+            if identity == file_identity(Path(folder.anchor)):
+                return value, "the ledger folder is the filesystem root"
+            if identity == file_identity(resolved_home):
+                return value, "the ledger folder is the home folder"
+            if any(identity == file_identity(parent) for parent in resolved_home.parents):
+                return value, "the ledger folder is an ancestor of the home folder"
     except (OSError, RuntimeError, ValueError):
         return value, "the ledger folder or home folder cannot be resolved to an absolute folder"
-    if folder == Path(folder.anchor):
-        return value, "the ledger folder is the filesystem root"
-    if folder == resolved_home:
-        return value, "the ledger folder is the home folder"
-    if folder in resolved_home.parents:
-        return value, "the ledger folder is an ancestor of the home folder"
     value["filesystem"] = {"allowWrite": [str(folder)]}
     return value, None
 
