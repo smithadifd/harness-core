@@ -243,6 +243,49 @@ tag's commit, while the bare `owner/repo` form follows the main branch whatever
 tag you meant. Do not add it from a local clone: a plugin installed from a
 clone is served from it, so the clone can never move.
 
+### Using it over SSH
+
+On macOS, the login keychain is normally locked in an SSH session. Logins
+made at the Mac's screen may therefore be unavailable over SSH. Before
+installing on a remote Mac:
+
+1. **Give Claude Code a token.** If it says `Not logged in · Please run /login`
+   despite a login at the screen, run:
+
+   ```sh
+   claude setup-token
+   ```
+
+   Complete the browser login on a machine where you can open the URL it
+   prints. Keep the resulting token in the SSH user's shell profile, exported
+   as `CLAUDE_CODE_OAUTH_TOKEN`, and load that profile before starting Claude
+   Code. Keep the profile private to that user; never commit the token.
+
+2. **Sign in to GitHub CLI without the keychain.** `gh auth login --web` can
+   hang without an error and leave no login stored. Instead, put a personal
+   access token in a private file outside the repository and read it on stdin:
+
+   ```sh
+   gh auth login --with-token --insecure-storage < '<token-file>'
+   ```
+
+   Replace `<token-file>` with your file's path. For a classic token, `gh`
+   requires the `repo`, `read:org` and `gist` scopes. `--insecure-storage`
+   stores the token in plain text instead of the locked keychain, so later SSH
+   sessions can use it. Keep both that credential file and the input file
+   readable only by your user; never commit either.
+
+3. **Configure git before the first push.** A GitHub CLI login alone does not
+   give git a credential helper. An HTTPS push may fail with
+   `fatal: could not read Username for 'https://github.com': terminal prompts disabled`,
+   or stop at a username prompt. After logging in, run:
+
+   ```sh
+   gh auth setup-git
+   ```
+
+   This makes git use GitHub CLI's stored token for HTTPS authentication.
+
 ### Install
 
 ```text
