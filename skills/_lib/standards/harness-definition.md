@@ -50,7 +50,8 @@ The core is a toolset: skills and agents that help a person follow solid enginee
 - **SWEEP**: groom the backlog.
 - **sharpen**: a one-question-at-a-time requirements interview.
 - **shape**: a pre-mortem.
-- **Session**: an agent session with a role.
+- **Session**: one running agent with a fixed role (planning, run, merge or director); an instance's rules may call it a seat.
+- **Director session**: the session that supervises the others and may merge.
 - **lane**: which model does the work.
 - **packet**: the handoff document.
 - **ledger**: the agents' issue tracker and decision log.

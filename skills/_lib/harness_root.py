@@ -1,20 +1,13 @@
-"""harness_root.py — the shared harness-root resolver (CS2, `harness-
-reconstruction.md` § 2 D1, ELECTED 2026-09-11).
+"""harness_root.py — the shared harness-root resolver.
 
 WHY THIS EXISTS
 ----------------
 Every loop skill (`session-handoff` · `orchestrate` · `chart-wave` ·
 `sharpen` · `seat-retro`; the agent `close-escalation-reviewer` reads
-through its caller) hardcoded the owner's configuration repository and
-its sub-paths directly. D1
-resolves that into ONE root, so the same skills can run for a second person
-or on a second machine without a fork ("migrate home in place, no parallel
-system"). This module is the ONE shared implementation every loop skill's
-own `config.json` is read through — CS2 adds the `harness_root` key to all
-six skills' configs and sweeps the literals in the four small ones
-(`chart-wave` · `sharpen` · `seat-retro` · `close-escalation-reviewer`,
-D1's bucket 3); the two large sweeps (`orchestrate`, `session-handoff`) are
-CS3/CS4, landing after this module merges.
+through its caller) used to hardcode one configuration repository and
+its sub-paths. This module is the one shared resolver every loop skill's
+own `config.json` is read through, so the same skills can run for a second
+person or on a second machine without a fork.
 
 PRECEDENCE (material — this is the contract)
 ---------------------------------------------
@@ -46,7 +39,7 @@ PRECEDENCE (material — this is the contract)
 `standards` /
 `decisions` /
 `topics`          : `config["harness_root"][<subkey>]` (a config-only
-                     override — no per-subkey env var is named by D1) >
+                     override — no per-subkey env var) >
                      `<root>/<subkey>`.
 `memory_index`     : `config["harness_root"]["memory_index"]` > a Claude
                      project index derived from the resolved root by
@@ -112,10 +105,11 @@ module's own `HarnessPaths` is a `@dataclass` under `from __future__ import
 annotations`, whose fields resolve lazily via `sys.modules[cls.__module__]`
 — an unregistered module makes that lookup return `None` and crash with
 `AttributeError: 'NoneType' object has no attribute '__dict__'` the first
-time anything introspects the dataclass (observed on Python 3.14; CS2's own
-fix-forward hit this in the harness map's `sources.py` and
-the wave triage script's `load_module` already gets it right, which is
-why this snippet must match it exactly rather than being simplified):
+time anything introspects the dataclass (observed on Python 3.14 when the
+harness map's `sources.py` loaded this module without registering it; the
+wave triage script's `load_module` already registers before `exec_module`,
+which is why this snippet must match it exactly rather than being
+simplified):
 
     import importlib.util
     import sys
@@ -307,8 +301,8 @@ def _load_config(
 
 
 def _env_root() -> Optional[str]:
-    """`HARNESS_ROOT`, or `None` if unset OR relative after `~` expansion
-    (CS2 fix-forward F3/D12). A relative env value resolves against
+    """`HARNESS_ROOT`, or `None` if unset OR relative after `~` expansion.
+    A relative env value resolves against
     whatever the CALLER's cwd happens to be at the moment `resolve()` runs
     — a silent-wrong-root bug class, not a redirect — so it is rejected
     with one loud stderr line rather than honoured. Returning `None` here
@@ -629,8 +623,8 @@ def resolve_standard(paths: HarnessPaths, name: str) -> Path:
 
 def resolve_relative(paths: HarnessPaths, subkey: str, value: str) -> Path:
     """Join a bare, skill-specific filename (or glob) onto one of
-    `paths`'s four subkey directories — the small helper the CS2 four-skill
-    sweep uses so `chart-wave`/`sharpen`/`seat-retro`'s own `config.json`
+    `paths`'s four subkey directories — the helper a skill calls so
+    `chart-wave`/`sharpen`/`seat-retro`'s own `config.json`
     keys (`sot_path`, `delegation_loop_standard`, `roadmaps_glob`, …) can
     carry a bare filename instead of repeating `harness_root`'s own default
     absolute prefix. Standards should use `resolve_standard()` instead so the
