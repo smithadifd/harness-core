@@ -28,6 +28,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from harness_fixtures import consent_args
+
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "plugins" / "harness" / "setup.py"
 RULES_SOURCE = ROOT / "plugins" / "harness" / "files" / "harness.md"
@@ -298,6 +300,8 @@ def run(verb: str, home: Path, *extra: str, bin_dir: Path | None = None,
     if verb in ("plan", "apply") and operator is not None:
         argv += ["--operator", operator, "--harness", HARNESS]
     argv += list(extra)
+    if verb == "apply" and "--consent" not in extra:
+        argv += consent_args(argv, bin_dir=bin_dir)
     hooks = dict(hooks or {})
     hooks.setdefault("home", str(home))
     env = {key: value for key, value in os.environ.items() if key != "CLAUDE_CONFIG_DIR"}
@@ -988,6 +992,8 @@ def test_command_line_refusals_are_one_named_line(tmp_path, argv, message):
     home = make_home(tmp_path)
     before = snap(home)
     argv = [part.replace("{home}", str(home)) for part in argv]
+    if argv[0] == "apply":
+        argv += consent_args(argv, bin_dir=bin_dir)
     env = dict(os.environ, PATH=safe_path(bin_dir))
     done = subprocess.run([sys.executable, str(SCRIPT), *argv], capture_output=True,
                           text=True, env=env, timeout=30)
@@ -1003,7 +1009,9 @@ def test_claude_missing_refuses_before_any_write(tmp_path):
     empty.mkdir()
     env = dict(os.environ, PATH=safe_path(empty))
     done = subprocess.run([sys.executable, str(SCRIPT), "apply", "--home", str(home),
-                           "--operator", OPERATOR], capture_output=True, text=True,
+                           "--operator", OPERATOR,
+                           *consent_args(["apply", "--home", str(home), "--operator", OPERATOR],
+                                         bin_dir=empty)], capture_output=True, text=True,
                           env=env, timeout=30)
     assert one_refusal(SimpleNamespace(rc=done.returncode, err=done.stderr)) == (
         "setup: claude is not on PATH")
@@ -1377,7 +1385,9 @@ def start_and_wait_for_configure(tmp_path: Path, home: Path) -> tuple[subprocess
     env = dict(os.environ, PATH=safe_path(bin_dir))
     proc = subprocess.Popen([sys.executable, str(SCRIPT), "apply", "--home", str(home),
                              "--operator", OPERATOR, "--approve-all", "--sandbox-folder",
-                             str(home / ".local/share/ledger")],
+                             str(home / ".local/share/ledger"),
+                             *consent_args(["apply", "--home", str(home), "--operator", OPERATOR],
+                                           bin_dir=bin_dir)],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
                             start_new_session=True)
     marker = bin_dir / "claude-pid"

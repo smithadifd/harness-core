@@ -92,12 +92,22 @@ Rules that hold in every mode:
    resolved safely also get only that bare proposal. The default ledger lives
    under home, so the default setup is unchanged.
 
-3. **Take the yes.** The plan must already be in your own reply, in full, from
+3. **Take the yes.**
+
+   A go must name the plan's consent code; a go that does not is refused with a one-line reason and nothing is written.
+
+   The plan must already be in your own reply, in full, from
    step 2. First ask one yes or no for the files, the ledger options
    and the first ledger write together. On no, stop: nothing was written.
+   When asking, name the code on the plan's `CONSENT CODE` line; accept the
+   files yes only when the person's reply names that code. A yes without it
+   is refused: tell the person in one line that the yes must name the code,
+   and ask again. Nothing is written. The code is in the transcript, so it
+   stops a one-keystroke generic yes, not a suggestion that copies the code.
    Then ask about each `OPTIONAL` item on its own, in the order printed, as a
    separate question showing that item's exact text. A yes to one item is never
    a yes to another, and the answer to the files is never a yes to an item.
+   Optional items keep their own per-item yes with no code.
    Saying no to every item leaves a complete setup. When you ask about the
    `prompt-suggestions` item, say what it is for: Claude Code can show a grey
    suggested reply already typed into the prompt box, such as a "yes" at a
@@ -121,9 +131,12 @@ Rules that hold in every mode:
    instead. Without sandbox approval, omit `--sandbox-folder`. A missing or
    changed folder approval refuses before configuration or settings writes;
    show the refusal and stop:
+   Pass `--consent '<code>'`, copied from the plan you presented and never
+   recomputed. Show a `consent_code_mismatch` refusal and stop, as with any
+   other refusal.
 
    ```text
-   python3 "${CLAUDE_SKILL_DIR}/../../setup.py" apply --home "$HOME" --operator '<operator>' --harness '<harness>' --approve '<id>' --approve '<id>' --sandbox-folder '<folder>'
+   python3 "${CLAUDE_SKILL_DIR}/../../setup.py" apply --home "$HOME" --operator '<operator>' --harness '<harness>' --consent '<code>' --approve '<id>' --approve '<id>' --sandbox-folder '<folder>'
    ```
 
    If the output says a file "already existed" and was kept, tell the person
