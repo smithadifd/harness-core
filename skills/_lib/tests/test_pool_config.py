@@ -267,7 +267,7 @@ def test_shipped_defaults_resolve_one_known_order_per_work_kind():
         "orchestration": ("claude-opus-5-5", "openai-codex/gpt-6.1-sol"),
         "hard_build": ("claude-opus-5-5", "openai-codex/gpt-6.1-sol"),
         "mechanical_build": (
-            "xai-oauth/grok-4.6",
+            "xai-oauth/grok-4.7",
             "openai-codex/gpt-6.1-sol",
             "claude-sonnet-5-5",
         ),
@@ -279,7 +279,7 @@ def test_shipped_defaults_resolve_one_known_order_per_work_kind():
         "review": ("claude-sonnet-5-5", "openai-codex/gpt-6.1-sol"),
         "second_review": (
             "openai-codex/gpt-6.1-sol",
-            "xai-oauth/grok-4.6",
+            "xai-oauth/grok-4.7",
             "claude-sonnet-5-5",
         ),
         "lint": ("claude-sonnet-5-5", "openai-codex/gpt-6.1-sol"),
@@ -397,11 +397,26 @@ def test_override_fixture_replaces_in_place_and_appends_new_entries():
     ), "a work kind the user added must resolve from the user's own models"
 
 
+def test_promote_grok_fixture_resolves_the_kept_inventory_model():
+    try:
+        config = pool_config.load_pool_config(FIXTURES / "promote-grok.json")
+    except PoolConfigError as exc:
+        raise AssertionError(
+            "the kept grok-4.6 inventory entry lets a user override rank it: "
+            f"loading promote-grok.json raised {exc}"
+        ) from exc
+    order = pool_config.resolve_eligible_models(config, "hard_build")
+    assert order[0] == "xai-oauth/grok-4.6", (
+        "the kept grok-4.6 inventory entry lets a user override rank it, "
+        f"but hard_build resolved to {order}"
+    )
+
+
 def test_override_fixture_drops_every_model_of_a_disabled_pool():
     config = pool_config.load_pool_config(FIXTURES / "override.json")
     for kind in config.work_kinds:
         order = pool_config.resolve_eligible_models(config, kind.id)
-        assert "xai-oauth/grok-4.6" not in order, (
+        assert "xai-oauth/grok-4.7" not in order, (
             f"work kind {kind.id!r} still resolves a model from the disabled "
             f"pool 'xai-grok': {order}"
         )
@@ -1163,7 +1178,7 @@ def test_cli_prints_the_eligible_order_one_per_line(capsys):
     captured = capsys.readouterr()
     assert exit_code == 0
     assert captured.out.splitlines() == [
-        "xai-oauth/grok-4.6",
+        "xai-oauth/grok-4.7",
         "openai-codex/gpt-6.1-sol",
         "claude-sonnet-5-5",
     ], f"the command line must print the eligible order, most preferred first: {captured.out!r}"

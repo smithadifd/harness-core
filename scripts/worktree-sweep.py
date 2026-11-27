@@ -1250,6 +1250,11 @@ def transfer_rows(args: argparse.Namespace) -> int:
     target = seat_registry(
         args.successor_scratch or args.scratch, successor, "successor"
     )
+    caller_registry = getattr(args, "caller_registry", None)
+    if caller_registry is not None:
+        field(caller_registry, "caller registry")
+        if target != caller_registry or os.path.realpath(caller_registry) != caller_registry:
+            raise Refused("caller registry does not rebuild from its scratch and seat (canonical path required)")
     if source == target:
         raise Refused("predecessor and successor share one registry")
     source_name = f"predecessor registry {source}"
@@ -1333,6 +1338,11 @@ def transfer_rows(args: argparse.Namespace) -> int:
         f"cleanup_transfer: {len(records)} rows from {predecessor} to {successor}",
         flush=True,
     )
+    if args.report_paths:
+        # Internal line grammar for retire's plan selector. Report all carried
+        # paths, not only new appends, so a repeated transfer plans the same set.
+        for _, path, _, _, _, _ in owned:
+            print(f"cleanup_transfer_path: {path}", flush=True)
     return 0
 
 
@@ -1467,11 +1477,13 @@ def plan(args: argparse.Namespace) -> int:
         os.path.dirname(registry), "cleanup.log"
     )
     rows = read_registry(registry)
+    paths = set(args.path) if args.path is not None else None
     selected = [
         item
         for item in rows
-        if (args.row is not None and item[4] == args.row)
-        or (args.seat is not None and item[3] == args.seat)
+        if ((args.row is not None and item[4] == args.row)
+            or (args.seat is not None and item[3] == args.seat))
+        and (paths is None or item[1] in paths)
     ]
     guard = os.path.expanduser(
         os.environ.get(
@@ -1515,11 +1527,14 @@ def parse(argv: list[str] | None) -> argparse.Namespace:
     select.add_argument("--row")
     select.add_argument("--seat")
     show.add_argument("--cleanup-log")
+    show.add_argument("--path", action="append", help="limit selected rows to these exact paths (repeatable)")
     move = commands.add_parser("transfer")
     move.add_argument("--scratch", required=True)
     move.add_argument("--successor-scratch")
     move.add_argument("--from", dest="from_label", required=True)
     move.add_argument("--to", dest="to_label", required=True)
+    move.add_argument("--caller-registry", help="require the rebuilt target to equal this canonical caller registry")
+    move.add_argument("--report-paths", action="store_true", help="report every carried path, including already-present rows")
     return parser.parse_args(argv)
 
 
