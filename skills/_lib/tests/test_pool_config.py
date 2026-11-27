@@ -397,6 +397,21 @@ def test_override_fixture_replaces_in_place_and_appends_new_entries():
     ), "a work kind the user added must resolve from the user's own models"
 
 
+def test_promote_grok_fixture_resolves_the_kept_inventory_model():
+    try:
+        config = pool_config.load_pool_config(FIXTURES / "promote-grok.json")
+    except PoolConfigError as exc:
+        raise AssertionError(
+            "the kept grok-4.6 inventory entry lets a user override rank it: "
+            f"loading promote-grok.json raised {exc}"
+        ) from exc
+    order = pool_config.resolve_eligible_models(config, "hard_build")
+    assert order[0] == "xai-oauth/grok-4.6", (
+        "the kept grok-4.6 inventory entry lets a user override rank it, "
+        f"but hard_build resolved to {order}"
+    )
+
+
 def test_override_fixture_drops_every_model_of_a_disabled_pool():
     config = pool_config.load_pool_config(FIXTURES / "override.json")
     for kind in config.work_kinds:
