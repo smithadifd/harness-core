@@ -14,7 +14,7 @@ Two kinds of rule run over every line of every tracked file:
 - Shape rules, held in this file: home folder paths, encoded home paths,
   ``~/`` paths into private folders, a secrets folder under the home folder,
   private-network host names, decision numbers and private schema names (the
-  shapes of the toolkit's core standards names test, with the narrowed host
+  shapes of the core standards names test, with the narrowed host
   name shape and the ASCII, case-sensitive word boundaries of its carve), plus
   token shapes and private-key headers. Under ``skills/_lib/ledger/``, the
   public ledger tree vendored unchanged, two shapes do not run in its files:

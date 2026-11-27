@@ -19,8 +19,8 @@ The guard, the speaker classifier and the index are this package's other
 modules.
 
 This is a ledger plugin verb module: the ledger itself does not import
-recall. The toolkit's plugin registry (``ledger_plugins.MODULES``) lists it,
-and the toolkit's ``ledger`` command passes that list to the ledger CLI
+recall. The plugin registry (``ledger_plugins.MODULES``) lists it,
+and the ledger command passes that list to the ledger CLI
 (``cli.main(plugin_modules=...)``).
 """
 from __future__ import annotations

@@ -1,7 +1,7 @@
 """The reader of a written resolution rule: which resolver a text prescribes
 for a config key.
 
-The toolkit's skills tell a seat how to turn a bare config value into a path;
+The skills tell a session how to turn a bare config value into a path;
 test_trust_keys_documented_resolution_toolkit.py reads those texts and
 resolves the real config values exactly as they prescribe. This file holds the
 reader itself.

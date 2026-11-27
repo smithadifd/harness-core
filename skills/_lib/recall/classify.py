@@ -1,7 +1,7 @@
 """Who spoke a transcript record: the speaker-kind classifier.
 
 ``role: user`` does not mean a person typed it. In a Claude Code transcript a
-user-role record is also a director's brief to a subagent, a subagent's
+user-role record is also an instruction to a subagent, a subagent's
 report, a peer session's message, a scheduled task or a harness reminder. The
 classifier labels a user-role record ``person`` only on positive provenance,
 and lets every agent or harness signal win over it:

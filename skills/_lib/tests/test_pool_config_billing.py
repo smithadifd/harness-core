@@ -3,7 +3,7 @@
 Every pool declares `billing`: `quota` (windows, policy, headroom: today's
 shape) or `api` (dollars, no windows, an optional ceiling and, per model, a
 dated price). The pick on an `api` pool (the cheapest qualified model at or
-under the ceiling) is the toolkit's `scripts/work_kind_model.py`; its cases
+under the ceiling) is the work-kind model picker; its cases
 are in test_pool_config_billing_toolkit.py.
 
 Every document here is a scratch copy written under `tmp_path` and passed
