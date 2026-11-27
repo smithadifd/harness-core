@@ -193,15 +193,40 @@ def child_env(home: Path, bin_dir: Path | None) -> dict[str, str]:
             "HOME": str(home), "PYTHONDONTWRITEBYTECODE": "1"}
 
 
+def consent_args(argv: list[str], *, bin_dir: Path | None) -> list[str]:
+    """Take the code from plan with the apply command's plan inputs."""
+    plan_argv = ["plan"]
+    index = 1
+    while index < len(argv):
+        flag = argv[index]
+        if flag in ("--home", "--db", "--operator", "--harness"):
+            plan_argv.extend(argv[index:index + 2])
+            index += 2
+        else:
+            index += 1
+    home = Path(argv[argv.index("--home") + 1])
+    plan = subprocess.run([sys.executable, str(SCRIPT), *plan_argv],
+                          capture_output=True, text=True, env=child_env(home, bin_dir),
+                          timeout=120)
+    if plan.returncode:
+        # Invalid plan inputs still exercise apply's original argument refusals.
+        return []
+    line = plan.stdout.splitlines()[-1]
+    assert line.startswith("CONSENT CODE "), plan.stdout
+    return ["--consent", line.removeprefix("CONSENT CODE ")]
+
+
 def setup_run(verb: str, home: Path, *extra: str, bin_dir: Path | None,
               operator: str | None = OPERATOR, harness: str | None = HARNESS,
-              timeout: float = 120) -> SimpleNamespace:
+              timeout: float = 120, auto_consent: bool = True) -> SimpleNamespace:
     argv = [sys.executable, str(SCRIPT), verb, "--home", str(home)]
     if operator is not None and verb in ("plan", "apply", "ledger-init"):
         argv += ["--operator", operator]
         if harness is not None:
             argv += ["--harness", harness]
     argv += list(extra)
+    if verb == "apply" and auto_consent and "--consent" not in extra:
+        argv += consent_args(argv[2:], bin_dir=bin_dir)
     done = subprocess.run(argv, capture_output=True, text=True,
                           env=child_env(home, bin_dir), timeout=timeout)
     return SimpleNamespace(rc=done.returncode, out=done.stdout, err=done.stderr)
@@ -274,6 +299,8 @@ def setup_run_traced(verb: str, home: Path, *extra: str, bin_dir: Path | None,
     if verb in ("plan", "apply", "ledger-init"):
         argv += ["--operator", operator, "--harness", harness]
     argv += list(extra)
+    if verb == "apply" and "--consent" not in extra:
+        argv += consent_args(argv, bin_dir=bin_dir)
     spec = {"script": str(SCRIPT), "argv": argv, "trace": str(trace)}
     done = subprocess.run([sys.executable, str(driver), json.dumps(spec)],
                           capture_output=True, text=True, env=child_env(home, bin_dir),

@@ -402,7 +402,7 @@ files, the ledger options and the first ledger write. With no `--approve`,
 every optional settings change is left out; the setup is still complete:
 
 ```sh
-python3 "$setup_py" apply --home "$HOME" --operator '<operator>' --harness 'claude-code'
+python3 "$setup_py" apply --home "$HOME" --operator '<operator>' --harness 'claude-code' --consent '<code>'
 ```
 
 To opt into individual optional changes instead, append one `--approve '<id>'`

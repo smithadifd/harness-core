@@ -32,7 +32,7 @@ import pytest
 from harness_fixtures import (
     HARNESS, OPERATOR, README, ROOT, SEEDED_SETTINGS, SKILL, child_env,
     added_dirs, ancestors, approve_args, at, changed_files, load_setup, make_bin,
-    make_home, plan_configure, plan_files, plan_option_ids, plan_settings_path,
+    make_home, consent_args, plan_configure, plan_files, plan_option_ids, plan_settings_path,
     setup_run, setup_run_traced, show_stored, sha, snap,
 )
 
@@ -92,6 +92,111 @@ def record_body(home):
     assert len(lines) == 2
     return json.loads(lines[1])
 
+
+CONSENT_REFUSAL = (
+    "setup: consent_code_mismatch: apply needs --consent with the code the plan printed; "
+    "nothing was written.\n"
+)
+
+
+def test_plan_ends_with_consent_code_of_exact_plan_text(tmp_path):
+    home, bin_dir = fixture(tmp_path)
+    plan = do("plan", home, bin_dir)
+    assert plan.rc == 0, plan.err
+    body, last = plan.out.rsplit("CONSENT CODE ", 1)
+    assert re.fullmatch(r"[0-9a-f]{4}\n", last)
+    assert last == sha(body.encode("utf-8"))[:4] + "\n"
+
+
+@pytest.mark.parametrize("settings", [SEEDED_SETTINGS, None], ids=["seeded", "empty"])
+def test_apply_without_consent_writes_nothing(tmp_path, settings):
+    home, bin_dir = fixture(tmp_path, settings=settings)
+    before = snap(home)
+    done = do("apply", home, bin_dir, "--approve-all", auto_consent=False)
+    assert snap(home) == before, "consent refusal changed the home tree"
+    assert done.rc == 1
+    assert done.out == ""
+    assert done.err == CONSENT_REFUSAL
+    assert not (bin_dir / "claude-stdin").exists(), "configure ran without consent"
+
+
+@pytest.mark.parametrize("code", ["different", "", "nope", "00000", "abcd ", " abcd",
+                                "CONSENT CODE abcd"])
+def test_apply_wrong_consent_writes_nothing(tmp_path, code):
+    home, bin_dir = fixture(tmp_path)
+    if code == "different":
+        right = consent_args(["apply", "--home", str(home), "--operator", OPERATOR],
+                             bin_dir=bin_dir)[1]
+        code = ("0" if right[0] != "0" else "1") + right[1:]
+    before = snap(home)
+    done = do("apply", home, bin_dir, "--consent", code)
+    assert snap(home) == before, "consent refusal changed the home tree"
+    assert done.rc == 1
+    assert done.out == ""
+    assert done.err == CONSENT_REFUSAL
+    assert not (bin_dir / "claude-stdin").exists()
+
+
+def test_apply_upper_case_consent_succeeds(tmp_path):
+    home, bin_dir = fixture(tmp_path)
+    operator = OPERATOR
+    while True:
+        plan = do("plan", home, bin_dir, operator=operator)
+        assert plan.rc == 0, plan.err
+        code = plan.out.splitlines()[-1].removeprefix("CONSENT CODE ")
+        if code.upper() != code:
+            break
+        operator += "x"
+    done = do("apply", home, bin_dir, "--consent", code.upper(), operator=operator)
+    assert done.rc == 0, done.err
+    assert at(home, RECORD).is_file()
+    assert at(home, RULES).is_file()
+
+
+@pytest.mark.parametrize("changed", ["operator", "database", "sandbox"])
+def test_apply_changed_plan_writes_nothing(tmp_path, changed):
+    home, bin_dir = fixture(tmp_path)
+    given = []
+    if changed == "sandbox":
+        first, second = home / "first", home / "second"
+        first.mkdir()
+        second.mkdir()
+        link = home / "ledger"
+        link.symlink_to(first, target_is_directory=True)
+        given = ["--db", str(link / "ledger.db")]
+    plan = do("plan", home, bin_dir, *given)
+    assert plan.rc == 0, plan.err
+    code = plan.out.splitlines()[-1].removeprefix("CONSENT CODE ")
+    operator = OPERATOR
+    if changed == "operator":
+        operator = "another operator"
+    elif changed == "database":
+        given = ["--db", str(home / "elsewhere" / "ledger.db")]
+    else:
+        link.unlink()
+        link.symlink_to(second, target_is_directory=True)
+    before = snap(home)
+    done = do("apply", home, bin_dir, *given, "--consent", code, operator=operator)
+    assert snap(home) == before, "changed-plan refusal changed the home tree"
+    assert done.rc == 1
+    assert done.out == ""
+    assert done.err == CONSENT_REFUSAL
+    assert not (bin_dir / "claude-stdin").exists()
+
+
+def test_apply_unbuildable_plan_writes_nothing(tmp_path, monkeypatch, capsys):
+    home, bin_dir = fixture(tmp_path)
+    code = consent_args(["apply", "--home", str(home), "--operator", OPERATOR],
+                        bin_dir=bin_dir)[1]
+    monkeypatch.setattr(setup, "RULES_SOURCE", tmp_path / "missing-rules.md")
+    before = snap(home)
+    rc = setup.main(["apply", "--home", str(home), "--operator", OPERATOR,
+                     "--consent", code])
+    output = capsys.readouterr()
+    assert snap(home) == before, "unbuildable-plan refusal changed the home tree"
+    assert rc == 1
+    assert output.out == ""
+    assert output.err == CONSENT_REFUSAL
 
 # ---------------------------------------------------------------------------
 # Test 1: a dry run lists every write before it happens
@@ -700,6 +805,7 @@ def test_the_documented_apply_command_runs_through_bash_with_a_deny_id(tmp_path)
     sandbox = plan.out.split("OPTIONAL sandbox\n----\n", 1)[1].split("\n----", 1)[0]
     folder = json.loads(sandbox)["sandbox"]["filesystem"]["allowWrite"][0]
     command = command.replace("<folder>", folder)
+    command = command.replace("<code>", plan.out.splitlines()[-1].removeprefix("CONSENT CODE "))
     env = child_env(home, bin_dir)
     env["CLAUDE_SKILL_DIR"] = str(SKILL.parent)
     done = subprocess.run(["/bin/bash", "-c", command], capture_output=True, text=True,
@@ -717,8 +823,11 @@ def test_the_readme_shell_setup_completes_without_a_session(tmp_path):
     assert commands, "the shell instructions contain no setup commands"
     env = child_env(home, bin_dir)
     env["setup_py"] = str(ROOT / "plugins" / "harness" / "setup.py")
+    plan = do("plan", home, bin_dir)
+    assert plan.rc == 0, plan.err
+    code = plan.out.splitlines()[-1].removeprefix("CONSENT CODE ")
     for template in commands:
-        command = template.replace("<operator>", OPERATOR)
+        command = template.replace("<operator>", OPERATOR).replace("<code>", code)
         done = subprocess.run(["/bin/bash", "-eu", "-c", command], capture_output=True,
                               text=True, env=env, timeout=120)
         assert done.returncode == 0, f"{command}\n{done.stdout}{done.stderr}"

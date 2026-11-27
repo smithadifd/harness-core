@@ -550,7 +550,8 @@ def format_plan(home: Path, database: Path, operator: str, harness: str | None) 
         if ident == "sandbox" and "filesystem" in sandbox:
             lines.append("Turns on the sandbox and lets sandboxed commands write the ledger "
                          f"folder {sandbox['filesystem']['allowWrite'][0]}")
-    return "\n".join(lines) + "\n"
+    text = "\n".join(lines) + "\n"
+    return text + f"CONSENT CODE {digest(text.encode('utf-8'))[:4]}\n"
 
 
 # ---------------------------------------------------------------------------
@@ -1230,9 +1231,23 @@ class Changes:
         self.settings: dict[str, Any] | None = None
 
 
+def check_consent(home: Path, database: Path, operator: str, harness: str | None,
+                  consent: str | None) -> None:
+    refusal = ("consent_code_mismatch: apply needs --consent with the code the plan "
+               "printed; nothing was written.")
+    try:
+        plan = format_plan(home, database, operator, harness)
+    except Exception as exc:
+        raise SetupError(refusal) from exc
+    code = plan.splitlines()[-1].removeprefix("CONSENT CODE ")
+    if not consent or consent.lower() != code:
+        raise SetupError(refusal)
+
+
 def apply_verb(home: Path, database: Path, operator: str, harness: str | None,
                approve: list[str], approve_all: bool,
-               sandbox_folder: str | None) -> tuple[str, list[str]]:
+               sandbox_folder: str | None, consent: str | None) -> tuple[str, list[str]]:
+    check_consent(home, database, operator, harness, consent)
     tree = Tree(home)
     try:
         lock = take_lock(tree)
@@ -2406,6 +2421,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="approve one optional settings proposal by id")
     parser.add_argument("--approve-all", action="store_true",
                         help="approve every optional settings proposal")
+    parser.add_argument("--consent", default=None, metavar="CODE",
+                        help="required for apply: the consent code printed by plan")
     parser.add_argument("--sandbox-folder", default=None,
                         help="the exact absolute folder accepted from the sandbox plan "
                              "(apply); an empty value accepts no write path")
@@ -2455,7 +2472,7 @@ def run(argv: list[str]) -> tuple[str, list[str], int]:
     if args.verb == "plan":
         return format_plan(home, database, args.operator, harness), [], 0
     out, warnings = apply_verb(home, database, args.operator, harness, args.approve,
-                               args.approve_all, args.sandbox_folder)
+                               args.approve_all, args.sandbox_folder, args.consent)
     return out, warnings, 0
 
 
