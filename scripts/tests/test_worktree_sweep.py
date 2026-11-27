@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -1393,10 +1395,15 @@ def seat_registry_file(scratch: Path, label: str, rows=()) -> Path:
 
 
 def run_transfer(scratch: Path, *, pred: str = PRED, succ: str = SUCC,
-                 successor_scratch: Path | None = None, env=None):
+                 successor_scratch: Path | None = None, caller_registry: str | None = None,
+                 report_paths: bool = False, env=None):
     argv = [sys.executable, str(SWEEP), "transfer", "--scratch", str(scratch), "--from", pred, "--to", succ]
     if successor_scratch is not None:
         argv.extend(["--successor-scratch", str(successor_scratch)])
+    if caller_registry is not None:
+        argv.append(f"--caller-registry={caller_registry}")
+    if report_paths:
+        argv.append("--report-paths")
     return subprocess.run(
         argv, text=True, capture_output=True, check=False, env=env or os.environ.copy()
     )
@@ -1584,6 +1591,92 @@ def test_transferred_row_matches_the_guard_grammar_and_plans_for_the_successor(c
     expected = f"git -C {case['repo']} worktree remove {case['worktree']}"
     assert planned.returncode == 0, planned.stderr
     assert planned.stdout.splitlines() == [expected]
+
+
+def test_transfer_matching_caller_registry_reports_all_carried_paths(transfer_case):
+    case = transfer_case
+    source = case["pred"].read_bytes()
+    for count in (2, 0):
+        result = run_transfer(
+            case["scratch"], caller_registry=str(case["succ"]), report_paths=True,
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.splitlines() == [
+            f"cleanup_transfer: {count} rows from {PRED} to {SUCC}",
+            *(f"cleanup_transfer_path: {row[1]}" for row in case["owned"]),
+        ]
+    assert [row[:5] for row in transferred_rows(case["succ"])] == [
+        [repo, path, "worktree", SUCC, row]
+        for repo, path, _, _, row, _ in case["owned"]
+    ]
+    assert case["pred"].read_bytes() == source
+
+
+@pytest.mark.parametrize("form", [
+    "wrong-label", "wrong-basename", "relative", "dotdot", "symlink",
+    "symlink-watch-dir",
+])
+def test_transfer_refuses_non_rebuilding_caller_registry(transfer_case, form):
+    case = transfer_case
+    scratch = case["scratch"]
+    caller = str(case["succ"])
+    if form == "wrong-label":
+        caller = caller.replace(f"watch-{SUCC}", "watch-other")
+    elif form == "wrong-basename":
+        caller = caller.replace("cleanup-items.tsv", "other.tsv")
+    elif form == "relative":
+        caller = os.path.relpath(caller)
+    elif form == "dotdot":
+        caller = str(scratch / ".." / "scratch" / f"watch-{SUCC}" / "cleanup-items.tsv")
+    elif form == "symlink":
+        link = case["base"] / "scratch-link"
+        link.symlink_to(scratch, target_is_directory=True)
+        caller = str(link / f"watch-{SUCC}" / "cleanup-items.tsv")
+    else:
+        watch = case["succ"].parent
+        target = scratch / "real-watch"
+        watch.rename(target)
+        watch.symlink_to(target, target_is_directory=True)
+    before = case["pred"].read_bytes(), case["succ"].read_bytes()
+
+    result = run_transfer(scratch, caller_registry=caller)
+
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert result.stdout == ""
+    assert result.stderr == (
+        "worktree-sweep: cleanup_transfer refused: caller registry does not rebuild "
+        "from its scratch and seat (canonical path required)\n"
+    ), result.stderr
+    assert (case["pred"].read_bytes(), case["succ"].read_bytes()) == before
+    assert not list(scratch.rglob("inherited-roots.tsv"))
+
+
+def test_plan_path_selector_intersects_seat_and_accepts_repeated_paths(cleanup_case):
+    case = cleanup_case
+    pushed(case)
+    assert register(case).returncode == 0
+    gone = case["tmp"].resolve() / "gone-selected"
+    unrelated = case["tmp"].resolve() / "gone-unrelated"
+    foreign = case["tmp"].resolve() / "gone-foreign"
+    with case["registry"].open("a") as stream:
+        for path, seat, row in [
+            (gone, "seat", "GONE"), (unrelated, "seat", "OTHER"),
+            (foreign, "other-seat", "FOREIGN"),
+        ]:
+            stream.write("\t".join((
+                str(case["repo"]), str(path), "worktree", seat, row,
+                "2026-01-01T00:00:00Z",
+            )) + "\n")
+
+    result = invoke(
+        case, "plan", "--registry", str(case["registry"]), "--seat", "seat",
+        "--path", str(case["worktree"]), "--path", str(gone), "--path", str(foreign),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        f"git -C {case['repo']} worktree remove {case['worktree']}", f"gone {gone}",
+    ], "path selection must intersect seat ownership and exclude unselected rows"
 
 
 def test_transfer_refuses_a_copy_row_already_holding_an_inherited_path(transfer_case):
