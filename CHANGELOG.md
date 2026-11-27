@@ -3,6 +3,31 @@
 Each tag of this repository gets an entry: what changed in the vendored files,
 and any pin move of the vendored ledger.
 
+## v0.3.6
+
+Three changes to the files this repository ships:
+
+- Setup apply now needs the plan's consent code (#43). The setup plan ends with
+  a four-character code built from the plan. Apply rebuilds the plan and
+  refuses before it opens the setup tree or takes its lock unless `--consent`
+  matches that code (case-insensitive). The setup skill asks for the code with
+  the files approval, and both executable apply templates in the README carry
+  `--consent '<code>'`. Optional items keep their own approval without a code.
+- The worktree cleanup script gains the toolkit's caller registry, report
+  paths and `plan --path` (#46), ported byte-equal from the toolkit with its
+  tests. Transfer takes `--caller-registry` (refuses before writing when the
+  caller's registry does not rebuild as the canonical path) and
+  `--report-paths`. `plan --path` is repeatable and intersects the selected
+  seat or row, so a path cannot admit a foreign seat's rows.
+- The xai-oauth pool's choice for mechanical builds and second reviews moves
+  to its 4.7 model (#45). The 4.6 model stays declared as inventory and is
+  preferred for no work kind. A new pool-config test keeps that inventory
+  entry; the toolkit takes it at its next vendor pin.
+
+The `sdlc` pin stays at skills `v1.7.0`. `harness` and `rails` stay at 0.2.0.
+The `ledger-hooks` pin and the vendored ledger stay at `v0.7.0`. The README's
+named current tag moves to `v0.3.6`.
+
 ## v0.3.5
 
 The marketplace's `sdlc` pin moves from skills `v1.6.1` to `v1.7.0`
