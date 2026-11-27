@@ -1215,6 +1215,30 @@ def test_the_v0_3_4_entry_names_the_sdlc_pin_move_and_neither_plugin_moves():
         assert claim in entry, claim
 
 
+# ---------------------------------------------------------------------------
+# The v0.3.5 release: the entry names the sdlc pin move, and neither plugin moves.
+
+
+def test_the_v0_3_5_entry_names_the_sdlc_pin_move_and_neither_plugin_moves():
+    headings = changelog_headings()
+    assert headings[headings.index("v0.3.5"):][:2] == ["v0.3.5", "v0.3.4"]
+    entry = one_line(changelog_entry("v0.3.5"))
+    stays = re.search(r"`harness` and `rails` stay at (\d+\.\d+\.\d+)", entry)
+    assert stays, "the entry does not say the plugin versions stay"
+    assert stays.group(1) == "0.2.0"
+    if headings[0] == "v0.3.5":
+        assert plugin_version("harness") == plugin_version("rails") == "0.2.0"
+        sources = {e["name"]: e["source"] for e in marketplace_manifest()["plugins"]
+                   if isinstance(e["source"], dict)}
+        assert sources["sdlc"]["ref"] == "v1.7.0"
+        assert sources["sdlc"]["sha"] == "f6f6cb27d22952dc0f4c258e8ab34bf4a9ee3261"
+        assert sources["ledger-hooks"]["ref"] == "v0.7.0"
+    for claim in ("skills `v1.6.1` to `v1.7.0`",
+                  "`sdlc` plugin at 0.17.0, commit `f6f6cb27d22952dc0f4c258e8ab34bf4a9ee3261`",
+                  "The `ledger-hooks` pin and the vendored ledger stay at `v0.7.0`"):
+        assert claim in entry, claim
+
+
 def test_the_readme_and_changelog_do_not_use_the_word_builder():
     for path in (README, CHANGELOG):
         assert "builder" not in path.read_text(encoding="utf-8").lower(), path.name
