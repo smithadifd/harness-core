@@ -143,7 +143,7 @@ the text itself.
 
 ## Carve record
 
-This repository was carved, without history, from a private toolkit at commit
+This repository was carved, without history, from an unpublished source repository at commit
 `5d2c033e6ddd86d4ea61f7e97dd69a8b4618923c`.
 
 - 158 vendored files were copied unchanged from their blobs at that

@@ -1,7 +1,7 @@
 """``ledger recall`` end to end, under a temporary HOME.
 
 The verb is a ledger plugin (``recall.ledger_verb``); the ledger CLI runs it
-here the way the toolkit's ``ledger`` command does, passed in as a plugin
+here the way the ledger command does, passed in as a plugin
 module.
 """
 from __future__ import annotations

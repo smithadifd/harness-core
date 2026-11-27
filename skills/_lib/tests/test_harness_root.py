@@ -240,9 +240,8 @@ def test_strict_resolve_absent_root_is_a_lookup_error_naming_both_remedies_in_or
     so the message alone is the fix; the class hierarchy stays covered too,
     on the real instance this time. The CLI form of this same refusal
     (`harness_paths.py --require-root`, exit 2, nothing on stdout) is proven
-    at `skills/session-handoff/tests/test_close_surfaces_from_harness_root.py
-    ::test_the_strict_print_refuses_without_a_root_and_prints_no_path` — not
-    duplicated here, since this module has no CLI of its own."""
+    beside the close command, not duplicated here, since this module has no
+    CLI of its own."""
     monkeypatch.delenv("HARNESS_ROOT", raising=False)
     with pytest.raises(hr.HarnessRootAbsent) as excinfo:
         hr.resolve({}, require_root=True, cwd=tmp_path)

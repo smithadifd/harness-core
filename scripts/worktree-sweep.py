@@ -1410,7 +1410,7 @@ def cleanup_log(path: str, text: str) -> None:
     directory, a path that is a directory, a symlink or a fifo with no reader,
     a full disk) is dropped, and the plan's output and exit code do not change.
 
-    As in merge-pr.sh's REFUSAL_LOG_PY, the log is never shortened: the
+    As in the merge tool's refusal log, the log is never shortened: the
     whole line is written (looping on partial writes), and on a failure that
     cannot be finished past (a short write, EFBIG past a file-size limit) the
     write stops and the fragment stays. Before writing, the log's last byte is
@@ -1472,7 +1472,7 @@ def path_missing(path: str) -> bool:
 def plan(args: argparse.Namespace) -> int:
     registry = registry_path(args.registry)
     # The seat's scratch holds its registry (`<scratch>/watch-<label>/`), so
-    # the log defaults to that directory; roll-land names its own scratch.
+    # the log defaults to that directory; the landing step names its own scratch.
     log_path = args.cleanup_log or os.path.join(
         os.path.dirname(registry), "cleanup.log"
     )

@@ -9,9 +9,9 @@
 #
 # Read by scripts/check-ledger-vendor.py and written by
 # scripts/ledger-vendor-bump.py. Two checks read it. Offline, the files under
-# skills/_lib/ledger are hashed against the manifest's git blob ids (the lint
-# job of .github/workflows/skills-ci.yml and the daily wave's pre-flight,
-# launchd-kit/triage-wave-run.sh --wave). With --source, the manifest itself
+# skills/_lib/ledger are hashed against the manifest's git blob ids (also run
+# from the unpublished source's lint job and its daily pre-flight). With
+# --source, the manifest itself
 # is compared with the ledger repository at `sha`, `tag` must resolve to `sha`
 # there, and `sha` must be on the ledger's main (CI fetches the commit, the
 # tag and main from the public repository without credentials).

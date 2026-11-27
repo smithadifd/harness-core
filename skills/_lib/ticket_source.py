@@ -1,6 +1,6 @@
 """Ticket-source interface with opt-in Notion and refusing implementations.
 
-The command-line entry is a separate ``ticket_source.py`` script in the toolkit.
+The command-line entry is a separate ``ticket_source.py`` script in the unpublished source repository.
 This module loads no code itself: a caller that wants the Notion source loads
 the Notion helpers and passes a loader for them."""
 
@@ -293,7 +293,7 @@ def get_ticket_source(
 
 # --- Write-back policy -------------------------------------------------------
 # One setting per tracker source, ``trackers.<source>.writeback``, kept in the
-# toolkit-wide override file ``trackers.json``:
+# shared override file ``trackers.json``:
 #     {"<source>": {"writeback": "auto" | "ask" | "off"}}
 # ``auto`` lets a write to that tracker proceed, ``ask`` holds each write until
 # it is named, ``off`` refuses. An absent file, source or key is ``off``.

@@ -44,13 +44,13 @@ The core is a toolset: skills and agents that help a person follow solid enginee
 
 ## For a newcomer
 
-- **CHART**: plan the sprint.
-- **ROLL**: run the agents.
+- **Planning session**: plan the sprint.
+- **Run session**: run the agents.
 - **close**: retro plus handoff.
 - **SWEEP**: groom the backlog.
 - **sharpen**: a one-question-at-a-time requirements interview.
 - **shape**: a pre-mortem.
-- **seat**: an agent session with a role.
+- **Session**: an agent session with a role.
 - **lane**: which model does the work.
 - **packet**: the handoff document.
 - **ledger**: the agents' issue tracker and decision log.

@@ -90,7 +90,7 @@ def _ts_value(value: Any) -> str | None:
 
 def _ts(record: Mapping[str, Any], message: Any = None) -> str:
     """A record's timestamp; OMP may put it inside ``message``, and may write it
-    as epoch seconds or milliseconds (the forms ``session-handoff/mix_report.py``
+    as epoch seconds or milliseconds (the forms the mix report
     also reads)."""
     value = _ts_value(record.get("timestamp"))
     if value is None and isinstance(message, Mapping):

@@ -83,7 +83,7 @@ relied on discovery needs the file added once; `HARNESS_ROOT` or
 
 A missing or unreadable config (bad JSON, unreadable path) still DEGRADES to
 `{}` for root/path resolution — the root must then come from the environment
-— preserving the dry-run posture of `chart-wave/triage_wave.py`'s own
+— preserving the dry-run posture of the wave triage script's own
 `load_config`. The failure is retained on `HarnessPaths`, so
 `resolve_standard()` refuses instead of silently resolving without the
 instance's override declaration. `resolve()` raises only on a genuinely
@@ -101,8 +101,8 @@ sibling `.py` file always canonicalizes back through any symlink to the
 PHYSICAL file, so `Path(__file__).resolve().parent.parent / "_lib" /
 "harness_root.py"` finds this module regardless of install mode with no
 extra wiring in `install.sh` — no separate symlink of `_lib/` is needed, and
-none is added. This is the SAME mechanism `chart-wave/triage_wave.py`'s
-`load_module()` already uses to reach `session-handoff/readiness_gate.py`
+none is added. This is the SAME mechanism the wave triage script's
+`load_module()` already uses to reach the readiness gate
 and `ai-coding-tasks/triage_taxonomy.py` (also true of
 `ticket_lifecycle.py`'s `notion_tasks.py` load) — never `sys.path`, never
 `$PWD`. A future skill call site should load this module the same way —
@@ -114,7 +114,7 @@ annotations`, whose fields resolve lazily via `sys.modules[cls.__module__]`
 `AttributeError: 'NoneType' object has no attribute '__dict__'` the first
 time anything introspects the dataclass (observed on Python 3.14; CS2's own
 fix-forward hit this in the harness map's `sources.py` and
-`chart-wave/triage_wave.py`'s `load_module` already gets it right, which is
+the wave triage script's `load_module` already gets it right, which is
 why this snippet must match it exactly rather than being simplified):
 
     import importlib.util

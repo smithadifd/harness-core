@@ -122,7 +122,7 @@ Every pool declares `billing`, which is required and is either `quota` or
 The pick on an `api` pool is `cheapest_within_ceiling`: of the models a work
 kind lists in that pool, those priced at or under the ceiling, cheapest first,
 a tie going to the work kind's declared order. This module only supplies that
-ordering; the toolkit's work-kind model picker applies it.
+ordering; the work-kind model picker applies it.
 
 OVERRIDE SEMANTICS
 ------------------

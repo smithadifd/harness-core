@@ -1,6 +1,6 @@
 """Read optional JSON overrides from stable user configuration locations.
 
-Toolkit-wide overrides live under
+Shared overrides live under
 ``${XDG_CONFIG_HOME:-$HOME/.config}/claude-toolkit/``.  The pool inventory is
 the reference consumer: ``pool_config.py`` reads ``pool-config.json`` there at
 run time, then applies its existing entry-by-id merge rules.
@@ -44,7 +44,7 @@ def _home() -> Path:
 
 
 def toolkit_config_dir() -> Path:
-    """Return the toolkit configuration directory for the current process."""
+    """Return the shared configuration directory for the current process."""
     xdg_home = os.environ.get("XDG_CONFIG_HOME")
     # A relative XDG_CONFIG_HOME is invalid and would follow the working
     # directory, so it is ignored and the HOME fallback is used.
@@ -56,7 +56,7 @@ def toolkit_config_dir() -> Path:
 
 
 def toolkit_override_path(name: str) -> Path:
-    """Return one toolkit-wide JSON override path."""
+    """Return one shared JSON override path."""
     return toolkit_config_dir() / _json_filename(name)
 
 
@@ -132,7 +132,7 @@ def load_json_overrides(
 
 
 def load_toolkit_overrides(name: str, defaults: Mapping[str, Any]) -> dict[str, Any]:
-    """Load one optional toolkit-wide override from the current config base."""
+    """Load one optional shared override from the current config base."""
     return load_json_overrides(defaults, toolkit_override_path(name))
 
 

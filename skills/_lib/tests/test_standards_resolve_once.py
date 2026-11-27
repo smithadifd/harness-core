@@ -1,7 +1,7 @@
 """The ordered standards search.
 
-Its repository-wide consumption contract (every standard the toolkit's
-skills declare resolves once; no live file names a literal standards path)
+Its repository-wide consumption contract (every standard the skills
+declare resolves once; no live file names a literal standards path)
 is in test_standards_resolve_once_toolkit.py.
 """
 

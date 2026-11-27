@@ -18,7 +18,7 @@ def _speakers(records, source=CLAUDE, agent_file=False):
 
 
 def test_agent_to_agent_user_record_in_subagent_file_is_agent():
-    """A director's brief, stored as ``role: user`` in a subagent transcript, is labelled agent."""
+    """An instruction to a subagent, stored as ``role: user`` in a subagent transcript, is labelled agent."""
     brief = claude_user("Build the widget. The owner decided X.", isSidechain=True,
                         agentId="a575ff0c", origin={"kind": "human"}, promptSource="typed")
     assert _speakers([brief], agent_file=True) == [("user", classify.AGENT)]

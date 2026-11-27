@@ -4,9 +4,9 @@ A row is labelled when no review model outside the builder's family can run,
 or when the user's configuration ranks a model above the shipped order for the
 row's work kind. The label never blocks: the row still resolves a builder.
 
-The cases that judge reviewers through the toolkit's
-`scripts/model-selection.sh`, or run `scripts/row_assurance.py` and
-`scripts/work_kind_model.py`, are in test_pool_config_assurance_toolkit.py.
+The cases that judge reviewers through `scripts/model-selection.sh`, or run
+`scripts/row_assurance.py` and the work-kind model picker, are in
+test_pool_config_assurance_toolkit.py.
 """
 
 import importlib.util

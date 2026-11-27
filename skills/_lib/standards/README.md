@@ -1,6 +1,6 @@
 # Core standards
 
-This is the one folder for shipped standards. A standard that the toolkit
+This is the one folder for shipped standards. A standard this repository
 distributes lives here and nowhere else; there is no second standards folder
 in this repository.
 
