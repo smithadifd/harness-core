@@ -295,7 +295,7 @@ claude plugin list
 ```
 
 `vX.Y.Z` is a release tag of this repository: use the current one, which is
-`v0.3.5`. Each release moves it, so if this text may be older than the
+`v0.3.6`. Each release moves it, so if this text may be older than the
 repository, read the newest tag on the repository's Tags page on GitHub, or run
 one command and take the highest version it lists:
 
