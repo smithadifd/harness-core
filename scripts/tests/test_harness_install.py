@@ -37,7 +37,7 @@ from harness_fixtures import (
 )
 
 setup = load_setup()
-ALL_IDS = [ident for ident, _text in setup.optional_items()]
+ALL_IDS = [ident for ident, _text in setup.optional_items({"enabled": True})]
 RULES, OVERRIDE, RECORD, LOCK, DB = (setup.RULES_REL, setup.OVERRIDE_REL, setup.RECORD_REL,
                                      setup.LOCK_REL, setup.DB_REL)
 SETTINGS = setup.SETTINGS_REL
@@ -78,7 +78,8 @@ def set_up(home, bin_dir, ids=ALL_IDS):
     """Plan, apply, store the options the stub was given, make the first ledger write."""
     plan = do("plan", home, bin_dir)
     assert plan.rc == 0, plan.err
-    applied = do("apply", home, bin_dir, *approve_args(ids))
+    applied = do("apply", home, bin_dir, *approve_args(ids), "--sandbox-folder",
+                 str(at(home, DB).parent))
     assert applied.rc == 0, applied.err
     show_stored(bin_dir)
     init = do("ledger-init", home, bin_dir)
@@ -110,7 +111,8 @@ def test_install_1_the_files_that_differ_after_setup_are_exactly_the_files_the_p
     settings_path = plan_settings_path(plan.out)
     assert settings_path == SETTINGS
 
-    applied = do("apply", home, bin_dir, *approve_args(ALL_IDS))
+    applied = do("apply", home, bin_dir, *approve_args(ALL_IDS), "--sandbox-folder",
+                 str(at(home, DB).parent))
     assert applied.rc == 0, applied.err
     show_stored(bin_dir)
     init = do("ledger-init", home, bin_dir)
@@ -276,12 +278,14 @@ def test_install_3_a_seeded_override_is_skipped_marked_not_ours_and_left_by_remo
 
 def test_install_3_approved_items_are_added_and_nothing_else_in_settings_changes(tmp_path):
     home, bin_dir = fixture(tmp_path)
-    done = do("apply", home, bin_dir, *approve_args(ALL_IDS))
+    done = do("apply", home, bin_dir, *approve_args(ALL_IDS), "--sandbox-folder",
+              str(at(home, DB).parent))
     assert done.rc == 0, done.err
     now = json.loads(at(home, SETTINGS).read_text(encoding="utf-8"))
     seeded = SEEDED_SETTINGS
     assert set(now) == set(seeded) | {"sandbox", "promptSuggestionEnabled"}
-    assert now["sandbox"] == {"enabled": True}
+    assert now["sandbox"] == {"enabled": True, "filesystem": {
+        "allowWrite": [str(home / ".local/share/ledger")]}}
     assert now["promptSuggestionEnabled"] is False
     assert now["model"] == seeded["model"]
     assert now["additionalDirectories"] == seeded["additionalDirectories"]
@@ -428,7 +432,8 @@ def test_db_a_database_seeded_elsewhere_is_used_and_no_new_database_is_made(tmp_
     command = shlex.split(lines[lines.index("FIRST LEDGER WRITE") + 2])
     assert command[1:3] == ["--db", str(seeded)]
 
-    applied = do("apply", home, bin_dir, *given, *approve_args(ALL_IDS))
+    applied = do("apply", home, bin_dir, *given, *approve_args(ALL_IDS),
+                 "--sandbox-folder", "")
     assert applied.rc == 0, applied.err
     # The stored ledger_db option is the given path.
     assert show_stored(bin_dir)["ledger_db"] == str(seeded)
@@ -640,6 +645,7 @@ def test_the_readme_names_every_optional_setting_the_plan_proposes():
     for rule in setup.DENY_RULES:
         assert f"`{rule}`" in text, rule
     assert '`{"enabled": true}`' in text
+    assert "`filesystem.allowWrite`" in text
     for key in ("ledger_db", "ledger_operator", "ledger_harness"):
         assert f"`{key}`" in text, key
 
@@ -665,16 +671,19 @@ def skill_commands(text):
 
 def test_the_skill_single_quotes_every_value_the_model_substitutes():
     text = SKILL.read_text(encoding="utf-8")
-    seen = {"--operator": 0, "--harness": 0, "--approve": 0, "--path": 0}
+    seen = {"--operator": 0, "--harness": 0, "--approve": 0, "--path": 0,
+            "--sandbox-folder": 0}
     commands = skill_commands(text)
     assert len(commands) == 8
     for command in commands:
-        for flag, value in re.findall(r"(--operator|--harness|--approve|--path) (\S+)", command):
+        for flag, value in re.findall(
+                r"(--operator|--harness|--approve|--path|--sandbox-folder) (\S+)", command):
             assert re.fullmatch(r"'<[a-z]+>'", value), f"unquoted {flag} value {value}: {command}"
             seen[flag] += 1
         bare = re.sub(r"'<[a-z]+>'", "", command)
         assert "<" not in bare and ">" not in bare, f"unquoted placeholder: {command}"
-    assert seen == {"--operator": 3, "--harness": 3, "--approve": 2, "--path": 2}
+    assert seen == {"--operator": 3, "--harness": 3, "--approve": 2, "--path": 2,
+                    "--sandbox-folder": 1}
     # The skill says why.
     assert "parentheses" in text and "deny:Read(.env)" in text
 
@@ -686,6 +695,11 @@ def test_the_documented_apply_command_runs_through_bash_with_a_deny_id(tmp_path)
     ids = iter(["deny:Read(.env)", "sandbox"])
     command = template.replace("<operator>", OPERATOR).replace("<harness>", HARNESS)
     command = re.sub(r"<id>", lambda _match: next(ids), command)
+    plan = do("plan", home, bin_dir)
+    assert plan.rc == 0, plan.err
+    sandbox = plan.out.split("OPTIONAL sandbox\n----\n", 1)[1].split("\n----", 1)[0]
+    folder = json.loads(sandbox)["sandbox"]["filesystem"]["allowWrite"][0]
+    command = command.replace("<folder>", folder)
     env = child_env(home, bin_dir)
     env["CLAUDE_SKILL_DIR"] = str(SKILL.parent)
     done = subprocess.run(["/bin/bash", "-c", command], capture_output=True, text=True,
@@ -693,7 +707,7 @@ def test_the_documented_apply_command_runs_through_bash_with_a_deny_id(tmp_path)
     assert done.returncode == 0, done.stderr
     stored = json.loads(at(home, SETTINGS).read_text(encoding="utf-8"))
     assert stored["permissions"]["deny"] == ["Read(.env)"]
-    assert stored["sandbox"]["enabled"] is True
+    assert stored["sandbox"] == {"enabled": True, "filesystem": {"allowWrite": [folder]}}
 
 
 def test_the_readme_shell_setup_completes_without_a_session(tmp_path):
@@ -772,7 +786,6 @@ def test_the_readme_first_use_says_how_to_file_stop_resume_and_where_ledger_runs
 def test_the_readme_says_where_it_talks_about_grants_that_auto_mode_is_the_default():
     text = README.read_text(encoding="utf-8")
     grants = "\n".join(section(text, "#### What setup writes"))
-    assert "Setup never proposes anything that grants" in grants
     assert "auto mode" in grants and "2.1.326" in grants and "shift+tab" in grants
 
 

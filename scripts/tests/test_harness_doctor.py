@@ -18,7 +18,7 @@ from harness_fixtures import (
 )
 
 setup = load_setup()
-ALL_IDS = [ident for ident, _text in setup.optional_items()]
+ALL_IDS = [ident for ident, _text in setup.optional_items({"enabled": True})]
 RULES, OVERRIDE, RECORD, DB, SETTINGS = (setup.RULES_REL, setup.OVERRIDE_REL, setup.RECORD_REL,
                                          setup.DB_REL, setup.SETTINGS_REL)
 
@@ -37,7 +37,8 @@ def args_for(ids):
 
 
 def finish_setup(home, bin_dir, ids=ALL_IDS):
-    applied = setup_run("apply", home, *args_for(ids), bin_dir=bin_dir)
+    applied = setup_run("apply", home, *args_for(ids), "--sandbox-folder",
+                        str(at(home, DB).parent), bin_dir=bin_dir)
     assert applied.rc == 0, applied.err
     show_stored(bin_dir)
     init = setup_run("ledger-init", home, bin_dir=bin_dir)
@@ -305,6 +306,38 @@ def test_doctor_notes_settings_items_when_the_settings_file_is_gone(tmp_path):
     gone = lines_of(lines, "note", "settings")
     assert len(gone) == 2 + len(setup.DENY_RULES)
     assert all("is already gone" in line and "is absent" in line for line in gone)
+
+
+
+@pytest.mark.parametrize("accepted", [True, False], ids=["accepted", "existing"])
+def test_doctor_reports_sandbox_on_without_recorded_ledger_folder(tmp_path, accepted):
+    home, bin_dir = fixture(tmp_path)
+    finish_setup(home, bin_dir, ids=["sandbox"] if accepted else [])
+    settings = at(home, SETTINGS)
+    data = json.loads(settings.read_bytes())
+    data["sandbox"] = {"enabled": True}
+    settings.write_text(json.dumps(data, indent=2) + "\n")
+    _rc, lines = doctor(home, bin_dir)
+    assert (f"note settings: sandbox is on but the recorded ledger folder is missing from "
+            f"its write paths in user settings: {at(home, DB).parent}") in lines
+
+
+def test_doctor_checks_the_recorded_custom_folder_not_the_default(tmp_path):
+    home, bin_dir = fixture(tmp_path)
+    database = home / "custom ledger" / "ledger.db"
+    done = setup_run("apply", home, "--db", str(database), "--approve", "sandbox",
+                     "--sandbox-folder", str(database.parent), bin_dir=bin_dir)
+    assert done.rc == 0, done.err
+    show_stored(bin_dir)
+    _rc, lines = doctor(home, bin_dir)
+    assert not any("missing from its write paths" in line for line in lines)
+    settings = at(home, SETTINGS)
+    data = json.loads(settings.read_bytes())
+    data["sandbox"]["filesystem"]["allowWrite"] = [str(at(home, DB).parent)]
+    settings.write_text(json.dumps(data, indent=2) + "\n")
+    _rc, lines = doctor(home, bin_dir)
+    assert (f"note settings: sandbox is on but the recorded ledger folder is missing from "
+            f"its write paths in user settings: {database.parent}") in lines
 
 
 def test_doctor_names_a_leftover_settings_backup_with_no_record(tmp_path):

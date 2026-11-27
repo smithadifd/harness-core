@@ -5,7 +5,8 @@ The setup skill drives this script. Plan writes nothing and takes no lock.
 Apply places the rules default, places the override starter when the person
 has none, and adds each approved settings item that is absent: a missing key,
 or a deny rule appended after the existing ones. It never changes, removes or
-reorders an existing entry, and nothing it proposes grants anything. Remove
+reorders an existing entry. The optional sandbox item includes one ledger
+folder write path when it is narrow enough. Remove
 takes out exactly what a complete setup record lists, and keeps and names
 anything the person has changed since. Update replaces the installed rules
 default with the plugin's current file only when the installed file's hash
@@ -135,12 +136,6 @@ DENY_RULES: tuple[str, ...] = (
     "Read(**/*.key)",
 )
 
-SANDBOX_VALUE: dict[str, Any] = {"enabled": True}
-
-# The one sandbox proposal setup may make, as canonical JSON (sorted keys, no
-# spaces). The proposal gate compares the proposal with this text exactly, so
-# any other value (an extra key, a nested setting, `1` for `true`) refuses.
-SAFE_SANDBOX = '{"enabled":true}'
 
 # The prompt-suggestions proposal: Claude Code's user setting
 # `promptSuggestionEnabled`, which its own settings schema describes as "When
@@ -310,6 +305,92 @@ def recorded_database(home: Path, body: dict[str, Any]) -> Path:
     return Path(raw)
 
 
+def resolve_missing_path(path: Path) -> Path:
+    """Resolve existing components strictly, allowing only a missing tail.
+
+    Resolve dangling symlink targets too, before taking the database's parent.
+    Unlike non-strict resolve on newer Python, loops and other errors propagate.
+    """
+    try:
+        return path.resolve(strict=True)
+    except FileNotFoundError:
+        if any(part in (".", "..") for part in path.parts):
+            raise ValueError("missing tail contains dot or dot-dot")
+        try:
+            target = Path(os.readlink(path))
+        except FileNotFoundError:
+            parent = resolve_missing_path(path.parent)
+            return parent / path.name
+        return resolve_missing_path(target if target.is_absolute() else path.parent / target)
+
+
+def file_identity(path: Path) -> tuple[int, int]:
+    """The file identity used by os.path.samefile, independent of its spelling."""
+    info = path.stat()
+    return info.st_dev, info.st_ino
+
+
+def sandbox_proposal(home: Path, database: Path) -> tuple[dict[str, Any], str | None]:
+    """Grant only a folder strictly inside home by ancestor file identity."""
+    value: dict[str, Any] = {"enabled": True}
+    try:
+        if not home.is_absolute() or not database.is_absolute():
+            raise ValueError("path is not absolute")
+        resolved_home = home.resolve(strict=True)
+        if not resolved_home.is_dir():
+            raise ValueError("home is not a folder")
+        folder = resolve_missing_path(database).parent
+        if not folder.is_absolute():
+            raise ValueError("folder is not absolute")
+        home_identity = file_identity(resolved_home)
+        current = folder
+        while True:
+            try:
+                current.lstat()
+                break
+            except FileNotFoundError:
+                if current.parent == current:
+                    raise
+                current = current.parent
+        inside_home = False
+        while True:
+            identity = file_identity(current)
+            if identity == home_identity:
+                if current == folder:
+                    return value, "the ledger folder is not inside the home folder"
+                inside_home = True
+            if current.parent == current:
+                break
+            current = current.parent
+        if not inside_home:
+            return value, "the ledger folder is not inside the home folder"
+    except (OSError, RuntimeError, ValueError):
+        return value, "the ledger folder or home folder cannot be resolved to an absolute folder"
+    value["filesystem"] = {"allowWrite": [str(folder)]}
+    return value, None
+
+
+def sandbox_note(reason: str) -> str:
+    return f"ledger folder was not added to the sandbox's write paths: {reason}"
+
+
+def check_sandbox_folder(sandbox: dict[str, Any], accepted: str | None) -> None:
+    """Bind approval to the exact plan spelling, and existing folder identity."""
+    proposed = sandbox.get("filesystem", {}).get("allowWrite", [""])[0]
+    refusal = "sandbox folder approval is missing or changed; show the plan and ask again"
+    if accepted is None or accepted != proposed:
+        raise SetupError(refusal)
+    if not proposed:
+        return  # Explicit approval of the bare sandbox switch.
+    try:
+        if file_identity(Path(accepted)) != file_identity(Path(proposed)):
+            raise SetupError(refusal)
+    except FileNotFoundError:
+        pass  # A missing ledger folder is permitted in the plan too.
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise SetupError(refusal) from exc
+
+
 def ledger_values(database: Path, operator: str, harness: str | None) -> dict[str, str]:
     values = {
         OPTION_DB: str(database),
@@ -324,9 +405,9 @@ def first_write_command(database: Path) -> list[str]:
     return ["ledger", "--db", str(database), *FIRST_WRITE]
 
 
-def optional_items() -> list[tuple[str, str]]:
+def optional_items(sandbox: dict[str, Any]) -> list[tuple[str, str]]:
     """(id, exact text to be added) for each optional settings proposal."""
-    items = [("sandbox", json.dumps({"sandbox": dict(SANDBOX_VALUE)}, indent=2))]
+    items = [("sandbox", json.dumps({"sandbox": sandbox}, indent=2))]
     for rule in DENY_RULES:
         items.append((f"deny:{rule}", rule))
     items.append((PROMPT_SUGGESTION_ID,
@@ -343,9 +424,11 @@ def proposal_is_granting(kind: str, name: str, value: Any) -> bool:
     return True
 
 
-def granting_proposals() -> list[str]:
+def granting_proposals(sandbox: dict[str, Any]) -> list[str]:
     found = []
-    if canonical(SANDBOX_VALUE) != SAFE_SANDBOX:
+    # Exactly the computed proposal, including its single resolved folder.
+    proposed = json.loads(dict(optional_items(sandbox))["sandbox"])
+    if canonical(proposed) != canonical({"sandbox": sandbox}):
         found.append("sandbox")
     for rule in DENY_RULES:
         if proposal_is_granting("deny", "deny", rule):
@@ -400,10 +483,10 @@ def comment_only(text: str) -> bool:
     return True
 
 
-def check_proposals() -> tuple[bytes, bytes]:
-    """The fixed proposal table grants nothing and the override starter is
-    HTML comments only. Returns the rules and override bytes."""
-    grants = granting_proposals()
+def check_proposals(sandbox: dict[str, Any]) -> tuple[bytes, bytes]:
+    """Only the exact sandbox proposal and the other non-granting items pass.
+    The override starter is HTML comments only."""
+    grants = granting_proposals(sandbox)
     if grants:
         raise SetupError("proposals grant: " + ", ".join(grants))
     override = load_source(OVERRIDE_SOURCE)
@@ -412,8 +495,8 @@ def check_proposals() -> tuple[bytes, bytes]:
     return load_source(RULES_SOURCE), override
 
 
-def approved_ids(approve: list[str], approve_all: bool) -> set[str]:
-    known = {ident for ident, _text in optional_items()}
+def approved_ids(approve: list[str], approve_all: bool, sandbox: dict[str, Any]) -> set[str]:
+    known = {ident for ident, _text in optional_items(sandbox)}
     found: set[str] = set()
     for ident in approve:
         if ident not in known:
@@ -425,7 +508,8 @@ def approved_ids(approve: list[str], approve_all: bool) -> set[str]:
 
 
 def format_plan(home: Path, database: Path, operator: str, harness: str | None) -> str:
-    rules, override = check_proposals()
+    sandbox, reason = sandbox_proposal(home, database)
+    rules, override = check_proposals(sandbox)
     values = ledger_values(database, operator, harness)
     # The default database is listed below the home like the other files; a
     # path --db gives is listed whole, since it may be anywhere.
@@ -459,8 +543,13 @@ def format_plan(home: Path, database: Path, operator: str, harness: str | None) 
         "changed only by an optional item below that you approve; Claude Code also "
         "stores the ledger options in it",
     ]
-    for ident, text in optional_items():
+    if reason:
+        lines.append(sandbox_note(reason))
+    for ident, text in optional_items(sandbox):
         lines.extend([f"OPTIONAL {ident}", "----", text, "----"])
+        if ident == "sandbox" and "filesystem" in sandbox:
+            lines.append("Turns on the sandbox and lets sandboxed commands write the ledger "
+                         f"folder {sandbox['filesystem']['allowWrite'][0]}")
     return "\n".join(lines) + "\n"
 
 
@@ -822,6 +911,22 @@ def valid_header(head: dict[str, Any] | None) -> bool:
             and head["backup"] in (None, BACKUP_REL))
 
 
+def valid_sandbox_record(value: Any) -> bool:
+    """Accept the old bare value or exactly one absolute recorded write path.
+    Do not resolve it again: the person's symlink targets may have changed."""
+    if same(value, {"enabled": True}):
+        return True
+    if not isinstance(value, dict) or set(value) != {"enabled", "filesystem"}:
+        return False
+    filesystem = value["filesystem"]
+    if value["enabled"] is not True or not isinstance(filesystem, dict):
+        return False
+    paths = filesystem.get("allowWrite")
+    return (set(filesystem) == {"allowWrite"} and isinstance(paths, list)
+            and len(paths) == 1 and isinstance(paths[0], str)
+            and os.path.isabs(paths[0]))
+
+
 def valid_item(item: Any) -> bool:
     if not isinstance(item, dict):
         return False
@@ -830,7 +935,7 @@ def valid_item(item: Any) -> bool:
         return False
     if item.get("kind") == "key":
         return (set(item) == {"kind", "name", "value", "index", "before", "after"}
-                and ((item["name"] == "sandbox" and same(item["value"], SANDBOX_VALUE))
+                and ((item["name"] == "sandbox" and valid_sandbox_record(item["value"]))
                      or (item["name"] == PROMPT_SUGGESTION_KEY
                          and same(item["value"], PROMPT_SUGGESTION_VALUE))))
     if item.get("kind") == "deny":
@@ -983,13 +1088,13 @@ def neighbours(seq: list[Any], index: int) -> tuple[Any, Any]:
 
 
 def add_items(settings: dict[str, Any],
-              ids: set[str]) -> tuple[list[dict[str, Any]], bool, bool]:
+              ids: set[str], sandbox: dict[str, Any]) -> tuple[list[dict[str, Any]], bool, bool]:
     """Add each approved item that is absent. Returns the items with their
     recorded places in the final settings, and whether permissions and
     permissions.deny were made. The caller has checked wrong_type."""
     added_sandbox = "sandbox" in ids and "sandbox" not in settings
     if added_sandbox:
-        settings["sandbox"] = dict(SANDBOX_VALUE)
+        settings["sandbox"] = json.loads(dict(optional_items(sandbox))["sandbox"])["sandbox"]
     added_prompt = PROMPT_SUGGESTION_ID in ids and PROMPT_SUGGESTION_KEY not in settings
     if added_prompt:
         settings[PROMPT_SUGGESTION_KEY] = PROMPT_SUGGESTION_VALUE
@@ -1015,7 +1120,7 @@ def add_items(settings: dict[str, Any],
         keys = list(settings)
         index = keys.index("sandbox")
         before, after = neighbours(keys, index)
-        items.append({"kind": "key", "name": "sandbox", "value": dict(SANDBOX_VALUE),
+        items.append({"kind": "key", "name": "sandbox", "value": settings["sandbox"],
                       "index": index, "before": before, "after": after})
     if added_prompt:
         keys = list(settings)
@@ -1126,13 +1231,14 @@ class Changes:
 
 
 def apply_verb(home: Path, database: Path, operator: str, harness: str | None,
-               approve: list[str], approve_all: bool) -> tuple[str, list[str]]:
+               approve: list[str], approve_all: bool,
+               sandbox_folder: str | None) -> tuple[str, list[str]]:
     tree = Tree(home)
     try:
         lock = take_lock(tree)
         try:
             return apply_locked(tree, lock, database, operator, harness, approve,
-                                approve_all)
+                                approve_all, sandbox_folder)
         finally:
             os.close(lock)
     finally:
@@ -1140,9 +1246,11 @@ def apply_verb(home: Path, database: Path, operator: str, harness: str | None,
 
 
 def apply_locked(tree: Tree, lock: int, database: Path, operator: str, harness: str | None,
-                 approve: list[str], approve_all: bool) -> tuple[str, list[str]]:
+                 approve: list[str], approve_all: bool,
+                 sandbox_folder: str | None) -> tuple[str, list[str]]:
     # Preconditions: no writes.
-    rules_bytes, override_bytes = check_proposals()
+    sandbox, reason = sandbox_proposal(tree.root, database)
+    rules_bytes, override_bytes = check_proposals(sandbox)
     raw, head, body = read_record(tree)
     if raw is not None:
         if body is not None:
@@ -1156,7 +1264,9 @@ def apply_locked(tree: Tree, lock: int, database: Path, operator: str, harness: 
     tree.entry(OVERRIDE_REL)
     tree.entry(SETTINGS_REL)
     claude = which_claude()
-    ids = approved_ids(approve, approve_all)
+    ids = approved_ids(approve, approve_all, sandbox)
+    if "sandbox" in ids:
+        check_sandbox_folder(sandbox, sandbox_folder)
     check_types(tree, read_settings(tree), ids)
 
     # Configure, then the settings bytes apply builds on.
@@ -1171,10 +1281,10 @@ def apply_locked(tree: Tree, lock: int, database: Path, operator: str, harness: 
                          f"{CONFIGURE_STAYS}") from exc
 
     changes = Changes()
-    notes: list[str] = []
+    notes: list[str] = [sandbox_note(reason)] if reason else []
     try:
         apply_changes(tree, changes, base, ids, rules_bytes, override_bytes, notes,
-                      database)
+                      database, sandbox)
     except Exception as exc:
         raise rollback(tree, changes, exc) from exc
 
@@ -1200,7 +1310,7 @@ CONFIGURE_STAYS = "the ledger options claude plugin configure set stay set"
 
 def apply_changes(tree: Tree, changes: Changes, base: tuple[bytes, int, dict[str, Any]] | None,
                   ids: set[str], rules_bytes: bytes, override_bytes: bytes,
-                  notes: list[str], database: Path) -> None:
+                  notes: list[str], database: Path, sandbox: dict[str, Any]) -> None:
     def made(rel: str) -> None:
         changes.dirs.append(rel)
 
@@ -1242,7 +1352,7 @@ def apply_changes(tree: Tree, changes: Changes, base: tuple[bytes, int, dict[str
 
     # Settings, only when an approved item is absent.
     obj = json.loads(json.dumps(base[2])) if base is not None else {}
-    items, created_permissions, created_deny = add_items(obj, ids)
+    items, created_permissions, created_deny = add_items(obj, ids, sandbox)
     info = {"created": False, "sha256": None, "items": [],
             "created_permissions": False, "created_deny": False}
     if items:
@@ -1540,6 +1650,13 @@ def update_locked(tree: Tree) -> tuple[str, list[str]]:
         raise SetupError(f"no record at {tree.show(RECORD_REL)}")
     if body is None:
         raise hard_stop_refusal(tree, head)
+    sandbox, _reason = sandbox_proposal(tree.root, recorded_database(tree.root, body))
+    notes = ""
+    for item in body["settings"]["items"]:
+        if (item["kind"] == "key" and item["name"] == "sandbox"
+                and not same(item["value"], sandbox)):
+            notes = ("note: sandbox proposal differs from the recorded value; settings left "
+                     f"unchanged; optional proposal: {canonical({'sandbox': sandbox})}\n")
     shown = tree.show(RULES_REL)
     recorded = recorded_rules_hash(body)
     if not is_hex64(recorded):
@@ -1553,7 +1670,7 @@ def update_locked(tree: Tree) -> tuple[str, list[str]]:
     default = load_source(RULES_SOURCE)
     new_sha = digest(default)
     if live_sha == new_sha:
-        return f"already current: {shown}\n", []
+        return notes + f"already current: {shown}\n", []
     new_record = record_with_rules_hash(head, body, new_sha)
     record_mode = tree.read(RECORD_REL)
     tree.replace(RULES_REL, default, found[0], "update", lambda: None,
@@ -1569,7 +1686,7 @@ def update_locked(tree: Tree) -> tuple[str, list[str]]:
             raise
         restore_rules(tree, found, default, recorded, new_sha, exc)
         raise
-    return f"updated: {shown}\n", []
+    return notes + f"updated: {shown}\n", []
 
 
 def restore_rules(tree: Tree, previous: tuple[bytes, int], default: bytes,
@@ -1844,11 +1961,31 @@ def doctor_settings(tree: Tree, body: dict[str, Any] | None, report: Report) -> 
     if body is None:
         return
     info = body["settings"]
+    found = read_settings(tree)
+    sandbox = found[2].get("sandbox") if found else None
+    if isinstance(sandbox, dict) and sandbox.get("enabled") is True:
+        expected, reason = sandbox_proposal(tree.root, recorded_database(tree.root, body))
+        if reason:
+            report.add("note", "settings", sandbox_note(reason))
+        else:
+            folder = expected["filesystem"]["allowWrite"][0]
+            filesystem = sandbox.get("filesystem")
+            paths = filesystem.get("allowWrite") if isinstance(filesystem, dict) else None
+            # Claude Code accepts ~ and combines paths from settings scopes.
+            # Doctor can only inspect this user settings file.
+            present = isinstance(paths, list) and any(
+                isinstance(path, str) and (
+                    path == folder or (path.startswith("~/")
+                                       and str(tree.root / path[2:]) == folder))
+                for path in paths)
+            if not present:
+                report.add("note", "settings",
+                           f"sandbox is on but the recorded ledger folder is missing from "
+                           f"its write paths in user settings: {folder}")
     if not info["items"]:
         report.add("ok", "settings", "setup added no settings item")
         return
     shown = tree.show(SETTINGS_REL)
-    found = read_settings(tree)
     for item in info["items"]:
         label = item_label(item)
         if found is None:
@@ -2269,6 +2406,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="approve one optional settings proposal by id")
     parser.add_argument("--approve-all", action="store_true",
                         help="approve every optional settings proposal")
+    parser.add_argument("--sandbox-folder", default=None,
+                        help="the exact absolute folder accepted from the sandbox plan "
+                             "(apply); an empty value accepts no write path")
     parser.add_argument("--db", default=None,
                         help="the absolute path of the ledger database (plan, apply and "
                              "ledger-init); a database already there is used as it is")
@@ -2315,7 +2455,7 @@ def run(argv: list[str]) -> tuple[str, list[str], int]:
     if args.verb == "plan":
         return format_plan(home, database, args.operator, harness), [], 0
     out, warnings = apply_verb(home, database, args.operator, harness, args.approve,
-                               args.approve_all)
+                               args.approve_all, args.sandbox_folder)
     return out, warnings, 0
 
 

@@ -313,7 +313,8 @@ def run(verb: str, home: Path, *extra: str, bin_dir: Path | None = None,
 
 
 def apply_all(home: Path, bin_dir: Path, **kw) -> SimpleNamespace:
-    return run("apply", home, "--approve-all", bin_dir=bin_dir, **kw)
+    return run("apply", home, "--approve-all", "--sandbox-folder",
+               str(home / ".local/share/ledger"), bin_dir=bin_dir, **kw)
 
 
 def points(events: list[dict], op: str, rel_suffix: str = "") -> list[int]:
@@ -392,18 +393,18 @@ def test_plan_prints_two_files_options_and_items_as_exact_text(tmp_path):
               "ledger_operator": OPERATOR, "ledger_harness": HARNESS}
     assert json.dumps(values, indent=2) in done.out
     assert f"claude plugin configure {mod.LEDGER_PLUGIN} --values-stdin" in done.out
-    for ident, text in mod.optional_items():
+    sandbox, _reason = mod.sandbox_proposal(home, mod.database_path(home))
+    for ident, text in mod.optional_items(sandbox):
         assert f"OPTIONAL {ident}\n----\n{text}\n----\n" in done.out
     lower = done.out.lower()
     for word in ("allow(", "additionaldirectories", "extradirectories", "autoallow"):
         assert word not in lower
 
 
-def test_proposals_grant_nothing_and_the_starter_is_comments_only():
-    assert mod.granting_proposals() == []
-    assert set(mod.SANDBOX_VALUE) == {"enabled"} and mod.SANDBOX_VALUE["enabled"] is True
-    assert mod.SAFE_SANDBOX == '{"enabled":true}'
-    assert mod.canonical(mod.SANDBOX_VALUE) == mod.SAFE_SANDBOX
+def test_proposals_grant_nothing_else_and_the_starter_is_comments_only(tmp_path):
+    home = make_home(tmp_path)
+    sandbox, _reason = mod.sandbox_proposal(home, mod.database_path(home))
+    assert mod.granting_proposals(sandbox) == []
     for rule in mod.DENY_RULES:
         assert rule.startswith("Read(")
     starter = OVERRIDE_SOURCE.read_text(encoding="utf-8")
@@ -415,14 +416,14 @@ def test_proposals_grant_nothing_and_the_starter_is_comments_only():
 def test_a_granting_proposal_or_a_non_comment_starter_refuses(monkeypatch, tmp_path):
     monkeypatch.setattr(mod, "DENY_RULES", mod.DENY_RULES + ("Allow(everything)",))
     with pytest.raises(mod.SetupError, match=r"^proposals grant: deny:Allow\(everything\)$"):
-        mod.check_proposals()
+        mod.check_proposals({"enabled": True})
     monkeypatch.undo()
     starter = tmp_path / "harness-local.md"
     starter.write_text("<!-- comment -->\nallow = yes\n", encoding="utf-8")
     monkeypatch.setattr(mod, "OVERRIDE_SOURCE", starter)
     with pytest.raises(mod.SetupError,
                        match="^override starter has a line that is not a comment$"):
-        mod.check_proposals()
+        mod.check_proposals({"enabled": True})
 
 
 @pytest.mark.parametrize("value", [
@@ -434,10 +435,369 @@ def test_a_granting_proposal_or_a_non_comment_starter_refuses(monkeypatch, tmp_p
     {},
 ], ids=["widened", "auto-allow", "excluded", "one-for-true", "disabled", "empty"])
 def test_any_sandbox_proposal_but_the_one_safe_value_refuses(monkeypatch, value):
-    monkeypatch.setattr(mod, "SANDBOX_VALUE", value)
+    original = mod.optional_items
+    monkeypatch.setattr(mod, "optional_items", lambda sandbox: [
+        (ident, json.dumps({"sandbox": value}) if ident == "sandbox" else text)
+        for ident, text in original(sandbox)])
     with pytest.raises(mod.SetupError, match=r"^proposals grant: sandbox$"):
-        mod.check_proposals()
+        mod.check_proposals({"enabled": True})
 
+
+@pytest.mark.parametrize("case", ["relative-database", "missing-home", "unreadable-home",
+                                 "relative-folder"])
+def test_sandbox_unresolvable_folder_fails_closed(tmp_path, monkeypatch, case):
+    home = make_home(tmp_path)
+    database = mod.database_path(home)
+    if case == "relative-database":
+        database = Path("ledger.db")
+    elif case == "missing-home":
+        home = tmp_path / "absent"
+    else:
+        original = Path.resolve
+
+        def resolve(path, *args, **kwargs):
+            if case == "unreadable-home" and path == home:
+                raise PermissionError("unreadable")
+            if case == "relative-folder" and path == database:
+                return Path("ledger/ledger.db")
+            return original(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "resolve", resolve)
+    value, reason = mod.sandbox_proposal(home, database)
+    assert value == {"enabled": True}, "an unresolved folder granted sandbox writes"
+    assert reason == "the ledger folder or home folder cannot be resolved to an absolute folder"
+
+
+def test_sandbox_custom_database_resolves_folder_and_apply_matches_plan(tmp_path):
+    bin_dir = install(tmp_path)
+    home = make_home(tmp_path)
+    folder = home / "actual ledger"
+    folder.mkdir()
+    link = tmp_path / "ledger link"
+    link.symlink_to(folder, target_is_directory=True)
+    database = link / "ledger.db"
+    done = run("plan", home, "--db", str(database))
+    assert done.rc == 0, done.err
+    text = done.out.split("OPTIONAL sandbox\n----\n", 1)[1].split("\n----", 1)[0]
+    expected = {"sandbox": {"enabled": True, "filesystem": {"allowWrite": [str(folder)]}}}
+    assert json.loads(text) == expected
+    done = run("apply", home, "--db", str(database), "--approve", "sandbox",
+               "--sandbox-folder", str(folder), bin_dir=bin_dir)
+    assert done.rc == 0, done.err
+    assert json.loads(at(home, mod.SETTINGS_REL).read_bytes())["sandbox"] == expected["sandbox"]
+
+
+@pytest.mark.parametrize("target", ["other-folder", "home"])
+def test_sandbox_apply_refuses_retargeted_database_after_consent(tmp_path, target):
+    bin_dir = install(tmp_path)
+    home = make_home(tmp_path)
+    accepted = home / "accepted"
+    changed = home / "changed"
+    accepted.mkdir()
+    changed = home if target == "home" else changed
+    changed.mkdir(exist_ok=True)
+    database = tmp_path / "ledger.db"
+    database.symlink_to(accepted / "ledger.db")
+    plan = run("plan", home, "--db", str(database))
+    assert plan.rc == 0, plan.err
+    text = plan.out.split("OPTIONAL sandbox\n----\n", 1)[1].split("\n----", 1)[0]
+    folder = json.loads(text)["sandbox"]["filesystem"]["allowWrite"][0]
+    database.unlink()
+    database.symlink_to(changed / "ledger.db")
+    before = snap(home)
+    done = run("apply", home, "--db", str(database), "--approve", "sandbox",
+               "--sandbox-folder", folder, bin_dir=bin_dir)
+    assert done.rc == 1, "apply granted a folder different from the accepted plan"
+    assert one_refusal(done) == "setup: sandbox folder approval is missing or changed; show the plan and ask again"
+    assert unchanged(before, snap(home)), "a changed sandbox proposal wrote settings"
+    assert not (bin_dir / "claude-argv").exists()
+
+
+@pytest.mark.parametrize("approval", [("--approve", "sandbox"), ("--approve-all",)],
+                         ids=["sandbox", "all"])
+def test_sandbox_apply_requires_accepted_folder(tmp_path, approval):
+    bin_dir = install(tmp_path)
+    home = make_home(tmp_path)
+    before = snap(home)
+    done = run("apply", home, *approval, bin_dir=bin_dir)
+    assert done.rc == 1, "apply granted sandbox writes without an accepted folder"
+    assert one_refusal(done) == "setup: sandbox folder approval is missing or changed; show the plan and ask again"
+    assert unchanged(before, snap(home))
+    assert not (bin_dir / "claude-argv").exists()
+
+
+@pytest.mark.parametrize("fault", ["changed", "unreadable"])
+def test_sandbox_accepted_folder_identity_fails_closed(tmp_path, monkeypatch, fault):
+    home = make_home(tmp_path)
+    folder = home / "ledger"
+    folder.mkdir()
+    sandbox, reason = mod.sandbox_proposal(home, folder / "ledger.db")
+    assert reason is None
+    original = mod.file_identity
+    calls = 0
+
+    def identity(path):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            if fault == "unreadable":
+                raise PermissionError("unreadable accepted folder")
+            return (0, 0)
+        return original(path)
+
+    monkeypatch.setattr(mod, "file_identity", identity)
+    with pytest.raises(mod.SetupError, match="^sandbox folder approval is missing or changed; "
+                       "show the plan and ask again$"):
+        mod.check_sandbox_folder(sandbox, str(folder))
+
+
+def test_sandbox_symlink_to_home_is_not_a_write_path(tmp_path):
+    home = make_home(tmp_path)
+    link = tmp_path / "ledger link"
+    link.symlink_to(home, target_is_directory=True)
+    value, reason = mod.sandbox_proposal(home, link / "ledger.db")
+    assert value == {"enabled": True}
+    assert reason == "the ledger folder is not inside the home folder"
+
+
+@pytest.mark.parametrize("wide", [False, True], ids=["narrow-target", "home-target"])
+def test_sandbox_database_symlink_uses_target_folder(tmp_path, wide):
+    home = make_home(tmp_path)
+    folder = home if wide else home / "target ledger"
+    folder.mkdir(exist_ok=True)
+    link_folder = tmp_path / "links"
+    link_folder.mkdir()
+    database = link_folder / "ledger.db"
+    database.symlink_to(folder / "actual.db")
+    done = run("plan", home, "--db", str(database))
+    assert done.rc == 0, done.err
+    text = done.out.split("OPTIONAL sandbox\n----\n", 1)[1].split("\n----", 1)[0]
+    expected = {"enabled": True}
+    if not wide:
+        expected["filesystem"] = {"allowWrite": [str(folder)]}
+    assert json.loads(text) == {"sandbox": expected}, "sandbox did not use the database target folder"
+
+
+@pytest.mark.parametrize("existing", [False, True], ids=["missing-tail", "existing"])
+def test_sandbox_default_folder(tmp_path, existing):
+    home = make_home(tmp_path)
+    if existing:
+        (home / ".local/share/ledger").mkdir(parents=True)
+    done = run("plan", home)
+    assert done.rc == 0, done.err
+    text = done.out.split("OPTIONAL sandbox\n----\n", 1)[1].split("\n----", 1)[0]
+    assert json.loads(text) == {"sandbox": {"enabled": True, "filesystem": {
+        "allowWrite": [str(home / ".local/share/ledger")]}}}
+
+
+@pytest.mark.parametrize("where", ["home", "root", "ancestor", "outside"])
+def test_sandbox_folder_not_inside_home(tmp_path, where):
+    home = make_home(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    folder = {"home": home, "root": Path(home.anchor),
+              "ancestor": home.parent, "outside": outside}[where]
+    done = run("plan", home, "--db", str(folder / "ledger.db"))
+    assert done.rc == 0, done.err
+    text = done.out.split("OPTIONAL sandbox\n----\n", 1)[1].split("\n----", 1)[0]
+    assert json.loads(text) == {"sandbox": {"enabled": True}}, "a folder not inside home granted sandbox writes"
+    reasons = [line for line in done.out.splitlines()
+               if "ledger folder was not added to the sandbox's write paths" in line]
+    assert len(reasons) == 1
+    assert reasons[0] == mod.sandbox_note("the ledger folder is not inside the home folder")
+    if where == "outside":
+        done = run("apply", home, "--db", str(folder / "ledger.db"), "--approve", "sandbox",
+                   "--sandbox-folder", "", bin_dir=install(tmp_path))
+        assert done.rc == 0, done.err
+        assert json.loads(at(home, mod.SETTINGS_REL).read_bytes())["sandbox"] == {"enabled": True}
+        assert mod.sandbox_note("the ledger folder is not inside the home folder") in done.out
+
+
+@pytest.mark.parametrize("where", ["home", "root", "ancestor"])
+def test_sandbox_folder_alias_is_not_a_write_path(tmp_path, monkeypatch, where):
+    home = make_home(tmp_path)
+    alias = tmp_path / "alias"
+    alias.mkdir()
+    target = {"home": home, "root": Path(home.anchor), "ancestor": home.parent}[where]
+    original = mod.file_identity
+
+    def identity(path):
+        return original(target if path == alias else path)
+
+    monkeypatch.setattr(mod, "file_identity", identity)
+    value, reason = mod.sandbox_proposal(home, alias / "ledger.db")
+    assert value == {"enabled": True}, "a folder alias granted sandbox writes"
+    assert reason == "the ledger folder is not inside the home folder"
+
+
+@pytest.mark.parametrize("where", ["alias-root", "alias-parent"])
+def test_sandbox_alias_root_and_parent_are_not_inside_home(tmp_path, monkeypatch, where):
+    home = make_home(tmp_path)
+    parent = tmp_path / "volume"
+    root = parent / "Data"
+    alias = root.joinpath(*home.parts[1:])
+    alias.mkdir(parents=True)
+    original = mod.file_identity
+
+    def identity(path):
+        return original(home if path == alias else path)
+
+    monkeypatch.setattr(mod, "file_identity", identity)
+    folder = root if where == "alias-root" else parent
+    value, reason = mod.sandbox_proposal(home, folder / "ledger.db")
+    assert value == {"enabled": True}, "an alias root or its parent granted sandbox writes"
+    assert reason == "the ledger folder is not inside the home folder"
+
+
+@pytest.mark.parametrize("existing", [False, True], ids=["missing-tail", "existing"])
+def test_sandbox_folder_inside_home_alias_gets_write_path(tmp_path, monkeypatch, existing):
+    home = make_home(tmp_path)
+    alias = tmp_path / "alias"
+    alias.mkdir()
+    folder = alias / "ledger"
+    if existing:
+        folder.mkdir()
+    original = mod.file_identity
+
+    def identity(path):
+        return original(home if path == alias else path)
+
+    monkeypatch.setattr(mod, "file_identity", identity)
+    value, reason = mod.sandbox_proposal(home, folder / "ledger.db")
+    assert value == {"enabled": True, "filesystem": {"allowWrite": [str(folder)]}}, \
+        "a folder inside home by identity lost its sandbox write path"
+    assert reason is None
+
+
+def test_sandbox_missing_tail_dot_dot_fails_closed(tmp_path):
+    home = make_home(tmp_path)
+    value, reason = mod.sandbox_proposal(home, home / "missing" / ".." / "ledger.db")
+    assert value == {"enabled": True}, "a missing tail with dot-dot granted sandbox writes"
+    assert reason == "the ledger folder or home folder cannot be resolved to an absolute folder"
+
+
+@pytest.mark.parametrize("where", ["folder", "home", "root", "ancestor"])
+def test_sandbox_unreadable_identity_fails_closed(tmp_path, monkeypatch, where):
+    home = make_home(tmp_path)
+    ancestor = home / "data"
+    folder = ancestor / "ledger"
+    folder.mkdir(parents=True)
+    target = {"folder": folder, "home": home, "root": Path(home.anchor),
+              "ancestor": ancestor}[where]
+    original = mod.file_identity
+
+    def identity(path):
+        if path == target:
+            raise PermissionError("unreadable identity")
+        return original(path)
+
+    monkeypatch.setattr(mod, "file_identity", identity)
+    value, reason = mod.sandbox_proposal(home, folder / "ledger.db")
+    assert value == {"enabled": True}, "an unreadable identity granted sandbox writes"
+    assert reason == "the ledger folder or home folder cannot be resolved to an absolute folder"
+
+
+@pytest.mark.parametrize("loop_at", ["folder", "database"])
+@pytest.mark.parametrize("verb", ["plan", "apply"])
+def test_sandbox_symlink_loop_fails_closed(tmp_path, verb, loop_at):
+    bin_dir = install(tmp_path)
+    home = make_home(tmp_path, b'{"sandbox": {"enabled": true}}\n')
+    folder = home / "ledger"
+    folder.mkdir()
+    (folder / "loopA").symlink_to("loopB")
+    (folder / "loopB").symlink_to("loopA")
+    database = folder / "loopA"
+    if loop_at == "folder":
+        database /= "ledger.db"
+    settings = at(home, mod.SETTINGS_REL)
+    before = settings.read_bytes()
+    args = ("--approve", "sandbox", "--sandbox-folder", "") if verb == "apply" else ()
+    done = run(verb, home, "--db", str(database), *args, bin_dir=bin_dir)
+    assert done.rc == 0, done.err
+    assert "ledger folder was not added to the sandbox's write paths: " \
+           "the ledger folder or home folder cannot be resolved to an absolute folder" in done.out
+    if verb == "plan":
+        text = done.out.split("OPTIONAL sandbox\n----\n", 1)[1].split("\n----", 1)[0]
+        assert json.loads(text) == {"sandbox": {"enabled": True}}
+    assert settings.read_bytes() == before, "an unresolved folder changed existing settings"
+    assert "allowWrite" not in settings.read_text()
+
+
+def test_sandbox_consent_names_folder(tmp_path):
+    home = make_home(tmp_path)
+    folder = home / "chosen ledger"
+    done = run("plan", home, "--db", str(folder / "ledger.db"))
+    assert done.rc == 0, done.err
+    assert f"and lets sandboxed commands write the ledger folder {folder}" in done.out
+
+
+@pytest.mark.parametrize("how", ["extra-key", "second-path", "relative", "different-folder"])
+def test_sandbox_gate_refuses_other_paths(tmp_path, monkeypatch, how):
+    home = make_home(tmp_path)
+    expected, _reason = mod.sandbox_proposal(home, mod.database_path(home))
+    value = json.loads(json.dumps(expected))
+    paths = value["filesystem"]["allowWrite"]
+    if how == "extra-key":
+        value["network"] = {}
+    elif how == "second-path":
+        paths.append(str(tmp_path / "other"))
+    elif how == "relative":
+        paths[0] = "ledger"
+    else:
+        paths[0] = str(tmp_path / "other")
+    original = mod.optional_items
+    monkeypatch.setattr(mod, "optional_items", lambda sandbox: [
+        (ident, json.dumps({"sandbox": value}) if ident == "sandbox" else text)
+        for ident, text in original(sandbox)])
+    with pytest.raises(mod.SetupError, match=r"^proposals grant: sandbox$"):
+        mod.check_proposals(expected)
+
+
+def test_sandbox_round_trip_preserves_owned_and_later_paths(tmp_path):
+    bin_dir = install(tmp_path)
+    home = make_home(tmp_path, b'{\n  "model": "kept"\n}\n')
+    settings = at(home, mod.SETTINGS_REL)
+    original = settings.read_bytes()
+    assert run("apply", home, "--approve", "sandbox", "--sandbox-folder",
+               str(home / ".local/share/ledger"), bin_dir=bin_dir).rc == 0
+    assert run("remove", home).rc == 0
+    assert settings.read_bytes() == original
+    assert run("apply", home, "--approve", "sandbox", "--sandbox-folder",
+               str(home / ".local/share/ledger"), bin_dir=bin_dir).rc == 0
+    data = json.loads(settings.read_bytes())
+    data["sandbox"]["filesystem"]["allowWrite"].append(str(tmp_path / "later"))
+    later = (json.dumps(data, indent=2) + "\n").encode()
+    settings.write_bytes(later)
+    assert run("remove", home).rc == 0
+    assert settings.read_bytes() == later, "remove took a sandbox path the person added"
+    assert run("apply", home, "--approve", "sandbox", "--sandbox-folder",
+               str(home / ".local/share/ledger"), bin_dir=bin_dir).rc == 0
+    assert run("remove", home).rc == 0
+    assert settings.read_bytes() == later, "remove took a sandbox block present before apply"
+
+
+def test_sandbox_old_record_update_reports_without_widening(tmp_path):
+    bin_dir = install(tmp_path)
+    home = make_home(tmp_path)
+    assert run("apply", home, "--approve", "sandbox", "--sandbox-folder",
+               str(home / ".local/share/ledger"), bin_dir=bin_dir).rc == 0
+    settings = at(home, mod.SETTINGS_REL)
+    data = json.loads(settings.read_bytes())
+    data["sandbox"] = {"enabled": True}
+    settings.write_text(json.dumps(data, indent=2) + "\n")
+    lines = record_bytes(home).splitlines()
+    body = json.loads(lines[1])
+    for item in body["settings"]["items"]:
+        if item.get("name") == "sandbox":
+            item["value"] = {"enabled": True}
+    body["settings"]["sha256"] = sha(settings.read_bytes())
+    at(home, mod.RECORD_REL).write_bytes(lines[0] + b"\n" + mod.json_line(body))
+    before = settings.read_bytes()
+    done = run("update", home)
+    assert done.rc == 0, done.err
+    assert settings.read_bytes() == before
+    assert "sandbox proposal differs from the recorded value; settings left unchanged" in done.out
+    assert str(home / ".local/share/ledger") in done.out
 
 # A `#` line in a .md rules file is a Markdown heading, which Claude Code reads
 # as an instruction. The starter may hold only blank lines and whole HTML
@@ -472,7 +832,7 @@ def test_a_starter_line_that_is_not_a_whole_html_comment_refuses(monkeypatch, tm
     monkeypatch.setattr(mod, "OVERRIDE_SOURCE", path)
     with pytest.raises(mod.SetupError,
                        match="^override starter has a line that is not a comment$"):
-        mod.check_proposals()
+        mod.check_proposals({"enabled": True})
 
 
 @pytest.mark.parametrize("starter", [
@@ -496,7 +856,8 @@ def test_apply_places_both_files_adds_items_and_records_them(tmp_path):
     assert at(home, mod.OVERRIDE_REL).read_bytes() == OVERRIDE_SOURCE.read_bytes()
     data = json.loads(at(home, mod.SETTINGS_REL).read_bytes())
     assert data["model"] == "kept"
-    assert data["sandbox"] == {"enabled": True}
+    assert data["sandbox"] == {"enabled": True, "filesystem": {
+        "allowWrite": [str(home / ".local/share/ledger")]}}
     assert data["permissions"]["deny"] == ["Read(seeded)", *mod.DENY_RULES]
     assert mod.granting_in_settings(data) == []
     raw = record_bytes(home)
@@ -578,9 +939,11 @@ def test_sandbox_only_apply_and_remove(tmp_path):
     bin_dir = install(tmp_path)
     home = make_home(tmp_path, b'{\n  "model": "kept"\n}\n')
     before = snap(home)
-    assert run("apply", home, "--approve", "sandbox", bin_dir=bin_dir).rc == 0
+    assert run("apply", home, "--approve", "sandbox", "--sandbox-folder",
+               str(home / ".local/share/ledger"), bin_dir=bin_dir).rc == 0
     data = json.loads(at(home, mod.SETTINGS_REL).read_bytes())
-    assert data == {"model": "kept", "sandbox": {"enabled": True}}
+    assert data == {"model": "kept", "sandbox": {"enabled": True, "filesystem": {
+        "allowWrite": [str(home / ".local/share/ledger")]}}}
     assert run("remove", home).rc == 0
     assert unchanged(before, snap(home))
 
@@ -771,7 +1134,8 @@ def test_a_present_key_of_the_wrong_type_refuses_before_any_write(tmp_path, sett
     bin_dir = install(tmp_path)
     home = make_home(tmp_path, (json.dumps(settings, indent=2) + "\n").encode())
     before = snap(home)
-    done = run("apply", home, "--approve", approve, bin_dir=bin_dir)
+    done = run("apply", home, "--approve", approve, "--sandbox-folder",
+               str(home / ".local/share/ledger"), bin_dir=bin_dir)
     assert one_refusal(done) == (
         f"setup: {at(home, mod.SETTINGS_REL)}: {problem}; setup does not overwrite it")
     assert writes_before_first(done.events, home) == []
@@ -797,10 +1161,12 @@ def test_a_wrong_type_no_approved_item_touches_is_left_alone(tmp_path):
     raw = b'{\n  "permissions": null\n}\n'
     home = make_home(tmp_path, raw)
     before = snap(home)
-    done = run("apply", home, "--approve", "sandbox", bin_dir=bin_dir)
+    done = run("apply", home, "--approve", "sandbox", "--sandbox-folder",
+               str(home / ".local/share/ledger"), bin_dir=bin_dir)
     assert done.rc == 0, done.err
     data = json.loads(at(home, mod.SETTINGS_REL).read_bytes())
-    assert data == {"permissions": None, "sandbox": {"enabled": True}}
+    assert data == {"permissions": None, "sandbox": {"enabled": True, "filesystem": {
+        "allowWrite": [str(home / ".local/share/ledger")]}}}
     assert run("remove", home).rc == 0
     assert unchanged(before, snap(home))
 
@@ -894,7 +1260,8 @@ def test_a_sigkill_at_every_apply_point_keeps_the_promise(tmp_path, pre):
         home = fresh(tmp_path, f"k{k}", pre)
         killed = apply_all(home, bin_dir, hooks={"kill_after": k})
         assert killed.rc == -signal.SIGKILL, (k, killed.rc, killed.err)
-        outcomes.add(check_hard_stop_state(tmp_path, home, bin_dir, pre, post, k))
+        expected_post = post.replace(str(template).encode(), str(home).encode())
+        outcomes.add(check_hard_stop_state(tmp_path, home, bin_dir, pre, expected_post, k))
     expected = {"none", "complete", "unfinished-present" if pre else "unfinished-none"}
     if pre is not None:
         expected.add("unfinished-absent")
@@ -918,8 +1285,8 @@ def test_an_unfinished_record_refuses_apply_and_remove(tmp_path, shape):
         "no-newline": raw[:-1],
         "bad-header": line1.replace(b"harness-setup", b"harness-other") + line2,
         # `1` is not the `true` setup writes: the compare is type-strict.
-        "sandbox-value-one": line1 + line2.replace(b'"value": {"enabled": true}',
-                                                   b'"value": {"enabled": 1}'),
+        "sandbox-value-one": line1 + line2.replace(b'"value": {"enabled": true,',
+                                                   b'"value": {"enabled": 1,'),
         # The prompt-suggestions item is recorded as `false`: `0` and `true` are not it.
         "prompt-value-zero": line1 + line2.replace(b'"value": false', b'"value": 0'),
         "prompt-value-true": line1 + line2.replace(b'"value": false', b'"value": true'),
@@ -1009,7 +1376,8 @@ def start_and_wait_for_configure(tmp_path: Path, home: Path) -> tuple[subprocess
     bin_dir = install(tmp_path, CLAUDE_SLEEP)
     env = dict(os.environ, PATH=safe_path(bin_dir))
     proc = subprocess.Popen([sys.executable, str(SCRIPT), "apply", "--home", str(home),
-                             "--operator", OPERATOR, "--approve-all"],
+                             "--operator", OPERATOR, "--approve-all", "--sandbox-folder",
+                             str(home / ".local/share/ledger")],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
                             start_new_session=True)
     marker = bin_dir / "claude-pid"
@@ -1097,8 +1465,9 @@ def test_a_short_write_is_finished_or_rolled_back(tmp_path, kind):
             assert at(home, mod.RULES_REL).read_bytes() == RULES_SOURCE.read_bytes(), k
             assert at(home, mod.OVERRIDE_REL).read_bytes() == OVERRIDE_SOURCE.read_bytes(), k
             assert mod.parse_record(record_bytes(home))[1] is not None, k
-            assert at(template, mod.SETTINGS_REL).read_bytes() == \
-                at(home, mod.SETTINGS_REL).read_bytes(), k
+            expected = at(template, mod.SETTINGS_REL).read_bytes().replace(
+                str(template).encode(), str(home).encode())
+            assert expected == at(home, mod.SETTINGS_REL).read_bytes(), k
         else:
             line = one_refusal(done)
             assert "os.write wrote nothing" in line, (k, line)
@@ -1742,7 +2111,8 @@ def test_the_sandbox_key_is_recorded_at_its_place_in_the_final_settings(tmp_path
     assert apply_all(home, bin_dir).rc == 0
     _head, body = mod.parse_record(record_bytes(home))
     key = [item for item in body["settings"]["items"] if item["kind"] == "key"]
-    assert key == [{"kind": "key", "name": "sandbox", "value": {"enabled": True}, "index": 1,
+    assert key == [{"kind": "key", "name": "sandbox", "value": {"enabled": True,
+                    "filesystem": {"allowWrite": [str(home / ".local/share/ledger")]}}, "index": 1,
                     "before": "model", "after": "promptSuggestionEnabled"},
                    {"kind": "key", "name": "promptSuggestionEnabled", "value": False,
                     "index": 2, "before": "sandbox", "after": "permissions"}]
@@ -1755,7 +2125,8 @@ def test_the_sandbox_key_is_recorded_at_its_place_in_the_final_settings(tmp_path
 def test_remove_keeps_and_names_a_moved_or_changed_sandbox_key(tmp_path, how):
     bin_dir = install(tmp_path)
     home = make_home(tmp_path, b'{\n  "model": "kept"\n}\n')
-    assert run("apply", home, "--approve", "sandbox", bin_dir=bin_dir).rc == 0
+    assert run("apply", home, "--approve", "sandbox", "--sandbox-folder",
+               str(home / ".local/share/ledger"), bin_dir=bin_dir).rc == 0
     settings = at(home, mod.SETTINGS_REL)
     data = json.loads(settings.read_bytes())
     assert list(data) == ["model", "sandbox"]
@@ -2026,7 +2397,7 @@ def test_a_missing_plugin_file_refuses_by_name(tmp_path, monkeypatch):
     monkeypatch.setattr(mod, "RULES_SOURCE", tmp_path / "harness.md")
     with pytest.raises(mod.SetupError,
                        match="^harness.md is missing from the plugin files folder$"):
-        mod.check_proposals()
+        mod.check_proposals({"enabled": True})
 
 
 def test_a_temp_name_that_keeps_colliding_refuses_by_name(tmp_path):
@@ -2067,7 +2438,7 @@ def test_plan_proposes_prompt_suggestions_off_as_an_optional_item(tmp_path):
     done = run("plan", home)
     assert done.rc == 0, done.err
     assert f"OPTIONAL {PROMPT_ID}\n----\n{PROMPT_TEXT}\n----\n" in done.out
-    assert (PROMPT_ID, PROMPT_TEXT) in mod.optional_items()
+    assert (PROMPT_ID, PROMPT_TEXT) in mod.optional_items({"enabled": True})
     assert [e for e in done.events if e["op"] in MUTATING and e.get("path")] == []
     assert unchanged(before, snap(home))
 
@@ -2096,10 +2467,12 @@ def test_prompt_suggestions_off_is_added_on_its_approval_and_removed_by_remove(t
 def test_prompt_suggestions_off_is_not_added_without_its_approval(tmp_path):
     bin_dir = install(tmp_path)
     home = make_home(tmp_path, KEPT_SETTINGS)
-    done = run("apply", home, "--approve", "sandbox", bin_dir=bin_dir)
+    done = run("apply", home, "--approve", "sandbox", "--sandbox-folder",
+               str(home / ".local/share/ledger"), bin_dir=bin_dir)
     assert done.rc == 0, done.err
     assert json.loads(at(home, mod.SETTINGS_REL).read_bytes()) == {
-        "model": "kept", "sandbox": {"enabled": True}}
+        "model": "kept", "sandbox": {"enabled": True, "filesystem": {
+            "allowWrite": [str(home / ".local/share/ledger")]}}}
     other = make_home(tmp_path, KEPT_SETTINGS, name="none-approved")
     assert run("apply", other, bin_dir=bin_dir).rc == 0
     assert at(other, mod.SETTINGS_REL).read_bytes() == KEPT_SETTINGS
@@ -2152,17 +2525,19 @@ def test_any_prompt_suggestions_proposal_but_the_one_safe_value_refuses(monkeypa
     else:
         monkeypatch.setattr(mod, "GRANTING_KEYS", mod.GRANTING_KEYS | {PROMPT_KEY})
     with pytest.raises(mod.SetupError, match=r"^proposals grant: prompt-suggestions$"):
-        mod.check_proposals()
+        mod.check_proposals({"enabled": True})
 
 
 def test_a_wrong_typed_prompt_suggestions_key_is_left_alone_when_it_is_not_approved(tmp_path):
     bin_dir = install(tmp_path)
     raw = b'{\n  "promptSuggestionEnabled": "no"\n}\n'
     home = make_home(tmp_path, raw)
-    done = run("apply", home, "--approve", "sandbox", bin_dir=bin_dir)
+    done = run("apply", home, "--approve", "sandbox", "--sandbox-folder",
+               str(home / ".local/share/ledger"), bin_dir=bin_dir)
     assert done.rc == 0, done.err
     assert json.loads(at(home, mod.SETTINGS_REL).read_bytes()) == {
-        "promptSuggestionEnabled": "no", "sandbox": {"enabled": True}}
+        "promptSuggestionEnabled": "no", "sandbox": {"enabled": True, "filesystem": {
+            "allowWrite": [str(home / ".local/share/ledger")]}}}
 
 
 # ---------------------------------------------------------------------------

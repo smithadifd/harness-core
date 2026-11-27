@@ -511,7 +511,7 @@ def test_the_starter_is_comment_only_by_setups_own_rule():
 
 
 def test_setups_check_accepts_the_shipped_starter():
-    rules, override = setup.check_proposals()
+    rules, override = setup.check_proposals({"enabled": True})
     assert rules == RULES.read_bytes()
     assert override == STARTER.read_bytes()
 
