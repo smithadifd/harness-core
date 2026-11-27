@@ -3,6 +3,19 @@
 Each tag of this repository gets an entry: what changed in the vendored files,
 and any pin move of the vendored ledger.
 
+## v0.3.5
+
+The marketplace's `sdlc` pin moves from skills `v1.6.1` to `v1.7.0`
+(the `sdlc` plugin at 0.17.0, commit `f6f6cb27d22952dc0f4c258e8ab34bf4a9ee3261`).
+The pin names the commit the annotated tag peels to, not the tag object.
+v1.7.0 requires a plan or outward go in the ticket skill to name the ticket id
+or the pass id's last four characters; the build and closing cards say which
+steps CI must prove, warn on a runtime pin mismatch and note locked worktrees.
+
+`harness` and `rails` stay at 0.2.0. The `ledger-hooks` pin and the
+vendored ledger stay at `v0.7.0`. The README's named current tag moves to
+`v0.3.5`, and its skills release and commit match the new pin.
+
 ## v0.3.4
 
 The marketplace's `sdlc` pin moves from skills `v1.6.0` to `v1.6.1`
