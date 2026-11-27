@@ -56,7 +56,7 @@ def _run_skill_loader(home: Path, name: str, defaults: dict) -> subprocess.Compl
 def test_missing_well_known_pool_override_uses_shipped_default(tmp_path):
     result = _run_pool(tmp_path / "home")
     assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines()[0] == "xai-oauth/grok-4.6", (
+    assert result.stdout.splitlines()[0] == "xai-oauth/grok-4.7", (
         "an absent optional override must leave the shipped model order unchanged"
     )
 
@@ -72,7 +72,7 @@ def test_well_known_pool_override_is_read_at_run_time(tmp_path):
     after = _run_pool(home)
 
     assert before.returncode == after.returncode == 0, before.stderr + after.stderr
-    assert before.stdout.splitlines()[0] == "xai-oauth/grok-4.6"
+    assert before.stdout.splitlines()[0] == "xai-oauth/grok-4.7"
     assert after.stdout.splitlines()[0] == "openai-codex/gpt-6.1-sol", (
         "the override created between runs was not read from the current HOME"
     )
@@ -94,7 +94,7 @@ def test_xdg_pool_override_takes_precedence_over_home_fallback(tmp_path):
 
     result = _run_pool(home, xdg=xdg)
     assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines()[0] == "xai-oauth/grok-4.6", (
+    assert result.stdout.splitlines()[0] == "xai-oauth/grok-4.7", (
         "the HOME fallback won even though XDG_CONFIG_HOME was set"
     )
 

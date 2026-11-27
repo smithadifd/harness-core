@@ -68,7 +68,12 @@
       "pool": "openai-codex",
       "note": "Advisory voice; declared as available inventory, preferred for no work kind by default."
     },
-    {"id": "xai-oauth/grok-4.6", "pool": "xai-grok"},
+    {"id": "xai-oauth/grok-4.7", "pool": "xai-grok"},
+    {
+      "id": "xai-oauth/grok-4.6",
+      "pool": "xai-grok",
+      "note": "The Grok lane's previous pin; declared as available inventory, preferred for no work kind by default."
+    },
     {"id": "google-antigravity/gemini-3.8-flash", "pool": "google-antigravity-gemini"}
   ],
   "work_kinds": [
@@ -84,7 +89,7 @@
     },
     {
       "id": "mechanical_build",
-      "models": ["xai-oauth/grok-4.6", "openai-codex/gpt-6.1-sol", "claude-sonnet-5-5"],
+      "models": ["xai-oauth/grok-4.7", "openai-codex/gpt-6.1-sol", "claude-sonnet-5-5"],
       "note": "The measured default build lane first, then both primary pools behind it."
     },
     {
@@ -99,7 +104,7 @@
     },
     {
       "id": "second_review",
-      "models": ["openai-codex/gpt-6.1-sol", "xai-oauth/grok-4.6", "claude-sonnet-5-5"],
+      "models": ["openai-codex/gpt-6.1-sol", "xai-oauth/grok-4.7", "claude-sonnet-5-5"],
       "note": "The independent second reviewing lane, which is required to come from a different provider than the builder of the same work."
     },
     {
